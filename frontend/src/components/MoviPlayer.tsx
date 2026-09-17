@@ -196,7 +196,7 @@ export function MoviPlayer({
         <track
           key={s.url}
           src={s.url}
-          srclang="en"
+          srcLang="en"
           label={s.label}
           kind="subtitles"
           default={i === 0 ? true : undefined}
