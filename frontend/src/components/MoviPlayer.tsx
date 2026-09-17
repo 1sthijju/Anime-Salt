@@ -49,7 +49,6 @@ export function MoviPlayer({
       return;
     }
 
-    // Referer/Origin are injected server-side by /proxy/media
     el.setAttribute('headers', '{}');
     el.setAttribute(
       'engine',
@@ -66,30 +65,26 @@ export function MoviPlayer({
     const el = ref.current;
     if (!el || !onAudioTracks) return;
 
-    const readTracks = (e?: any) => {
-      // Prefer the trackschange payload, fall back to el.audioTracks
-      let list: any[] = Array.isArray(e?.detail) ? e.detail : [];
-      if (list.length === 0) {
-        const at = (el as any).audioTracks;
-        list = at && at.length ? Array.from(at) : [];
+    const readTracks = () => {
+      const elAny = el as any;
+      let list: any[] = [];
+      
+      // Try standard audioTracks property
+      if (elAny.audioTracks && elAny.audioTracks.length) {
+        list = Array.from(elAny.audioTracks);
       }
-      const audio = list
-        .map((t: any, i: number) => ({
-          index: typeof t.index === 'number' ? t.index : i,
-          label: t.label || t.name || t.language || `Audio ${i + 1}`,
-          language: t.language || '',
-        }))
-        .filter((t: any) => !t.language || true); // keep all; type filter below if available
-      const filtered = list.length
-        ? list
-            .filter((t: any) => (t.type || t.kind || '').toString().includes('audio') || !(t.type || t.kind))
-            .map((t: any, i: number) => ({
-              index: typeof t.index === 'number' ? t.index : i,
-              label: t.label || t.name || t.language || `Audio ${i + 1}`,
-              language: t.language || '',
-            }))
-        : audio;
-      onAudioTracks(filtered);
+      
+      if (list.length === 0) {
+        onAudioTracks([]);
+        return;
+      }
+
+      const tracks = list.map((t: any, i: number) => ({
+        index: typeof t.id === 'number' ? t.id : (typeof t.index === 'number' ? t.index : i),
+        label: t.label || t.name || t.language || `Audio ${i + 1}`,
+        language: t.language || '',
+      }));
+      onAudioTracks(tracks);
     };
 
     readTracks();
@@ -97,7 +92,6 @@ export function MoviPlayer({
     const events = ['loadedmetadata', 'canplay', 'playing', 'trackschange'];
     events.forEach((evt) => el.addEventListener(evt, readTracks));
 
-    // Late retries — some engines expose tracks only after demuxing starts
     const timers = [
       window.setTimeout(readTracks, 800),
       window.setTimeout(readTracks, 2500),
