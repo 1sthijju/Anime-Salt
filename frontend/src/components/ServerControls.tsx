@@ -1,4 +1,5 @@
 import type { Server, StreamData } from '../api/types';
+import type { AudioTrackInfo } from './MoviPlayer';
 import { Badge } from './ui/Badge';
 
 interface Props {
@@ -7,38 +8,32 @@ interface Props {
   activeLang?: string;
   activeQuality: number;
   stream: StreamData | null;
+  audioTracks?: AudioTrackInfo[];
+  audioTrackIndex?: number | null;
   onServerChange: (i: number) => void;
   onLangChange: (lang?: string) => void;
   onQualityChange: (i: number) => void;
+  onAudioTrackChange?: (i: number) => void;
 }
 
 export function ServerControls({
-  servers,
-  activeServer,
-  activeLang,
-  activeQuality,
-  stream,
-  onServerChange,
-  onLangChange,
-  onQualityChange,
+  servers, activeServer, activeLang, activeQuality, stream,
+  audioTracks = [], audioTrackIndex = null,
+  onServerChange, onLangChange, onQualityChange, onAudioTrackChange,
 }: Props) {
   const current = servers[activeServer];
   const hasLangs = current?.isMultiLang && current.languages.length > 0;
   const qualities = stream?.qualities;
   const hasMultiQuality = qualities && qualities.length > 1;
+  const hasMultiAudio = audioTracks.length > 1;
 
   return (
     <div className="bg-card rounded-xl p-4 space-y-3">
-      {/* Servers */}
       <div>
         <div className="text-xs text-muted mb-2 uppercase tracking-wide">Server</div>
         <div className="flex flex-wrap gap-2">
           {servers.map((s, i) => (
-            <Badge
-              key={i}
-              active={i === activeServer}
-              onClick={() => onServerChange(i)}
-            >
+            <Badge key={i} active={i === activeServer} onClick={() => onServerChange(i)}>
               {s.serverName}
               {s.isMultiLang && <span className="ml-1">🌐</span>}
             </Badge>
@@ -46,10 +41,9 @@ export function ServerControls({
         </div>
       </div>
 
-      {/* Languages */}
       {hasLangs && (
         <div className="pt-3 border-t border-border">
-          <div className="text-xs text-muted mb-2 uppercase tracking-wide">Audio</div>
+          <div className="text-xs text-muted mb-2 uppercase tracking-wide">Audio (multi-lang server)</div>
           <div className="flex flex-wrap gap-2">
             {current.languages.map((l) => (
               <Badge
@@ -65,31 +59,38 @@ export function ServerControls({
         </div>
       )}
 
-      {/* Qualities */}
-      {hasMultiQuality && (
+      {hasMultiAudio && onAudioTrackChange && (
         <div className="pt-3 border-t border-border">
-          <div className="text-xs text-muted mb-2 uppercase tracking-wide">Quality</div>
+          <div className="text-xs text-muted mb-2 uppercase tracking-wide">Audio track (HLS)</div>
           <div className="flex flex-wrap gap-2">
-            {qualities!.map((q, i) => (
+            {audioTracks.map((t) => (
               <Badge
-                key={i}
-                variant="violet"
-                active={activeQuality === i}
-                onClick={() => onQualityChange(i)}
+                key={t.index}
+                variant="cyan"
+                active={(audioTrackIndex ?? 0) === t.index}
+                onClick={() => onAudioTrackChange(t.index)}
               >
-                {q.resolution || `Q${i + 1}`}
-                {q.size && (
-                  <span className="ml-1 text-muted">
-                    ({Math.round(q.size / (1024 * 1024))}MB)
-                  </span>
-                )}
+                {t.label}
+                {t.language && <span className="ml-1 opacity-70">[{t.language}]</span>}
               </Badge>
             ))}
           </div>
         </div>
       )}
 
-      {/* Stream info */}
+      {hasMultiQuality && (
+        <div className="pt-3 border-t border-border">
+          <div className="text-xs text-muted mb-2 uppercase tracking-wide">Quality</div>
+          <div className="flex flex-wrap gap-2">
+            {qualities!.map((q, i) => (
+              <Badge key={i} variant="violet" active={activeQuality === i} onClick={() => onQualityChange(i)}>
+                {q.resolution || `Q${i + 1}`}
+              </Badge>
+            ))}
+          </div>
+        </div>
+      )}
+
       {stream && (
         <div className="pt-3 border-t border-border text-xs text-muted flex flex-wrap gap-3">
           {stream.host && <span>Host: {stream.host}</span>}
