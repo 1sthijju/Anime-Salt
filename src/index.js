@@ -269,22 +269,63 @@ function parseEpisodesFromHtml(html, seasonNum) {
 
 async function getEpisodesData(animeId, requestedSeason) {
   const html = await fetchPage(`/series/${animeId}/`);
-  const postIdMatch = html.match(/data-post="(\d+)"/i) || html.match(/postid-(\d+)/i);
+  
+  // 1. Extract Post ID for AJAX (Added "post_id" JSON fallback)
+  const postIdMatch = html.match(/data-post="(\d+)"/i) || 
+                      html.match(/postid-(\d+)/i) || 
+                      html.match(/"post_id":\s*(\d+)/i);
   const postId = postIdMatch ? postIdMatch[1] : null;
-  const seasonRegex = /<button[^>]*class="[^"]*season-btn[^"]*"[^>]*data-season="(\d+)"[^>]*>([^<]+)<\/button>/gi;
+  
+  // 2. Broadened Regex to catch .season-btn, .sel-temp, or .aa-stn li
+  const seasonRegex = /<(?:button|li|div|a)[^>]*class="[^"]*(?:season-btn|sel-temp|aa-stn)[^"]*"[^>]*(?:data-season="(\d+)")[^>]*>([\s\S]*?)<\/(?:button|li|div|a)>/gi;
+  
   const seasons = [];
   let match;
-  while ((match = seasonRegex.exec(html)) !== null) seasons.push({ num: parseInt(match[1]), title: match[2].trim() });
-  if (seasons.length === 0) return { postId: null, seasons: [], episodes: parseEpisodesFromHtml(html, 1) };
+  while ((match = seasonRegex.exec(html)) !== null) {
+    const sNum = parseInt(match[1], 10);
+    const sTitle = match[2].replace(/<[^>]+>/g, '').trim();
+    
+    if (sNum > 0 && !seasons.find(s => s.num === sNum)) {
+      const countMatch = sTitle.match(/\((\d+)\)/);
+      const episodeCount = countMatch ? parseInt(countMatch[1], 10) : undefined;
+      seasons.push({ num: sNum, title: sTitle, episodeCount });
+    }
+  }
+  
+  // 3. If no seasons found via buttons, fallback to parsing all episodes currently on page
+  if (seasons.length === 0) {
+    return { postId: null, seasons: [], episodes: parseEpisodesFromHtml(html, 1) };
+  }
+  
+  // 4. Fire parallel AJAX requests to fetch hidden seasons
   const episodes = [];
-  const targetSeasons = requestedSeason === "all" || requestedSeason === undefined ? seasons : seasons.filter(s => s.num === requestedSeason);
+  const targetSeasons = requestedSeason === "all" || requestedSeason === undefined 
+    ? seasons 
+    : seasons.filter(s => s.num === requestedSeason);
+  
   for (const s of targetSeasons) {
     try {
-      const ajaxHtml = await fetchAjax(`/wp-admin/admin-ajax.php?action=action_select_season&season=${s.num}&post=${postId}`);
-      episodes.push(...parseEpisodesFromHtml(ajaxHtml, s.num));
-    } catch (e) { console.warn(`Failed to fetch season ${s.num}`); }
+      if (postId) {
+        const ajaxHtml = await fetchAjax(`/wp-admin/admin-ajax.php?action=action_select_season&season=${s.num}&post=${postId}`);
+        episodes.push(...parseEpisodesFromHtml(ajaxHtml, s.num));
+      }
+    } catch (e) { 
+      console.warn(`Failed to fetch season ${s.num}`); 
+    }
   }
-  return { postId, seasons, episodes };
+  
+  // 5. If AJAX failed or no postId, fallback to page HTML
+  if (episodes.length === 0) {
+    return { postId, seasons, episodes: parseEpisodesFromHtml(html, 1) };
+  }
+
+  // Deduplicate episodes just in case
+  const uniqueMap = new Map();
+  for (const ep of episodes) { if (!uniqueMap.has(ep.slug)) uniqueMap.set(ep.slug, ep); }
+  const uniqueEpisodes = Array.from(uniqueMap.values());
+  uniqueEpisodes.sort((a, b) => a.season - b.season || a.num - b.num);
+
+  return { postId, seasons, episodes: uniqueEpisodes };
 }
 
 // ==========================================
@@ -345,10 +386,6 @@ export default {
         catch (e) { return jsonResponse({ success: true, page, data: [] }); }
       }
 
-      if (path === "/api/type/:type") {
-        // Native router doesn't support :type directly in path matching easily without regex, so we use startsWith
-      }
-      
       if (path.startsWith("/api/type/")) {
         const type = path.split("/")[3];
         const subtype = params.get("subtype") || "series";
