@@ -17,7 +17,6 @@ export function rewriteManifest(text, manifestUrl, workerOrigin) {
   }).join("\n");
 }
 
-// Force the chosen audio rendition to be the manifest default
 export function setDefaultAudio(text, langCode) {
   return text.split("\n").map(line => {
     if (!line.startsWith("#EXT-X-MEDIA:TYPE=AUDIO")) return line;
@@ -29,7 +28,6 @@ export function setDefaultAudio(text, langCode) {
   }).join("\n");
 }
 
-// Parse EXT-X-MEDIA groups (audio renditions + subtitle tracks)
 export function parseHlsMediaGroups(text) {
   const audio = [];
   const subtitles = [];
@@ -47,11 +45,21 @@ export function parseHlsMediaGroups(text) {
   return { audio, subtitles };
 }
 
+// ---------------------------------------------------------------------------
+// SRT -> WebVTT converter (FirePlayer serves SRT disguised as .jpg)
+// ---------------------------------------------------------------------------
+export function srtToVtt(srt) {
+  const body = srt
+    .replace(/\r+/g, "")                                   // normalize line endings
+    .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2");     // 00:00:34,910 -> 00:00:34.910
+  return "WEBVTT\n\n" + body.trim() + "\n";
+}
+
 export async function handleMediaProxy(request) {
   const params = new URL(request.url).searchParams;
   const target = params.get("url");
   const audio = params.get("audio");     // e.g. "hin" — make this rendition default
-  const force = params.get("force");     // e.g. "text/vtt" — override Content-Type
+  const force = params.get("force");     // e.g. "text/vtt" — subtitle mode
   if (!target) return jsonResponse({ error: "url required" }, 400);
   let u;
   try { u = new URL(target); } catch { return jsonResponse({ error: "bad url" }, 400); }
@@ -68,6 +76,20 @@ export async function handleMediaProxy(request) {
   const res = await fetch(target, { headers: upstreamHeaders, redirect: "follow" });
   if (!res.ok && res.status !== 206) {
     return new Response(`Upstream returned ${res.status}`, { status: 502, headers: corsHeaders });
+  }
+
+  // ------------------------------------------------------------------
+  // SUBTITLE MODE: convert SRT bodies to valid WebVTT on the fly
+  // ------------------------------------------------------------------
+  if (force && force.includes("text/vtt")) {
+    const raw = await res.text();
+    const vtt = raw.trimStart().startsWith("WEBVTT") ? raw : srtToVtt(raw);
+    const headers = new Headers(corsHeaders);
+    headers.set("Content-Type", "text/vtt");
+    headers.set("Cache-Control", "public, max-age=86400");
+    headers.set("Content-Length", String(new TextEncoder().encode(vtt).length));
+    headers.set("Accept-Ranges", "bytes");
+    return new Response(vtt, { status: 200, headers });
   }
 
   const ctype = (res.headers.get("Content-Type") || "").toLowerCase();
@@ -88,8 +110,7 @@ export async function handleMediaProxy(request) {
   }
 
   // Segments disguised as .js/.css/.woff: normalize MIME for MSE friendliness
-  if (force) headers.set("Content-Type", force);
-  else if (/\.(js|css|woff2?)$/i.test(u.pathname)) headers.set("Content-Type", "video/mp2t");
+  if (/\.(js|css|woff2?)$/i.test(u.pathname)) headers.set("Content-Type", "video/mp2t");
   else headers.set("Content-Type", ctype || "application/octet-stream");
 
   headers.set("Cache-Control",
