@@ -1,7 +1,6 @@
-name = "anime-salt"
-main = "src/index.js"
-compatibility_date = "2026-09-17"
+name = "animesalt-edge"
+main = "src/index.ts"
+compatibility_date = "2024-09-17"
 
-# Tell Cloudflare NOT to run a build command
-[build]
-command = ""
+# If you absolutely MUST use Cheerio and Node Crypto, enable this flag:
+# compatibility_flags = [ "nodejs_compat" ]
