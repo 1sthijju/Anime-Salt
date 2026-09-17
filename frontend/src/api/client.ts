@@ -40,11 +40,11 @@ export const api = {
   servers: (epSlug: string) =>
     request<Server[]>(`/api/servers?ep=${encodeURIComponent(epSlug)}`),
 
-  stream: (epSlug: string, serverIndex = 0, lang?: string) =>
+  stream: (epSlug: string, serverIndex = 0, lang?: string, audio?: string) =>
     request<StreamData>(
       `/api/stream?ep=${encodeURIComponent(epSlug)}&server=${serverIndex}${
         lang ? `&lang=${encodeURIComponent(lang)}` : ''
-      }`
+      }${audio ? `&audio=${encodeURIComponent(audio)}` : ''}`
     ),
 
   /**
