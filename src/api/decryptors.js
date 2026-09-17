@@ -17,7 +17,7 @@ export function normalizeAbyssUrl(url) {
 export async function resolveAsCdn26(embedUrl) {
   const videoId = new URL(embedUrl).pathname.split('/').pop();
   
-  // Fetch the embed page HTML
+  // Fetch the embed page HTML to extract subtitles
   const sessionRes = await fetch(embedUrl, { headers: CHROME_HEADERS });
   const embedHtml = await sessionRes.text();
   
@@ -30,7 +30,7 @@ export async function resolveAsCdn26(embedUrl) {
   }
   
   // Extract subtitles from playerjsSubtitle variable
-  // Format: "[English]https://as-cdn28.top/p/...jpg" (disguised as JPG, actually VTT)
+  // Format: "[English]https://as-cdn28.top/p/...jpg" (disguised as JPG, actually SRT)
   const subtitles = [];
   const subMatch = embedHtml.match(/playerjsSubtitle\s*=\s*"([^"]*)"/i);
   if (subMatch && subMatch[1]) {
@@ -38,7 +38,11 @@ export async function resolveAsCdn26(embedUrl) {
     const pairRegex = /\[([^\]]+)\](https?:\/\/[^"'\s\\]+)/g;
     let match;
     while ((match = pairRegex.exec(rawSubtitles)) !== null) {
-      subtitles.push({ label: match[1], url: match[2] });
+      subtitles.push({ 
+        label: match[1], 
+        url: match[2],
+        referer: embedUrl  // Track the embed URL as the required referer
+      });
     }
   }
   
