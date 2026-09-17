@@ -1,0 +1,6 @@
+name = "animesalt-proxy"
+   main = "src/index.js"
+   compatibility_date = "2024-09-17"
+   
+   [vars]
+   # You can add environment variables here if needed
