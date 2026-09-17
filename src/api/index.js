@@ -1,10 +1,26 @@
-import { jsonResponse, corsHeaders, BASE_URL, CACHE_TTL_HOME } from "./config.js";
+import { jsonResponse, corsHeaders, BASE_URL, CACHE_TTL_HOME, CACHE_TTL, CHROME_HEADERS } from "./config.js";
 import { cachedJSON, fetchPage, siteAjax, getSeriesHtml } from "./net.js";
 import { extractAnimeList, extractPopularItems, extractEmbedForIndex } from "./parsers.js";
 import { getEpisodesData } from "./episodes.js";
 import { resolveAsCdn26, resolveAbyss, normalizeAbyssUrl } from "./decryptors.js";
-import { CHROME_HEADERS, CACHE_TTL } from "./config.js";   // merge with existing configImport
 import { proxyMediaUrl, handleMediaProxy, parseHlsMediaGroups } from "./media-proxy.js";
+
+async function getMasterInfo(masterUrl) {
+  return await cachedJSON(`masterinfo:${masterUrl}`, async () => {
+    try {
+      const r = await fetch(masterUrl, {
+        headers: { 
+          "User-Agent": CHROME_HEADERS["User-Agent"], 
+          "Referer": "https://as-cdn26.top/", 
+          "Origin": "https://as-cdn26.top" 
+        },
+      });
+      return parseHlsMediaGroups(await r.text());
+    } catch (e) { 
+      return { audio: [], subtitles: [] }; 
+    }
+  }, CACHE_TTL);
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -17,7 +33,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.3.0",
+          version: "3.4.0",
           endpoints: ["/api/health", "/api/search", "/api/latest-episodes", "/api/popular", "/api/completed", "/api/ongoing", "/api/type/:type", "/api/genre/:category", "/api/info", "/api/episodes/:id", "/api/servers", "/api/stream", "/api/ajax", "/proxy/media"],
         });
       }
@@ -30,7 +46,7 @@ export default {
           upstreamOnline = typeof html === "string" && (html.includes("animesalt") || html.includes("<html"));
           upstreamLatency = Date.now() - t0;
         } catch (err) { upstreamError = err.message; }
-        return jsonResponse({ success: upstreamOnline, status: upstreamOnline ? "healthy" : "degraded", timestamp: new Date().toISOString(), upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError }, version: "3.3.0-edge", endpointsCount: 14 });
+        return jsonResponse({ success: upstreamOnline, status: upstreamOnline ? "healthy" : "degraded", timestamp: new Date().toISOString(), upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError }, version: "3.4.0-edge", endpointsCount: 14 });
       }
 
       if (path === "/api/search") {
@@ -137,9 +153,6 @@ export default {
         return jsonResponse({ success: true, data: { animeId, requestedSeason, availableSeasons: seasons.map(s => s.num), totalEpisodes: episodes.length, failedSeasons, groupedEpisodes } });
       }
 
-      // =====================================================================
-      // /api/servers — uses extractEmbedForIndex for robust iframe discovery
-      // =====================================================================
       if (path === "/api/servers") {
         const epSlug = params.get("ep");
         if (!epSlug) return jsonResponse({ success: false, error: "Episode slug (ep) is required" }, 400);
@@ -173,20 +186,17 @@ export default {
         return jsonResponse({ success: true, data: servers });
       }
 
-      // =====================================================================
-      // /api/stream — uses extractEmbedForIndex for robust iframe discovery
-      // =====================================================================
       if (path === "/api/stream") {
         const epSlug = params.get("ep");
         const serverParam = params.get("server") || "0";
         const lang = params.get("lang");
+        const audio = params.get("audio");
         if (!epSlug) return jsonResponse({ success: false, error: "Episode slug (ep) is required" }, 400);
         const data = await cachedJSON(`html:episode:${epSlug}`, () => fetchPage(`/episode/${epSlug}/`));
         const serverIndex = parseInt(serverParam, 10);
 
         let embedUrl = extractEmbedForIndex(data, serverIndex) || null;
         let selectedLanguage = null;
-
         if (embedUrl && embedUrl.includes("multi-lang-plyr/player.php?data=")) {
           try {
             const b64Match = embedUrl.match(/data=([A-Za-z0-9+/=]+)/);
@@ -217,14 +227,34 @@ export default {
             }
           } catch (e) { console.warn(`Decryptor failed: ${e.message}`); }
         }
+
         if (resolvedStream) {
           const workerOrigin = new URL(request.url).origin;
           const primary = resolvedStream.direct_hls || resolvedStream.qualities?.[0]?.url || null;
+
+          // Parse available audio/subtitle renditions from the HLS master
+          let groups = { audio: [], subtitles: [] };
+          if (resolvedStream.direct_hls) groups = await getMasterInfo(resolvedStream.direct_hls);
+
+          // Proxied URL carries the chosen audio so the proxy flips DEFAULT flags
+          let proxied = primary ? proxyMediaUrl(workerOrigin, primary) : null;
+          if (proxied && audio) proxied += `&audio=${encodeURIComponent(audio)}`;
+
+          // Subtitle VTTs (disguised as .jpg upstream) forced to text/vtt through proxy
+          const subtitles = (resolvedStream.subtitles || []).map(s => ({
+            label: s.label,
+            url: proxyMediaUrl(workerOrigin, s.url) + "&force=" + encodeURIComponent("text/vtt"),
+          }));
+
           return jsonResponse({
             success: true,
             data: {
               ...resolvedStream,
-              proxied_url: primary ? proxyMediaUrl(workerOrigin, primary) : null,
+              subtitles,
+              proxied_url: proxied,
+              audio_languages: groups.audio,
+              subtitle_languages: groups.subtitles,
+              selected_audio: audio || null,
               serverIndex,
               selectedLanguage,
               isIframe: false,
