@@ -63,3 +63,31 @@ export function parseEpisodesFromHtml(html, seasonNum) {
   }
   return eps;
 }
+
+/**
+ * Extract the embed iframe URL for a given server index from an episode page.
+ * Handles nested wrapper divs by using a lookahead that stops at the NEXT
+ * options container or a known section boundary, rather than the first </div>.
+ * Falls back to picking the Nth iframe in document order.
+ */
+export function extractEmbedForIndex(html, index) {
+  // Strategy 1: capture the options-N container with tolerant boundary detection
+  const containerRegex = new RegExp(
+    `<div[^>]*id="options-${index}"[^>]*>([\\s\\S]*?)(?=<div[^>]*id="options-\\d+|<div[^>]*class="[^"]*(?:server-section|download|related)[^"]*"|</section>|<footer[^>]*>|$)`,
+    'i'
+  );
+  const containerMatch = html.match(containerRegex);
+  if (containerMatch) {
+    const iframeMatch = containerMatch[1].match(/<iframe[^>]*(?:src|data-src)="([^"]+)"/i);
+    if (iframeMatch && iframeMatch[1]) return iframeMatch[1];
+  }
+
+  // Strategy 2: fallback — pick the Nth iframe in document order
+  const iframeRegex = /<iframe[^>]*(?:src|data-src)="([^"]+)"/gi;
+  let m, i = 0;
+  while ((m = iframeRegex.exec(html)) !== null) {
+    if (i === index) return m[1];
+    i++;
+  }
+  return "";
+}
