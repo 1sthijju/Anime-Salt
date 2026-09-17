@@ -124,7 +124,7 @@ async function aesCtrTransform(data, keySeed, mode) {
 }
 
 // ==========================================
-// 3. NETWORK & FETCH HELPERS
+// 3. NETWORK & FETCH HELPERS (WAF BYPASS)
 // ==========================================
 async function fetchPage(path, params) {
   let fullUrl = `${BASE_URL}${path}`;
@@ -144,9 +144,18 @@ async function fetchPage(path, params) {
   return text;
 }
 
+// CRITICAL FIX: Route AJAX through proxy if direct WAF blocks it
 async function fetchAjax(path) {
-  const res = await fetch(`${BASE_URL}${path}`, { headers: AJAX_HEADERS });
-  return await res.text();
+  let res = await fetch(`${BASE_URL}${path}`, { headers: AJAX_HEADERS });
+  let text = await res.text();
+  
+  // If blocked by WAF or returns HTML challenge, route through proxy
+  if (!res.ok || text.includes("Just a moment...") || text.includes("cf-browser-verification") || (text.includes("<html") && !text.includes("/episode/"))) {
+    const proxyUrl = `${PROXY_BASE}${path}`;
+    res = await fetch(proxyUrl, { headers: AJAX_HEADERS });
+    text = await res.text();
+  }
+  return text;
 }
 
 // ==========================================
@@ -270,31 +279,62 @@ function parseEpisodesFromHtml(html, seasonNum) {
 async function getEpisodesData(animeId, requestedSeason) {
   const html = await fetchPage(`/series/${animeId}/`);
   
-  // 1. Extract Post ID for AJAX (Added "post_id" JSON fallback)
+  // 1. Extract Post ID & Nonce (Crucial for WP AJAX)
   const postIdMatch = html.match(/data-post="(\d+)"/i) || 
                       html.match(/postid-(\d+)/i) || 
-                      html.match(/"post_id":\s*(\d+)/i);
+                      html.match(/"post_id":\s*"?(\d+)"?/i) ||
+                      html.match(/post\s*:\s*(\d+)/i);
   const postId = postIdMatch ? postIdMatch[1] : null;
   
-  // 2. Broadened Regex to catch .season-btn, .sel-temp, or .aa-stn li
-  const seasonRegex = /<(?:button|li|div|a)[^>]*class="[^"]*(?:season-btn|sel-temp|aa-stn)[^"]*"[^>]*(?:data-season="(\d+)")[^>]*>([\s\S]*?)<\/(?:button|li|div|a)>/gi;
-  
+  const nonceMatch = html.match(/"nonce"\s*:\s*"([a-z0-9]+)"/i) || 
+                     html.match(/torofilm[^{]*\{[^}]*"nonce":"([a-z0-9]+)"/i) ||
+                     html.match(/ajax_nonce\s*=\s*"([a-z0-9]+)"/i);
+  const nonce = nonceMatch ? nonceMatch[1] : "";
+
+  // 2. Extract Seasons from <select class="sel-temp"> or <ul class="aa-stn">
   const seasons = [];
-  let match;
-  while ((match = seasonRegex.exec(html)) !== null) {
-    const sNum = parseInt(match[1], 10);
-    const sTitle = match[2].replace(/<[^>]+>/g, '').trim();
-    
-    if (sNum > 0 && !seasons.find(s => s.num === sNum)) {
-      const countMatch = sTitle.match(/\((\d+)\)/);
-      const episodeCount = countMatch ? parseInt(countMatch[1], 10) : undefined;
-      seasons.push({ num: sNum, title: sTitle, episodeCount });
+  
+  // Check for <select> (Standard torofilm dropdown)
+  const selectRegex = /<select[^>]*class="[^"]*(?:sel-temp|season)[^"]*"[^>]*>([\s\S]*?)<\/select>/gi;
+  let selectMatch;
+  while ((selectMatch = selectRegex.exec(html)) !== null) {
+    const optionsHtml = selectMatch[1];
+    const optionRegex = /<option[^>]*value="([^"]*)"[^>]*>([\s\S]*?)<\/option>/gi;
+    let optMatch;
+    while ((optMatch = optionRegex.exec(optionsHtml)) !== null) {
+      const val = optMatch[1];
+      const text = optMatch[2].replace(/<[^>]+>/g, '').trim();
+      const sNumMatch = text.match(/(?:Season|S)\s*(\d+)/i) || val.match(/^(\d+)$/);
+      if (sNumMatch) {
+        const sNum = parseInt(sNumMatch[1], 10);
+        if (sNum > 0 && !seasons.find(s => s.num === sNum)) {
+          seasons.push({ num: sNum, title: text, value: val });
+        }
+      }
     }
   }
-  
-  // 3. If no seasons found via buttons, fallback to parsing all episodes currently on page
+
+  // Check for <ul> or buttons
+  const listRegex = /<(?:ul|div)[^>]*class="[^"]*(?:aa-stn|seasons|season-list)[^"]*"[^>]*>([\s\S]*?)<\/(?:ul|div)>/gi;
+  let listMatch;
+  while ((listMatch = listRegex.exec(html)) !== null) {
+    const itemsHtml = listMatch[1];
+    const itemRegex = /<(?:li|button|a)[^>]*(?:data-season="(\d+)"|data-temp="(\d+)"|value="(\d+)")[^>]*>([\s\S]*?)<\/(?:li|button|a)>/gi;
+    let itemMatch;
+    while ((itemMatch = itemRegex.exec(itemsHtml)) !== null) {
+      const sNum = parseInt(itemMatch[1] || itemMatch[2] || itemMatch[3], 10);
+      const text = itemMatch[4].replace(/<[^>]+>/g, '').trim();
+      if (sNum > 0 && !seasons.find(s => s.num === sNum)) {
+        seasons.push({ num: sNum, title: text, value: itemMatch[1] || itemMatch[2] || itemMatch[3] });
+      }
+    }
+  }
+
+  // 3. If no seasons found, fallback to parsing whatever is on the page
   if (seasons.length === 0) {
-    return { postId: null, seasons: [], episodes: parseEpisodesFromHtml(html, 1) };
+    const allEps = parseEpisodesFromHtml(html, 1);
+    allEps.sort((a, b) => a.season - b.season || a.num - b.num);
+    return { postId: null, seasons: [], episodes: allEps };
   }
   
   // 4. Fire parallel AJAX requests to fetch hidden seasons
@@ -306,20 +346,37 @@ async function getEpisodesData(animeId, requestedSeason) {
   for (const s of targetSeasons) {
     try {
       if (postId) {
-        const ajaxHtml = await fetchAjax(`/wp-admin/admin-ajax.php?action=action_select_season&season=${s.num}&post=${postId}`);
-        episodes.push(...parseEpisodesFromHtml(ajaxHtml, s.num));
+        let ajaxHtml = "";
+        const seasonVal = s.value || s.num;
+        const nonceParam = nonce ? `&nonce=${nonce}` : "";
+        
+        // Try multiple known AJAX actions for torofilm theme
+        const actions = ["action_select_season", "action_select_temp", "action_get_episodes", "action_get_episodes_by_season"];
+        
+        for (const action of actions) {
+            try {
+                const url = `/wp-admin/admin-ajax.php?action=${action}&season=${seasonVal}&post=${postId}${nonceParam}`;
+                ajaxHtml = await fetchAjax(url);
+                // If we got valid HTML with episode links, break the loop
+                if (ajaxHtml.length > 100 && ajaxHtml.includes("/episode/")) break; 
+            } catch (e) {}
+        }
+        
+        if (ajaxHtml.includes("/episode/")) {
+            episodes.push(...parseEpisodesFromHtml(ajaxHtml, s.num));
+        }
       }
     } catch (e) { 
       console.warn(`Failed to fetch season ${s.num}`); 
     }
   }
   
-  // 5. If AJAX failed or no postId, fallback to page HTML
+  // 5. If AJAX failed completely, fallback to page HTML
   if (episodes.length === 0) {
     return { postId, seasons, episodes: parseEpisodesFromHtml(html, 1) };
   }
 
-  // Deduplicate episodes just in case
+  // Deduplicate and sort
   const uniqueMap = new Map();
   for (const ep of episodes) { if (!uniqueMap.has(ep.slug)) uniqueMap.set(ep.slug, ep); }
   const uniqueEpisodes = Array.from(uniqueMap.values());
