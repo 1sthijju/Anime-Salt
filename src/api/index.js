@@ -3,7 +3,8 @@ import { cachedJSON, fetchPage, siteAjax, getSeriesHtml } from "./net.js";
 import { extractAnimeList, extractPopularItems, extractEmbedForIndex } from "./parsers.js";
 import { getEpisodesData } from "./episodes.js";
 import { resolveAsCdn26, resolveAbyss, normalizeAbyssUrl } from "./decryptors.js";
-import { proxyMediaUrl, handleMediaProxy } from "./media-proxy.js";
+import { CHROME_HEADERS, CACHE_TTL } from "./config.js";   // merge with existing configImport
+import { proxyMediaUrl, handleMediaProxy, parseHlsMediaGroups } from "./media-proxy.js";
 
 export default {
   async fetch(request, env, ctx) {
