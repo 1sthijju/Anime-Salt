@@ -33,7 +33,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.4.0",
+          version: "3.5.0",
           endpoints: ["/api/health", "/api/search", "/api/latest-episodes", "/api/popular", "/api/completed", "/api/ongoing", "/api/type/:type", "/api/genre/:category", "/api/info", "/api/episodes/:id", "/api/servers", "/api/stream", "/api/ajax", "/proxy/media"],
         });
       }
@@ -46,7 +46,7 @@ export default {
           upstreamOnline = typeof html === "string" && (html.includes("animesalt") || html.includes("<html"));
           upstreamLatency = Date.now() - t0;
         } catch (err) { upstreamError = err.message; }
-        return jsonResponse({ success: upstreamOnline, status: upstreamOnline ? "healthy" : "degraded", timestamp: new Date().toISOString(), upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError }, version: "3.4.0-edge", endpointsCount: 14 });
+        return jsonResponse({ success: upstreamOnline, status: upstreamOnline ? "healthy" : "degraded", timestamp: new Date().toISOString(), upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError }, version: "3.5.0-edge", endpointsCount: 14 });
       }
 
       if (path === "/api/search") {
