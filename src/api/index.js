@@ -33,7 +33,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.5.0",
+          version: "3.6.0",
           endpoints: ["/api/health", "/api/search", "/api/latest-episodes", "/api/popular", "/api/completed", "/api/ongoing", "/api/type/:type", "/api/genre/:category", "/api/info", "/api/episodes/:id", "/api/servers", "/api/stream", "/api/ajax", "/proxy/media"],
         });
       }
@@ -46,7 +46,7 @@ export default {
           upstreamOnline = typeof html === "string" && (html.includes("animesalt") || html.includes("<html"));
           upstreamLatency = Date.now() - t0;
         } catch (err) { upstreamError = err.message; }
-        return jsonResponse({ success: upstreamOnline, status: upstreamOnline ? "healthy" : "degraded", timestamp: new Date().toISOString(), upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError }, version: "3.5.0-edge", endpointsCount: 14 });
+        return jsonResponse({ success: upstreamOnline, status: upstreamOnline ? "healthy" : "degraded", timestamp: new Date().toISOString(), upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError }, version: "3.6.0-edge", endpointsCount: 14 });
       }
 
       if (path === "/api/search") {
@@ -240,10 +240,13 @@ export default {
           let proxied = primary ? proxyMediaUrl(workerOrigin, primary) : null;
           if (proxied && audio) proxied += `&audio=${encodeURIComponent(audio)}`;
 
-          // Subtitle VTTs (disguised as .jpg upstream) forced to text/vtt through proxy
+          // Subtitle VTTs (SRT disguised as .jpg upstream) forced to text/vtt through proxy
+          // Pass the embed referer so the CDN accepts the request
           const subtitles = (resolvedStream.subtitles || []).map(s => ({
             label: s.label,
-            url: proxyMediaUrl(workerOrigin, s.url) + "&force=" + encodeURIComponent("text/vtt"),
+            url: proxyMediaUrl(workerOrigin, s.url) + 
+                 "&force=" + encodeURIComponent("text/vtt") + 
+                 (s.referer ? "&referer=" + encodeURIComponent(s.referer) : ""),
           }));
 
           return jsonResponse({
@@ -283,4 +286,4 @@ export default {
       return jsonResponse({ error: e.message, stack: e.stack }, 500);
     }
   }
-}; 
+};
