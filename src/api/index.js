@@ -1,6 +1,6 @@
 import { jsonResponse, corsHeaders, BASE_URL, CACHE_TTL_HOME } from "./config.js";
 import { cachedJSON, fetchPage, siteAjax, getSeriesHtml } from "./net.js";
-import { extractAnimeList, extractPopularItems } from "./parsers.js";
+import { extractAnimeList, extractPopularItems, extractEmbedForIndex } from "./parsers.js";
 import { getEpisodesData } from "./episodes.js";
 import { resolveAsCdn26, resolveAbyss, normalizeAbyssUrl } from "./decryptors.js";
 import { proxyMediaUrl, handleMediaProxy } from "./media-proxy.js";
@@ -16,7 +16,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.2.0",
+          version: "3.3.0",
           endpoints: ["/api/health", "/api/search", "/api/latest-episodes", "/api/popular", "/api/completed", "/api/ongoing", "/api/type/:type", "/api/genre/:category", "/api/info", "/api/episodes/:id", "/api/servers", "/api/stream", "/api/ajax", "/proxy/media"],
         });
       }
@@ -29,7 +29,7 @@ export default {
           upstreamOnline = typeof html === "string" && (html.includes("animesalt") || html.includes("<html"));
           upstreamLatency = Date.now() - t0;
         } catch (err) { upstreamError = err.message; }
-        return jsonResponse({ success: upstreamOnline, status: upstreamOnline ? "healthy" : "degraded", timestamp: new Date().toISOString(), upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError }, version: "3.2.0-edge", endpointsCount: 14 });
+        return jsonResponse({ success: upstreamOnline, status: upstreamOnline ? "healthy" : "degraded", timestamp: new Date().toISOString(), upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError }, version: "3.3.0-edge", endpointsCount: 14 });
       }
 
       if (path === "/api/search") {
@@ -136,6 +136,9 @@ export default {
         return jsonResponse({ success: true, data: { animeId, requestedSeason, availableSeasons: seasons.map(s => s.num), totalEpisodes: episodes.length, failedSeasons, groupedEpisodes } });
       }
 
+      // =====================================================================
+      // /api/servers — uses extractEmbedForIndex for robust iframe discovery
+      // =====================================================================
       if (path === "/api/servers") {
         const epSlug = params.get("ep");
         if (!epSlug) return jsonResponse({ success: false, error: "Episode slug (ep) is required" }, 400);
@@ -151,13 +154,11 @@ export default {
           const serverNameHeader = nameMatch ? nameMatch[1].trim() : `SERVER ${index + 1}`;
           const serverInfo = infoMatch ? infoMatch[1].trim() : "";
           const fullName = serverInfo ? `${serverNameHeader} - ${serverInfo}` : serverNameHeader;
-          const containerRegex = new RegExp(`<div[^>]*id="options-${index}"[^>]*>([\\s\\S]*?)<\\/div>\\s*(?=<div[^>]*id="options-|$)`, 'i');
-          const containerMatch = data.match(containerRegex);
-          const containerHtml = containerMatch ? containerMatch[1] : "";
-          const iframeMatch = containerHtml.match(/<iframe[^>]*(?:src|data-src)="([^"]+)"/i);
-          const embedUrl = iframeMatch ? iframeMatch[1] : "";
+
+          const embedUrl = extractEmbedForIndex(data, index);
+
           let languages = [];
-          if (embedUrl.includes("multi-lang-plyr/player.php?data=")) {
+          if (embedUrl && embedUrl.includes("multi-lang-plyr/player.php?data=")) {
             try {
               const b64Match = embedUrl.match(/data=([A-Za-z0-9+/=]+)/);
               if (b64Match && b64Match[1]) {
@@ -171,6 +172,9 @@ export default {
         return jsonResponse({ success: true, data: servers });
       }
 
+      // =====================================================================
+      // /api/stream — uses extractEmbedForIndex for robust iframe discovery
+      // =====================================================================
       if (path === "/api/stream") {
         const epSlug = params.get("ep");
         const serverParam = params.get("server") || "0";
@@ -178,12 +182,10 @@ export default {
         if (!epSlug) return jsonResponse({ success: false, error: "Episode slug (ep) is required" }, 400);
         const data = await cachedJSON(`html:episode:${epSlug}`, () => fetchPage(`/episode/${epSlug}/`));
         const serverIndex = parseInt(serverParam, 10);
-        const containerRegex = new RegExp(`<div[^>]*id="options-${serverIndex}"[^>]*>([\\s\\S]*?)<\\/div>\\s*(?=<div[^>]*id="options-|$)`, 'i');
-        const containerMatch = data.match(containerRegex);
-        const containerHtml = containerMatch ? containerMatch[1] : data;
-        const iframeMatch = containerHtml.match(/<iframe[^>]*(?:src|data-src)="([^"]+)"/i);
-        let embedUrl = iframeMatch ? iframeMatch[1] : null;
+
+        let embedUrl = extractEmbedForIndex(data, serverIndex) || null;
         let selectedLanguage = null;
+
         if (embedUrl && embedUrl.includes("multi-lang-plyr/player.php?data=")) {
           try {
             const b64Match = embedUrl.match(/data=([A-Za-z0-9+/=]+)/);
@@ -203,11 +205,13 @@ export default {
           } catch (e) {}
         }
         if (embedUrl && embedUrl.startsWith("//")) embedUrl = "https:" + embedUrl;
+
         let resolvedStream = null;
         if (embedUrl) {
           try {
-            if (embedUrl.includes("as-cdn26.top")) resolvedStream = await resolveAsCdn26(embedUrl);
-            else if (/(short\.icu|short\.ink|abysscdn\.com|hydraxcdn\.biz|embedplayabyss\.top|abyssplayer\.com)/.test(embedUrl)) {
+            if (embedUrl.includes("as-cdn26.top")) {
+              resolvedStream = await resolveAsCdn26(embedUrl);
+            } else if (/(short\.icu|short\.ink|abysscdn\.com|hydraxcdn\.biz|embedplayabyss\.top|abyssplayer\.com)/.test(embedUrl)) {
               resolvedStream = await resolveAbyss(embedUrl);
             }
           } catch (e) { console.warn(`Decryptor failed: ${e.message}`); }
