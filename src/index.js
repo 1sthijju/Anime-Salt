@@ -1,11 +1,3 @@
-import { Hono } from 'hono';
-import { cors } from 'hono/cors';
-
-const app = new Hono();
-
-// Enable CORS for all routes so frontend apps can consume the API
-app.use('*', cors());
-
 // ==========================================
 // 1. CRYPTOGRAPHY UTILITIES (MD5 & AES-CTR)
 // ==========================================
@@ -84,8 +76,8 @@ function md5(string) {
 // WebCrypto AES-CTR Helper
 async function aesCtr(dataBytes, keySeed, mode = 'decrypt') {
     const keyHex = md5(keySeed.toString());
-    const keyBytes = new TextEncoder().encode(keyHex); // 32-byte hex string as key
-    const iv = keyBytes.slice(0, 16); // First 16 bytes as IV
+    const keyBytes = new TextEncoder().encode(keyHex); 
+    const iv = keyBytes.slice(0, 16); 
     
     const cryptoKey = await crypto.subtle.importKey(
         "raw", keyBytes, { name: "AES-CTR" }, false, [mode]
@@ -102,22 +94,16 @@ async function aesCtr(dataBytes, keySeed, mode = 'decrypt') {
 // 2. UPSTREAM RESOLVERS
 // ==========================================
 
-// Resolver for as-cdn26.top (MyStream)
 async function resolveAsCdn26(embedUrl) {
     const videoId = new URL(embedUrl).pathname.split('/').pop();
     const sessionRes = await fetch(embedUrl, {
-        headers: { 
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://animesalt.cx/"
-        }
+        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Referer": "https://animesalt.cx/" }
     });
     
-    // Extract fireplayer_player cookie
     const setCookieHeader = sessionRes.headers.get('set-cookie');
     const cookieMatch = setCookieHeader ? setCookieHeader.match(/fireplayer_player=([^;]+)/) : null;
     const cookie = cookieMatch ? `fireplayer_player=${cookieMatch[1]}` : "";
     
-    // Simulate AJAX call
     const ajaxRes = await fetch(`https://as-cdn26.top/player/index.php?data=${videoId}&do=getVideo`, {
         method: 'POST',
         headers: {
@@ -133,31 +119,30 @@ async function resolveAsCdn26(embedUrl) {
     const data = await ajaxRes.json();
     if (!data.securedLink) throw new Error("Failed to fetch secured HLS link");
     
-    return {
-        host: "as-cdn26.top",
-        source_type: "hls",
-        direct_hls: data.securedLink,
-        subtitles: data.tracks || []
-    };
+    return { host: "as-cdn26.top", source_type: "hls", direct_hls: data.securedLink, subtitles: data.tracks || [] };
 }
 
-// Resolver for Abyss / short.icu
 async function resolveAbyss(embedUrl) {
-    const html = await (await fetch(embedUrl, { headers: { "User-Agent": "Mozilla/5.0" } })).text();
+    const res = await fetch(embedUrl, { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" } });
+    const html = await res.text();
     
     const datasMatch = html.match(/(?:const|var)\s+datas\s*=\s*"([^"]+)"/);
     if (!datasMatch) throw new Error("No Abyss payload found");
     
-    const raw = atob(datasMatch[1]);
-    const payload = JSON.parse(raw);
+    const binaryString = atob(datasMatch[1]);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
     
-    // 1. Decrypt Media Payload
+    const payload = JSON.parse(new TextDecoder().decode(bytes));
     const seed = `${payload.user_id}:${payload.slug}:${payload.md5_id}`;
-    const encryptedBytes = new Uint8Array(payload.media.split('').map(c => c.charCodeAt(0)));
-    const decrypted = await aesCtr(encryptedBytes, seed, 'decrypt');
+    
+    const mediaString = payload.media;
+    const mediaBytes = new Uint8Array(mediaString.length);
+    for (let i = 0; i < mediaString.length; i++) mediaBytes[i] = mediaString.charCodeAt(i) & 0xFF;
+    
+    const decrypted = await aesCtr(mediaBytes, seed, 'decrypt');
     const mediaJson = JSON.parse(new TextDecoder().decode(decrypted));
     
-    // 2. Extract MP4 Sources
     const sources = mediaJson.mp4?.sources || [];
     const qualities = [];
     
@@ -165,161 +150,112 @@ async function resolveAbyss(embedUrl) {
         if (src.file) {
             qualities.push({ resolution: src.label || "Unknown", url: src.file });
         } else if (src.path && src.size && src.sub) {
-            // Generate Sora Token
             const pathValue = `/mp4/${payload.md5_id}/${src.res_id}/${src.size}?v=${payload.slug}`;
             const pathBytes = new TextEncoder().encode(pathValue);
             const encryptedPath = await aesCtr(pathBytes, src.size.toString(), 'encrypt');
             const firstB64 = btoa(String.fromCharCode(...new Uint8Array(encryptedPath)));
             const soraToken = btoa(firstB64);
-            
-            const domain = mediaJson.mp4.domains.find(d => src.sub.includes(d)) || "abysscdn.com";
-            qualities.push({
-                resolution: src.label || "Unknown",
-                size: src.size,
-                url: `https://${domain}/sora/${src.size}/${soraToken}`
-            });
+            const domain = (mediaJson.mp4.domains || []).find(d => src.sub.includes(d)) || "abysscdn.com";
+            qualities.push({ resolution: src.label || "Unknown", size: src.size, url: `https://${domain}/sora/${src.size}/${soraToken}` });
         }
     }
-    
-    return {
-        host: "abysscdn.com",
-        source_type: "mp4",
-        qualities
-    };
+    return { host: "abysscdn.com", source_type: "mp4", qualities };
 }
 
 // ==========================================
-// 3. API ROUTES (Hono)
+// 3. NATIVE ROUTER & PROXY
 // ==========================================
 
-app.get('/api/health', (c) => c.json({ status: "operational", uptime: Math.floor(Date.now() / 1000) }));
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+  });
+}
 
-app.get('/api/search', async (c) => {
-    const query = c.req.query('q');
-    if (!query) return c.json({ error: "Missing query 'q'" }, 400);
-    
-    const res = await fetch(`https://animesalt.cx/?s=${encodeURIComponent(query)}`, {
-        headers: { "User-Agent": "Mozilla/5.0" }
-    });
-    const html = await res.text();
-    
-    // Regex to extract search results
-    const regex = /<a href="\/anime\/([^"]+)".*?<img src="([^"]+)".*?<div class="title">([^<]+)<\/div>/gs;
-    const results = [];
-    let match;
-    while ((match = regex.exec(html)) !== null) {
-        results.push({ id: match[1], poster: match[2], title: match[3] });
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS" } });
     }
-    
-    return c.json({ query, results });
-});
 
-app.get('/api/info', async (c) => {
-    const id = c.req.query('id');
-    if (!id) return c.json({ error: "Missing id" }, 400);
-    
-    const res = await fetch(`https://animesalt.cx/anime/${id}/`, { headers: { "User-Agent": "Mozilla/5.0" } });
-    const html = await res.text();
-    
-    const titleMatch = html.match(/<h1 class="title">([^<]+)</);
-    const synopsisMatch = html.match(/<div class="description">([^<]+)</);
-    
-    return c.json({
-        id,
-        title: titleMatch ? titleMatch[1] : "Unknown",
-        synopsis: synopsisMatch ? synopsisMatch[1].trim() : ""
-    });
-});
-
-app.get('/api/servers', async (c) => {
-    const ep = c.req.query('ep');
-    if (!ep) return c.json({ error: "Missing episode id" }, 400);
-    
-    const res = await fetch(`https://animesalt.cx/episode/${ep}/`, { headers: { "User-Agent": "Mozilla/5.0" } });
-    const html = await res.text();
-    
-    // Extract iframes from server containers
-    const serverRegex = /<div id="options-(\d+)" class="video.*?">.*?<iframe.*?data-src="([^"]+)"/gs;
-    const servers = [];
-    let match;
-    while ((match = serverRegex.exec(html)) !== null) {
-        const embedUrl = match[2];
-        let host = "unknown";
-        if (embedUrl.includes('as-cdn26.top')) host = "as-cdn26.top";
-        else if (embedUrl.includes('short.icu') || embedUrl.includes('multi-lang-plyr')) host = "abysscdn.com";
-        
-        servers.push({
-            server_id: parseInt(match[1]),
-            host,
-            embed_url: embedUrl
-        });
-    }
-    
-    return c.json({ episode_id: ep, servers });
-});
-
-app.get('/api/stream', async (c) => {
-    const url = c.req.query('url');
-    if (!url) return c.json({ error: "Missing embed url" }, 400);
-    
     try {
-        if (url.includes('as-cdn26.top')) {
-            return c.json(await resolveAsCdn26(url));
-        } else if (url.includes('short.icu') || url.includes('multi-lang-plyr')) {
-            return c.json(await resolveAbyss(url));
-        } else {
-            return c.json({ error: "Unsupported host" }, 400);
+      if (path === "/api/health") return jsonResponse({ status: "operational", time: new Date().toISOString() });
+
+      if (path === "/api/search") {
+        const query = url.searchParams.get("q");
+        if (!query) return jsonResponse({ error: "Missing query 'q'" }, 400);
+        const res = await fetch(`https://animesalt.cx/?s=${encodeURIComponent(query)}`, { headers: { "User-Agent": "Mozilla/5.0" } });
+        const html = await res.text();
+        const regex = /<a href="\/anime\/([^"]+)".*?<img src="([^"]+)".*?<div class="title">([^<]+)<\/div>/gs;
+        const results = [];
+        let match;
+        while ((match = regex.exec(html)) !== null) results.push({ id: match[1], poster: match[2], title: match[3] });
+        return jsonResponse({ query, results });
+      }
+
+      if (path === "/api/info") {
+        const id = url.searchParams.get("id");
+        if (!id) return jsonResponse({ error: "Missing id" }, 400);
+        const res = await fetch(`https://animesalt.cx/anime/${id}/`, { headers: { "User-Agent": "Mozilla/5.0" } });
+        const html = await res.text();
+        const titleMatch = html.match(/<h1 class="title">([^<]+)</);
+        const synopsisMatch = html.match(/<div class="description">([^<]+)</);
+        return jsonResponse({ id, title: titleMatch ? titleMatch[1] : "Unknown", synopsis: synopsisMatch ? synopsisMatch[1].trim() : "" });
+      }
+
+      if (path === "/api/servers") {
+        const ep = url.searchParams.get("ep");
+        if (!ep) return jsonResponse({ error: "Missing episode id" }, 400);
+        const res = await fetch(`https://animesalt.cx/episode/${ep}/`, { headers: { "User-Agent": "Mozilla/5.0" } });
+        const html = await res.text();
+        const serverRegex = /<div id="options-(\d+)" class="video.*?">.*?<iframe.*?data-src="([^"]+)"/gs;
+        const servers = [];
+        let match;
+        while ((match = serverRegex.exec(html)) !== null) {
+          const embedUrl = match[2];
+          let host = "unknown";
+          if (embedUrl.includes('as-cdn26.top')) host = "as-cdn26.top";
+          else if (embedUrl.includes('short.icu') || embedUrl.includes('multi-lang-plyr')) host = "abysscdn.com";
+          servers.push({ server_id: parseInt(match[1]), host, embed_url: embedUrl });
         }
-    } catch (err) {
-        return c.json({ error: err.message }, 500);
+        return jsonResponse({ episode_id: ep, servers });
+      }
+
+      if (path === "/api/stream") {
+        const targetUrl = url.searchParams.get("url");
+        if (!targetUrl) return jsonResponse({ error: "Missing embed url" }, 400);
+        if (targetUrl.includes('as-cdn26.top')) return jsonResponse(await resolveAsCdn26(targetUrl));
+        if (targetUrl.includes('short.icu') || targetUrl.includes('multi-lang-plyr')) return jsonResponse(await resolveAbyss(targetUrl));
+        return jsonResponse({ error: "Unsupported host" }, 400);
+      }
+
+      if (path === "/proxy/manifest") {
+        const targetUrl = url.searchParams.get("url");
+        if (!targetUrl) return new Response("Missing url", { status: 400 });
+        const res = await fetch(targetUrl, { headers: { "Referer": "https://as-cdn26.top/", "Origin": "https://as-cdn26.top" } });
+        const manifest = await res.text();
+        const baseUrl = new URL(targetUrl);
+        const rewritten = manifest.split('\n').map(line => {
+          if (line.startsWith('#') || !line.trim()) return line;
+          return `/proxy/segment?url=${encodeURIComponent(new URL(line, baseUrl).href)}`;
+        }).join('\n');
+        return new Response(rewritten, { headers: { "Content-Type": "application/vnd.apple.mpegurl", "Access-Control-Allow-Origin": "*" } });
+      }
+
+      if (path === "/proxy/segment") {
+        const targetUrl = url.searchParams.get("url");
+        if (!targetUrl) return new Response("Missing url", { status: 400 });
+        const res = await fetch(targetUrl, { headers: { "Referer": "https://as-cdn26.top/", "Origin": "https://as-cdn26.top" } });
+        return new Response(res.body, { headers: { "Content-Type": "video/mp2t", "Access-Control-Allow-Origin": "*" } });
+      }
+
+      return jsonResponse({ error: "Not found" }, 404);
+    } catch (e) {
+      return jsonResponse({ error: e.message, stack: e.stack }, 500);
     }
-});
-
-// ==========================================
-// 4. HLS MANIFEST PROXY (Bypasses 403s)
-// ==========================================
-
-app.get('/proxy/manifest', async (c) => {
-    const targetUrl = c.req.query('url');
-    if (!targetUrl) return c.text("Missing url", 400);
-    
-    // Fetch the original m3u8 with the required Referer
-    const res = await fetch(targetUrl, {
-        headers: { "Referer": "https://as-cdn26.top/", "Origin": "https://as-cdn26.top" }
-    });
-    const manifest = await res.text();
-    
-    // Rewrite relative .ts segments to point back to this worker
-    const baseUrl = new URL(targetUrl);
-    const rewritten = manifest.split('\n').map(line => {
-        if (line.startsWith('#') || !line.trim()) return line;
-        const segmentUrl = new URL(line, baseUrl).href;
-        return `/proxy/segment?url=${encodeURIComponent(segmentUrl)}`;
-    }).join('\n');
-    
-    return new Response(rewritten, {
-        headers: { 
-            "Content-Type": "application/vnd.apple.mpegurl",
-            "Access-Control-Allow-Origin": "*"
-        }
-    });
-});
-
-app.get('/proxy/segment', async (c) => {
-    const targetUrl = c.req.query('url');
-    if (!targetUrl) return c.text("Missing url", 400);
-    
-    // Stream the raw .ts chunk
-    const res = await fetch(targetUrl, {
-        headers: { "Referer": "https://as-cdn26.top/", "Origin": "https://as-cdn26.top" }
-    });
-    
-    return new Response(res.body, {
-        headers: { 
-            "Content-Type": "video/mp2t",
-            "Access-Control-Allow-Origin": "*"
-        }
-    });
-});
-
-export default app;
+  }
+};
