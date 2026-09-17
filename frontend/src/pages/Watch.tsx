@@ -10,14 +10,17 @@ import { Loading } from '../components/ui/Loading';
 export default function Watch() {
   const { episode } = useParams<{ episode: string }>();
 
-  // Server + stream state
+  // Servers + stream
   const [servers, setServers] = useState<Server[]>([]);
   const [stream, setStream] = useState<StreamData | null>(null);
   const [activeServer, setActiveServer] = useState(0);
   const [activeLang, setActiveLang] = useState<string | undefined>(undefined);
   const [activeQuality, setActiveQuality] = useState(0);
 
-  // HLS audio-track state (driven by Movi Player's audioTracks list)
+  // Manifest-driven HLS audio language (server-side DEFAULT switching)
+  const [hlsAudio, setHlsAudio] = useState<string | undefined>(undefined);
+
+  // Player-exposed audio tracks (bonus)
   const [audioTracks, setAudioTracks] = useState<AudioTrackInfo[]>([]);
   const [audioTrackIdx, setAudioTrackIdx] = useState<number | null>(null);
 
@@ -25,15 +28,16 @@ export default function Watch() {
   const [serversLoading, setServersLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
 
-  // ------------------------------------------------------------------
-  // Reset everything when the episode changes
-  // ------------------------------------------------------------------
+  // ------------------------------------------------------------
+  // Reset all state when the episode changes
+  // ------------------------------------------------------------
   useEffect(() => {
     setServers([]);
     setStream(null);
     setActiveServer(0);
     setActiveLang(undefined);
     setActiveQuality(0);
+    setHlsAudio(undefined);
     setAudioTracks([]);
     setAudioTrackIdx(null);
     setErr(null);
@@ -41,9 +45,9 @@ export default function Watch() {
     setLoading(true);
   }, [episode]);
 
-  // ------------------------------------------------------------------
+  // ------------------------------------------------------------
   // Load servers once per episode
-  // ------------------------------------------------------------------
+  // ------------------------------------------------------------
   useEffect(() => {
     if (!episode) return;
     let cancelled = false;
@@ -64,9 +68,9 @@ export default function Watch() {
     };
   }, [episode]);
 
-  // ------------------------------------------------------------------
-  // Load the stream whenever server / language selection changes
-  // ------------------------------------------------------------------
+  // ------------------------------------------------------------
+  // Load stream on every selection change
+  // ------------------------------------------------------------
   useEffect(() => {
     if (!episode || servers.length === 0) return;
     let cancelled = false;
@@ -74,9 +78,10 @@ export default function Watch() {
     setErr(null);
     setAudioTracks([]);
     setAudioTrackIdx(null);
+    setActiveQuality(0);
 
     api
-      .stream(episode, activeServer, activeLang)
+      .stream(episode, activeServer, activeLang, hlsAudio)
       .then((s) => {
         if (cancelled) return;
         setStream(s);
@@ -87,26 +92,30 @@ export default function Watch() {
         setStream(null);
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (cancelled) return;
+        setLoading(false);
       });
 
     return () => {
       cancelled = true;
     };
-  }, [episode, servers, activeServer, activeLang]);
+  }, [episode, servers, activeServer, activeLang, hlsAudio]);
 
-  // ------------------------------------------------------------------
+  // ------------------------------------------------------------
   // Handlers
-  // ------------------------------------------------------------------
+  // ------------------------------------------------------------
   const handleServerChange = useCallback((i: number) => {
     setActiveServer(i);
     setActiveLang(undefined);
-    setActiveQuality(0);
+    setHlsAudio(undefined);
   }, []);
 
   const handleLangChange = useCallback((lang?: string) => {
     setActiveLang(lang);
-    setActiveQuality(0);
+  }, []);
+
+  const handleAudioLangChange = useCallback((code: string) => {
+    setHlsAudio((prev) => (prev === code ? undefined : code));
   }, []);
 
   const handleQualityChange = useCallback((i: number) => {
@@ -121,13 +130,13 @@ export default function Watch() {
     setErr(msg);
   }, []);
 
-  // ------------------------------------------------------------------
-  // Prev / next episode slugs
-  // ------------------------------------------------------------------
   if (!episode) {
     return <Error message="No episode specified" />;
   }
 
+  // ------------------------------------------------------------
+  // Prev / next episode slugs + pretty title
+  // ------------------------------------------------------------
   const match = episode.match(/-(\d+)x(\d+)$/);
   const season = match ? Number(match[1]) : 1;
   const epNum = match ? Number(match[2]) : 1;
@@ -138,7 +147,6 @@ export default function Watch() {
 
   return (
     <div className="animate-fade-in">
-      {/* Back link */}
       <Link
         to={`/anime/${animeSlug}`}
         className="text-sm text-muted hover:text-white mb-4 inline-block"
@@ -146,21 +154,24 @@ export default function Watch() {
         ← Back to anime
       </Link>
 
-      {/* Player */}
+      {/* Player (with subtitle tracks injected) */}
       <MoviPlayer
         stream={stream}
         qualityIndex={activeQuality}
         loading={loading}
         title={prettyTitle}
         slug={episode}
+        subtitles={stream?.subtitles}
         onError={handlePlayerError}
         onAudioTracks={setAudioTracks}
         audioTrackIndex={audioTrackIdx}
       />
 
-      {/* Server / language / quality / audio-track controls */}
+      {/* Controls */}
       {serversLoading ? (
-        <Loading text="Loading servers..." />
+        <div className="mt-4">
+          <Loading text="Loading servers..." />
+        </div>
       ) : servers.length > 0 ? (
         <div className="mt-4">
           <ServerControls
@@ -171,17 +182,19 @@ export default function Watch() {
             stream={stream}
             audioTracks={audioTracks}
             audioTrackIndex={audioTrackIdx}
+            audioLanguages={stream?.audio_languages}
+            activeAudioLang={stream?.selected_audio ?? null}
             onServerChange={handleServerChange}
             onLangChange={handleLangChange}
             onQualityChange={handleQualityChange}
             onAudioTrackChange={handleAudioTrackChange}
+            onAudioLangChange={handleAudioLangChange}
           />
         </div>
       ) : (
         !err && <Error message="No servers available for this episode" />
       )}
 
-      {/* Errors */}
       {err && (
         <div className="mt-4">
           <Error message={err} />
