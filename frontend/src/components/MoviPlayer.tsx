@@ -1,4 +1,4 @@
-import { useRef, useEffect, useLayoutEffect } from 'react';
+import { useRef, useEffect, useLayoutEffect, useState } from 'react';
 import type { StreamData } from '../api/types';
 import { api } from '../api/client';
 import { useResume } from '../hooks/useResume';
@@ -25,6 +25,7 @@ export function MoviPlayer({
 }: Props) {
   const ref = useRef<HTMLElement>(null);
   const { save, load } = useResume(slug);
+  const [hasPlayed, setHasPlayed] = useState(false);
 
   useLayoutEffect(() => {
     const el = ref.current;
@@ -34,31 +35,48 @@ export function MoviPlayer({
     el.setAttribute('headers', '{}');
     el.setAttribute('engine', stream.source_type === 'hls' ? 'shaka hlsjs native wasm' : 'native wasm');
     el.setAttribute('src', playUrl);
+    setHasPlayed(false);
   }, [stream, qualityIndex, onError]);
 
-  // Report HLS audio renditions upward
+  // Read audio tracks AFTER playback starts (HLS tracks load asynchronously)
   useEffect(() => {
     const el = ref.current;
     if (!el || !onAudioTracks) return;
-    const read = () => {
+
+    const readTracks = () => {
       const list = (el as any).audioTracks;
-      if (!list || !list.length) { onAudioTracks([]); return; }
-      onAudioTracks(
-        Array.from(list).map((t: any, i: number) => ({
-          index: i,
-          label: t.label || t.language || `Audio ${i + 1}`,
-          language: t.language || '',
-        }))
-      );
+      if (!list || !list.length) {
+        onAudioTracks([]);
+        return;
+      }
+      const tracks = Array.from(list).map((t: any, i: number) => ({
+        index: i,
+        label: t.label || t.language || `Audio ${i + 1}`,
+        language: t.language || '',
+      }));
+      onAudioTracks(tracks);
     };
-    read();
-    el.addEventListener('trackschange', read);
-    el.addEventListener('loadedmetadata', read);
+
+    // Try immediately
+    readTracks();
+
+    // Try on multiple events (HLS tracks load asynchronously)
+    const events = ['loadedmetadata', 'canplay', 'playing', 'trackschange'];
+    events.forEach(evt => el.addEventListener(evt, readTracks));
+
     return () => {
-      el.removeEventListener('trackschange', read);
-      el.removeEventListener('loadedmetadata', read);
+      events.forEach(evt => el.removeEventListener(evt, readTracks));
     };
-  }, [stream, onAudioTracks]);
+  }, [stream, onAudioTracks, hasPlayed]);
+
+  // Track when playback starts
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const onPlay = () => setHasPlayed(true);
+    el.addEventListener('play', onPlay);
+    return () => el.removeEventListener('play', onPlay);
+  }, [stream]);
 
   // Apply selected audio track
   useEffect(() => {
@@ -66,9 +84,11 @@ export function MoviPlayer({
     if (!el || audioTrackIndex == null) return;
     const list = (el as any).audioTracks;
     if (!list) return;
-    for (let i = 0; i < list.length; i++) list[i].enabled = i === audioTrackIndex;
+    for (let i = 0; i < list.length; i++) {
+      list[i].enabled = i === audioTrackIndex;
+    }
     try { list.selectedIndex = audioTrackIndex; } catch {}
-  }, [audioTrackIndex, stream]);
+  }, [audioTrackIndex, stream, hasPlayed]);
 
   // Resume
   useEffect(() => {
@@ -84,6 +104,7 @@ export function MoviPlayer({
     return () => el.removeEventListener('loadedmetadata', handler);
   }, [stream, load]);
 
+  // Save position
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
