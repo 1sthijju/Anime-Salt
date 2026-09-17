@@ -3,4 +3,4 @@ main = "src/index.ts"
 compatibility_date = "2024-09-17"
 
 # If you absolutely MUST use Cheerio and Node Crypto, enable this flag:
-# compatibility_flags = [ "nodejs_compat" ]
+compatibility_flags = [ "nodejs_compat" ]
