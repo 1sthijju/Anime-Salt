@@ -1,5 +1,5 @@
 // ============================================================================
-// ANIMESALT EDGE API v3.1.0 — Zero-dependency Cloudflare Worker
+// ANIMESALT EDGE API v3.2.0 — Zero-dependency Cloudflare Worker
 // Architecture:
 //   - Native fetch + Regex parsing (no Cheerio/Express/Hono)
 //   - WAF bypass via reverse proxy fallback (animesalt-proxy.v1nx.workers.dev)
@@ -7,6 +7,7 @@
 //   - Site-native AJAX layer (admin-ajax.php) with PARALLEL season fetching
 //   - Stream decryptors: as-cdn26.top (token AJAX) + Abyss (AES-CTR + Sora)
 //   - /proxy/media: CORS + Referer injection + HLS manifest rewriting
+//   - Abyss URL normalization: short.icu/short.ink → abyssplayer.com
 // ============================================================================
 
 const BASE_URL = "https://animesalt.cx";
@@ -156,7 +157,6 @@ async function fetchPage(path, params) {
   return text;
 }
 
-// AJAX goes straight to the reverse proxy (direct /wp-admin/ is always challenged)
 async function fetchAjax(path) {
   const res = await fetch(`${PROXY_BASE}${path}`, { headers: AJAX_HEADERS });
   return await res.text();
@@ -179,7 +179,6 @@ async function cachedJSON(cacheKey, producer, ttl = CACHE_TTL) {
   return data;
 }
 
-// Bootstrap the site's own AJAX credentials (nonce) — cached at the edge
 async function getSiteConfig() {
   return await cachedJSON("site:config", async () => {
     const html = await fetchPage("/");
@@ -188,7 +187,6 @@ async function getSiteConfig() {
   }, CACHE_TTL_HOME);
 }
 
-// Replicates animesalt.cx's internal XHR layer (admin-ajax.php)
 async function siteAjax(params) {
   const cfg = await getSiteConfig();
   const qs = new URLSearchParams();
@@ -202,8 +200,22 @@ async function getSeriesHtml(animeId) {
 }
 
 // ============================================================================
-// 3. STREAM DECRYPTORS (as-cdn26.top + Abyss)
+// 3. URL NORMALIZERS + STREAM DECRYPTORS
 // ============================================================================
+
+// Rewrite legacy Abyss redirectors (short.icu / short.ink / etc.) to abyssplayer.com/{slug}
+function normalizeAbyssUrl(url) {
+  try {
+    const u = new URL(url);
+    const legacyHosts = ["short.icu", "short.ink", "abysscdn.com", "hydraxcdn.biz", "embedplayabyss.top"];
+    if (legacyHosts.includes(u.hostname)) {
+      const slug = u.pathname.split("/").filter(Boolean).pop() || u.searchParams.get("v") || "";
+      if (slug) return `https://abyssplayer.com/${slug}`;
+    }
+    return url;
+  } catch (e) { return url; }
+}
+
 async function resolveAsCdn26(embedUrl) {
   const videoId = new URL(embedUrl).pathname.split('/').pop();
   const sessionRes = await fetch(embedUrl, { headers: CHROME_HEADERS });
@@ -224,6 +236,7 @@ async function resolveAsCdn26(embedUrl) {
 }
 
 async function resolveAbyss(embedUrl) {
+  embedUrl = normalizeAbyssUrl(embedUrl);
   const html = await fetchPage(embedUrl);
   const datasMatch = html.match(/(?:const|var)\s+datas\s*=\s*"([^"]+)"/);
   if (!datasMatch) throw new Error("No Abyss payload");
@@ -246,7 +259,7 @@ async function resolveAbyss(embedUrl) {
       qualities.push({ resolution: src.label, size: src.size, url: `https://${domain}/sora/${src.size}/${soraToken}` });
     }
   }
-  return { host: "abysscdn.com", source_type: "mp4", qualities };
+  return { host: "abyssplayer.com", source_type: "mp4", qualities };
 }
 
 // ============================================================================
@@ -329,7 +342,6 @@ async function getEpisodesData(animeId, requestedSeason) {
   const nonceMatch = html.match(/"nonce"\s*:\s*"([a-z0-9]+)"/i) || html.match(/ajax_nonce\s*=\s*"([a-z0-9]+)"/i);
   const nonce = nonceMatch ? nonceMatch[1] : "";
 
-  // Season discovery: <select class="sel-temp"> first, then buttons/lists
   const seasons = [];
   const selectMatch = html.match(/<select[^>]*class="[^"]*sel-temp[^"]*"[^>]*>([\s\S]*?)<\/select>/i);
   if (selectMatch) {
@@ -354,7 +366,6 @@ async function getEpisodesData(animeId, requestedSeason) {
     }
   }
 
-  // No season UI at all -> parse whatever episode links exist on the page
   if (seasons.length === 0) {
     const allEps = parseEpisodesFromHtml(html, 1);
     allEps.sort((a, b) => a.season - b.season || a.num - b.num);
@@ -365,7 +376,6 @@ async function getEpisodesData(animeId, requestedSeason) {
     ? seasons
     : seasons.filter(s => s.num === requestedSeason);
 
-  // PARALLEL season fetch via the site's own AJAX layer (1 subrequest each)
   const settled = await Promise.all(targetSeasons.map(async (s) => {
     try {
       const eps = await cachedJSON(`eps:${animeId}:s${s.num}`, async () => {
@@ -395,7 +405,6 @@ async function getEpisodesData(animeId, requestedSeason) {
     else failedSeasons.push(r.num);
   }
 
-  // If AJAX failed entirely, fall back to page-embedded links
   if (episodes.length === 0) {
     const fallback = parseEpisodesFromHtml(html, 1);
     return { postId, seasons, episodes: fallback, failedSeasons };
@@ -422,11 +431,9 @@ function rewriteManifest(text, manifestUrl, workerOrigin) {
     const t = line.trim();
     if (!t) return line;
     if (t.startsWith("#")) {
-      // Rewrite URI="..." inside EXT-X-KEY / EXT-X-MAP / EXT-X-MEDIA
       return line.replace(/URI="([^"]+)"/g, (_m, uri) =>
         `URI="${proxyMediaUrl(workerOrigin, new URL(uri, base).href)}"`);
     }
-    // Segment or child-playlist URI
     return proxyMediaUrl(workerOrigin, new URL(t, base).href);
   }).join("\n");
 }
@@ -445,7 +452,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.1.0",
+          version: "3.2.0",
           endpoints: ["/api/health", "/api/search", "/api/latest-episodes", "/api/popular", "/api/completed", "/api/ongoing", "/api/type/:type", "/api/genre/:category", "/api/info", "/api/episodes/:id", "/api/servers", "/api/stream", "/api/ajax", "/proxy/media"],
         });
       }
@@ -458,7 +465,7 @@ export default {
           upstreamOnline = typeof html === "string" && (html.includes("animesalt") || html.includes("<html"));
           upstreamLatency = Date.now() - t0;
         } catch (err) { upstreamError = err.message; }
-        return jsonResponse({ success: upstreamOnline, status: upstreamOnline ? "healthy" : "degraded", timestamp: new Date().toISOString(), upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError }, version: "3.1.0-edge", endpointsCount: 14 });
+        return jsonResponse({ success: upstreamOnline, status: upstreamOnline ? "healthy" : "degraded", timestamp: new Date().toISOString(), upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError }, version: "3.2.0-edge", endpointsCount: 14 });
       }
 
       if (path === "/api/search") {
@@ -587,7 +594,13 @@ export default {
           const embedUrl = iframeMatch ? iframeMatch[1] : "";
           let languages = [];
           if (embedUrl.includes("multi-lang-plyr/player.php?data=")) {
-            try { const b64Match = embedUrl.match(/data=([A-Za-z0-9+/=]+)/); if (b64Match && b64Match[1]) languages = JSON.parse(atob(b64Match[1])); } catch (e) {}
+            try {
+              const b64Match = embedUrl.match(/data=([A-Za-z0-9+/=]+)/);
+              if (b64Match && b64Match[1]) {
+                const parsed = JSON.parse(atob(b64Match[1]));
+                languages = Array.isArray(parsed) ? parsed.map(l => ({ ...l, link: normalizeAbyssUrl(l.link) })) : [];
+              }
+            } catch (e) {}
           }
           servers.push({ index, serverName: fullName, embedUrl: embedUrl || null, isMultiLang: languages.length > 0, languages });
         }
@@ -611,10 +624,16 @@ export default {
           try {
             const b64Match = embedUrl.match(/data=([A-Za-z0-9+/=]+)/);
             if (b64Match && b64Match[1]) {
-              const languages = JSON.parse(atob(b64Match[1]));
-              if (Array.isArray(languages)) {
-                if (lang) { const m = languages.find(l => l.language?.toLowerCase() === lang.toLowerCase()); if (m) { embedUrl = m.link; selectedLanguage = m.language; } }
-                else if (languages.length > 0) { const eng = languages.find(l => l.language?.toLowerCase().includes("eng")); if (eng) { embedUrl = eng.link; selectedLanguage = eng.language; } }
+              const parsed = JSON.parse(atob(b64Match[1]));
+              const languages = Array.isArray(parsed) ? parsed : [];
+              if (languages.length > 0) {
+                if (lang) {
+                  const m = languages.find(l => l.language?.toLowerCase() === lang.toLowerCase());
+                  if (m) { embedUrl = normalizeAbyssUrl(m.link); selectedLanguage = m.language; }
+                } else {
+                  const eng = languages.find(l => l.language?.toLowerCase().includes("eng"));
+                  if (eng) { embedUrl = normalizeAbyssUrl(eng.link); selectedLanguage = eng.language; }
+                }
               }
             }
           } catch (e) {}
@@ -624,11 +643,12 @@ export default {
         if (embedUrl) {
           try {
             if (embedUrl.includes("as-cdn26.top")) resolvedStream = await resolveAsCdn26(embedUrl);
-            else if (embedUrl.includes("short.icu") || embedUrl.includes("abysscdn.com") || embedUrl.includes("hydraxcdn.biz") || embedUrl.includes("embedplayabyss.top")) resolvedStream = await resolveAbyss(embedUrl);
+            else if (/(short\.icu|short\.ink|abysscdn\.com|hydraxcdn\.biz|embedplayabyss\.top|abyssplayer\.com)/.test(embedUrl)) {
+              resolvedStream = await resolveAbyss(embedUrl);
+            }
           } catch (e) { console.warn(`Decryptor failed: ${e.message}`); }
         }
         if (resolvedStream) {
-          // Attach a ready-to-use proxied URL so frontends don't have to build it
           const workerOrigin = new URL(request.url).origin;
           const primary = resolvedStream.direct_hls || resolvedStream.qualities?.[0]?.url || null;
           return jsonResponse({
@@ -639,7 +659,7 @@ export default {
               serverIndex,
               selectedLanguage,
               isIframe: false,
-              referer: resolvedStream.host === "as-cdn26.top" ? "https://as-cdn26.top/" : "https://abysscdn.com/",
+              referer: resolvedStream.host === "as-cdn26.top" ? "https://as-cdn26.top/" : "https://abyssplayer.com/",
             },
           });
         }
@@ -647,7 +667,6 @@ export default {
       }
 
       if (path === "/api/ajax") {
-        // Raw pass-through to animesalt's internal WordPress AJAX layer
         const action = params.get("action");
         if (!action) return jsonResponse({ success: false, error: "action required" }, 400);
         const passthrough = {};
@@ -656,10 +675,6 @@ export default {
         return new Response(frag, { headers: { "Content-Type": "text/html; charset=utf-8", ...corsHeaders } });
       }
 
-      // --------------------------------------------------------------------
-      // MEDIA PROXY — fixes CORS for HLS manifests, segments, keys, and MP4s
-      // Usage: /proxy/media?url=<encoded upstream url>
-      // --------------------------------------------------------------------
       if (path === "/proxy/media") {
         const target = params.get("url");
         if (!target) return jsonResponse({ error: "url required" }, 400);
