@@ -17,12 +17,26 @@ export function normalizeAbyssUrl(url) {
 export async function resolveAsCdn26(embedUrl) {
   const videoId = new URL(embedUrl).pathname.split('/').pop();
   const sessionRes = await fetch(embedUrl, { headers: CHROME_HEADERS });
+  const embedHtml = await sessionRes.text();
+
   let cookie = "";
   const setCookies = sessionRes.headers.getSetCookie?.() || [];
   for (const c of setCookies) {
     const match = c.match(/fireplayer_player=([^;]+)/);
     if (match) { cookie = `fireplayer_player=${match[1]}`; break; }
   }
+
+  // FirePlayer hides external subtitles in playerjsSubtitle = "[English]https://...jpg"
+  const subtitles = [];
+  const subVarMatch = embedHtml.match(/playerjsSubtitle\s*=\s*"([^"]*)"/i);
+  if (subVarMatch) {
+    const pairRegex = /\[([^\]]+)\](https?:\/\/[^"'\s\\]+)/g;
+    let sm;
+    while ((sm = pairRegex.exec(subVarMatch[1])) !== null) {
+      subtitles.push({ label: sm[1], url: sm[2] });
+    }
+  }
+
   const ajaxRes = await fetch(`https://as-cdn26.top/player/index.php?data=${videoId}&do=getVideo`, {
     method: 'POST',
     headers: { ...AJAX_HEADERS, "Cookie": cookie, "Referer": embedUrl, "Origin": "https://as-cdn26.top", "Content-Type": "application/x-www-form-urlencoded" },
@@ -30,7 +44,7 @@ export async function resolveAsCdn26(embedUrl) {
   });
   const data = await ajaxRes.json();
   if (!data.securedLink) throw new Error("Failed to get as-cdn26 token");
-  return { host: "as-cdn26.top", source_type: "hls", direct_hls: data.securedLink, subtitles: data.tracks || [] };
+  return { host: "as-cdn26.top", source_type: "hls", direct_hls: data.securedLink, subtitles, tracks: data.tracks || [] };
 }
 
 export async function resolveAbyss(embedUrl) {
