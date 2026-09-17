@@ -45,28 +45,27 @@ export function parseHlsMediaGroups(text) {
   return { audio, subtitles };
 }
 
-// ---------------------------------------------------------------------------
-// SRT -> WebVTT converter (FirePlayer serves SRT disguised as .jpg)
-// ---------------------------------------------------------------------------
+// Convert SRT format to WebVTT
 export function srtToVtt(srt) {
   const body = srt
-    .replace(/\r+/g, "")                                   // normalize line endings
-    .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2");     // 00:00:34,910 -> 00:00:34.910
+    .replace(/\r+/g, "")
+    .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2");
   return "WEBVTT\n\n" + body.trim() + "\n";
 }
 
 export async function handleMediaProxy(request) {
   const params = new URL(request.url).searchParams;
   const target = params.get("url");
-  const audio = params.get("audio");     // e.g. "hin" — make this rendition default
-  const force = params.get("force");     // e.g. "text/vtt" — subtitle mode
+  const audio = params.get("audio");
+  const force = params.get("force");
+  const referer = params.get("referer");  // Explicit referer override for CDN auth
   if (!target) return jsonResponse({ error: "url required" }, 400);
   let u;
   try { u = new URL(target); } catch { return jsonResponse({ error: "bad url" }, 400); }
 
   const upstreamHeaders = {
     "User-Agent": CHROME_HEADERS["User-Agent"],
-    "Referer": `${u.origin}/`,
+    "Referer": referer || `${u.origin}/`,  // Use explicit referer if provided, else origin
     "Origin": u.origin,
     "Accept": "*/*",
   };
@@ -78,9 +77,7 @@ export async function handleMediaProxy(request) {
     return new Response(`Upstream returned ${res.status}`, { status: 502, headers: corsHeaders });
   }
 
-  // ------------------------------------------------------------------
-  // SUBTITLE MODE: convert SRT bodies to valid WebVTT on the fly
-  // ------------------------------------------------------------------
+  // SUBTITLE MODE: convert SRT to WebVTT on the fly
   if (force && force.includes("text/vtt")) {
     const raw = await res.text();
     const vtt = raw.trimStart().startsWith("WEBVTT") ? raw : srtToVtt(raw);
