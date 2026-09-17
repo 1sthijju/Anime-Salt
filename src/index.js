@@ -1,11 +1,12 @@
 // ============================================================================
-// ANIMESALT EDGE API — Zero-dependency Cloudflare Worker
+// ANIMESALT EDGE API v3.1.0 — Zero-dependency Cloudflare Worker
 // Architecture:
 //   - Native fetch + Regex parsing (no Cheerio/Express/Hono)
 //   - WAF bypass via reverse proxy fallback (animesalt-proxy.v1nx.workers.dev)
 //   - Edge caching (Cache API) for pages, seasons, and site config
 //   - Site-native AJAX layer (admin-ajax.php) with PARALLEL season fetching
 //   - Stream decryptors: as-cdn26.top (token AJAX) + Abyss (AES-CTR + Sora)
+//   - /proxy/media: CORS + Referer injection + HLS manifest rewriting
 // ============================================================================
 
 const BASE_URL = "https://animesalt.cx";
@@ -409,7 +410,29 @@ async function getEpisodesData(animeId, requestedSeason) {
 }
 
 // ============================================================================
-// 6. NATIVE ROUTER
+// 6. MEDIA PROXY (CORS fix + Referer injection + HLS manifest rewriting)
+// ============================================================================
+function proxyMediaUrl(workerOrigin, absoluteUrl) {
+  return `${workerOrigin}/proxy/media?url=${encodeURIComponent(absoluteUrl)}`;
+}
+
+function rewriteManifest(text, manifestUrl, workerOrigin) {
+  const base = new URL(manifestUrl);
+  return text.split("\n").map(line => {
+    const t = line.trim();
+    if (!t) return line;
+    if (t.startsWith("#")) {
+      // Rewrite URI="..." inside EXT-X-KEY / EXT-X-MAP / EXT-X-MEDIA
+      return line.replace(/URI="([^"]+)"/g, (_m, uri) =>
+        `URI="${proxyMediaUrl(workerOrigin, new URL(uri, base).href)}"`);
+    }
+    // Segment or child-playlist URI
+    return proxyMediaUrl(workerOrigin, new URL(t, base).href);
+  }).join("\n");
+}
+
+// ============================================================================
+// 7. NATIVE ROUTER
 // ============================================================================
 export default {
   async fetch(request, env, ctx) {
@@ -422,8 +445,8 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.0.0",
-          endpoints: ["/api/health", "/api/search", "/api/latest-episodes", "/api/popular", "/api/completed", "/api/ongoing", "/api/type/:type", "/api/genre/:category", "/api/info", "/api/episodes/:id", "/api/servers", "/api/stream", "/api/ajax"],
+          version: "3.1.0",
+          endpoints: ["/api/health", "/api/search", "/api/latest-episodes", "/api/popular", "/api/completed", "/api/ongoing", "/api/type/:type", "/api/genre/:category", "/api/info", "/api/episodes/:id", "/api/servers", "/api/stream", "/api/ajax", "/proxy/media"],
         });
       }
 
@@ -435,7 +458,7 @@ export default {
           upstreamOnline = typeof html === "string" && (html.includes("animesalt") || html.includes("<html"));
           upstreamLatency = Date.now() - t0;
         } catch (err) { upstreamError = err.message; }
-        return jsonResponse({ success: upstreamOnline, status: upstreamOnline ? "healthy" : "degraded", timestamp: new Date().toISOString(), upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError }, version: "3.0.0-edge", endpointsCount: 13 });
+        return jsonResponse({ success: upstreamOnline, status: upstreamOnline ? "healthy" : "degraded", timestamp: new Date().toISOString(), upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError }, version: "3.1.0-edge", endpointsCount: 14 });
       }
 
       if (path === "/api/search") {
@@ -604,7 +627,22 @@ export default {
             else if (embedUrl.includes("short.icu") || embedUrl.includes("abysscdn.com") || embedUrl.includes("hydraxcdn.biz") || embedUrl.includes("embedplayabyss.top")) resolvedStream = await resolveAbyss(embedUrl);
           } catch (e) { console.warn(`Decryptor failed: ${e.message}`); }
         }
-        if (resolvedStream) return jsonResponse({ success: true, data: { ...resolvedStream, serverIndex, selectedLanguage, isIframe: false, referer: resolvedStream.host === "as-cdn26.top" ? "https://as-cdn26.top/" : "https://abysscdn.com/" } });
+        if (resolvedStream) {
+          // Attach a ready-to-use proxied URL so frontends don't have to build it
+          const workerOrigin = new URL(request.url).origin;
+          const primary = resolvedStream.direct_hls || resolvedStream.qualities?.[0]?.url || null;
+          return jsonResponse({
+            success: true,
+            data: {
+              ...resolvedStream,
+              proxied_url: primary ? proxyMediaUrl(workerOrigin, primary) : null,
+              serverIndex,
+              selectedLanguage,
+              isIframe: false,
+              referer: resolvedStream.host === "as-cdn26.top" ? "https://as-cdn26.top/" : "https://abysscdn.com/",
+            },
+          });
+        }
         else return jsonResponse({ success: true, data: { embedUrl, serverIndex, selectedLanguage, isIframe: true, referer: `${BASE_URL}/episode/${epSlug}/` } });
       }
 
@@ -616,6 +654,54 @@ export default {
         for (const [k, v] of params.entries()) passthrough[k] = v;
         const frag = await siteAjax(passthrough);
         return new Response(frag, { headers: { "Content-Type": "text/html; charset=utf-8", ...corsHeaders } });
+      }
+
+      // --------------------------------------------------------------------
+      // MEDIA PROXY — fixes CORS for HLS manifests, segments, keys, and MP4s
+      // Usage: /proxy/media?url=<encoded upstream url>
+      // --------------------------------------------------------------------
+      if (path === "/proxy/media") {
+        const target = params.get("url");
+        if (!target) return jsonResponse({ error: "url required" }, 400);
+        let u;
+        try { u = new URL(target); } catch { return jsonResponse({ error: "bad url" }, 400); }
+
+        const upstreamHeaders = {
+          "User-Agent": CHROME_HEADERS["User-Agent"],
+          "Referer": `${u.origin}/`,
+          "Origin": u.origin,
+          "Accept": "*/*",
+        };
+        const range = request.headers.get("Range");
+        if (range) upstreamHeaders["Range"] = range;
+
+        const res = await fetch(target, { headers: upstreamHeaders, redirect: "follow" });
+        if (!res.ok && res.status !== 206) {
+          return new Response(`Upstream returned ${res.status}`, { status: 502, headers: corsHeaders });
+        }
+
+        const ctype = (res.headers.get("Content-Type") || "").toLowerCase();
+        const isManifest = ctype.includes("mpegurl") || ctype.includes("m3u8") || u.pathname.endsWith(".m3u8");
+
+        const headers = new Headers(corsHeaders);
+        headers.set("Accept-Ranges", "bytes");
+        const cr = res.headers.get("Content-Range"); if (cr) headers.set("Content-Range", cr);
+        const cl = res.headers.get("Content-Length"); if (cl) headers.set("Content-Length", cl);
+
+        if (isManifest) {
+          const text = await res.text();
+          const rewritten = rewriteManifest(text, target, new URL(request.url).origin);
+          headers.set("Content-Type", "application/vnd.apple.mpegurl");
+          headers.set("Cache-Control", "public, max-age=300");
+          return new Response(rewritten, { status: res.status, headers });
+        }
+
+        headers.set("Content-Type", ctype || "application/octet-stream");
+        headers.set("Cache-Control",
+          (u.pathname.endsWith(".ts") || u.pathname.endsWith(".m4s"))
+            ? "public, max-age=86400"
+            : "public, max-age=3600");
+        return new Response(res.body, { status: res.status, headers });
       }
 
       return jsonResponse({ error: "Not found" }, 404);
