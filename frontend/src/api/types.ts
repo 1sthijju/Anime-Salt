@@ -58,18 +58,31 @@ export interface Quality {
   url: string;
 }
 
+export interface Subtitle {
+  label: string;
+  url: string;
+}
+
+export interface AudioLanguage {
+  code: string;
+  name: string;
+}
+
 export interface StreamData {
   host?: string;
   source_type?: 'hls' | 'mp4';
   direct_hls?: string;
   qualities?: Quality[];
-  subtitles?: { file: string; label?: string }[];
+  subtitles?: Subtitle[];
   embedUrl?: string;
   isIframe?: boolean;
   serverIndex: number;
   selectedLanguage?: string | null;
   referer?: string;
   proxied_url?: string | null;
+  audio_languages?: AudioLanguage[];
+  subtitle_languages?: AudioLanguage[];
+  selected_audio?: string | null;
 }
 
 export interface ApiResponse<T> {
