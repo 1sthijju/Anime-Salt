@@ -1,4 +1,4 @@
-import type { Server, StreamData, AudioLanguage } from '../api/types';
+import type { Server, StreamData, AudioLanguage, Subtitle } from '../api/types';
 import type { AudioTrackInfo } from './MoviPlayer';
 import { Badge } from './ui/Badge';
 
@@ -8,48 +8,37 @@ interface Props {
   activeLang?: string;
   activeQuality: number;
   stream: StreamData | null;
-
   audioTracks?: AudioTrackInfo[];
   audioTrackIndex?: number | null;
-
   audioLanguages?: AudioLanguage[];
   activeAudioLang?: string | null;
-
+  subtitles?: Subtitle[];
+  activeSubtitleIndex?: number | null;
   onServerChange: (i: number) => void;
   onLangChange: (lang?: string) => void;
   onQualityChange: (i: number) => void;
   onAudioTrackChange?: (i: number) => void;
   onAudioLangChange?: (code: string) => void;
+  onSubtitleChange?: (i: number | null) => void;
 }
 
 export function ServerControls({
-  servers,
-  activeServer,
-  activeLang,
-  activeQuality,
-  stream,
-  audioTracks = [],
-  audioTrackIndex = null,
-  audioLanguages = [],
-  activeAudioLang = null,
-  onServerChange,
-  onLangChange,
-  onQualityChange,
-  onAudioTrackChange,
-  onAudioLangChange,
+  servers, activeServer, activeLang, activeQuality, stream,
+  audioTracks = [], audioTrackIndex = null,
+  audioLanguages = [], activeAudioLang = null,
+  subtitles = [], activeSubtitleIndex = null,
+  onServerChange, onLangChange, onQualityChange,
+  onAudioTrackChange, onAudioLangChange, onSubtitleChange,
 }: Props) {
   const current = servers[activeServer];
   const hasMultiLang = current?.isMultiLang && current.languages.length > 0;
   const qualities = stream?.qualities;
   const hasMultiQuality = !!qualities && qualities.length > 1;
   const hasMultiAudioTracks = audioTracks.length > 1;
-  
-  // Only show manifest-driven audio row if player can't switch tracks itself
   const hasManifestAudio = audioLanguages.length > 1 && audioTracks.length < 2;
 
   return (
     <div className="bg-card rounded-xl p-4 space-y-3">
-      {/* Servers */}
       <div>
         <div className="text-xs text-muted mb-2 uppercase tracking-wide">Server</div>
         <div className="flex flex-wrap gap-2">
@@ -62,7 +51,6 @@ export function ServerControls({
         </div>
       </div>
 
-      {/* Abyss multi-lang (English / Japanese links) */}
       {hasMultiLang && (
         <div className="pt-3 border-t border-border">
           <div className="text-xs text-muted mb-2 uppercase tracking-wide">Audio (server)</div>
@@ -81,7 +69,6 @@ export function ServerControls({
         </div>
       )}
 
-      {/* Player-exposed audio tracks (instant switching) */}
       {hasMultiAudioTracks && onAudioTrackChange && (
         <div className="pt-3 border-t border-border">
           <div className="text-xs text-muted mb-2 uppercase tracking-wide">Audio track</div>
@@ -101,7 +88,6 @@ export function ServerControls({
         </div>
       )}
 
-      {/* HLS manifest audio languages (fallback for engines without track switching) */}
       {hasManifestAudio && onAudioLangChange && (
         <div className="pt-3 border-t border-border">
           <div className="text-xs text-muted mb-2 uppercase tracking-wide">Audio language</div>
@@ -120,7 +106,31 @@ export function ServerControls({
         </div>
       )}
 
-      {/* Quality ladder */}
+      {subtitles.length > 0 && onSubtitleChange && (
+        <div className="pt-3 border-t border-border">
+          <div className="text-xs text-muted mb-2 uppercase tracking-wide">Subtitles</div>
+          <div className="flex flex-wrap gap-2">
+            <Badge
+              variant="violet"
+              active={activeSubtitleIndex == null}
+              onClick={() => onSubtitleChange(null)}
+            >
+              Off
+            </Badge>
+            {subtitles.map((s, i) => (
+              <Badge
+                key={s.url}
+                variant="violet"
+                active={activeSubtitleIndex === i}
+                onClick={() => onSubtitleChange(i)}
+              >
+                {s.label}
+              </Badge>
+            ))}
+          </div>
+        </div>
+      )}
+
       {hasMultiQuality && (
         <div className="pt-3 border-t border-border">
           <div className="text-xs text-muted mb-2 uppercase tracking-wide">Quality</div>
@@ -133,27 +143,17 @@ export function ServerControls({
                 onClick={() => onQualityChange(i)}
               >
                 {q.resolution || `Q${i + 1}`}
-                {q.size && (
-                  <span className="ml-1 opacity-70">
-                    ({Math.round(q.size / (1024 * 1024))}MB)
-                  </span>
-                )}
               </Badge>
             ))}
           </div>
         </div>
       )}
 
-      {/* Stream metadata */}
       {stream && (
         <div className="pt-3 border-t border-border text-xs text-muted flex flex-wrap gap-3">
           {stream.host && <span>Host: {stream.host}</span>}
           {stream.source_type && <span>Type: {stream.source_type.toUpperCase()}</span>}
-          {stream.selectedLanguage && <span>Server audio: {stream.selectedLanguage}</span>}
           {stream.selected_audio && <span>HLS audio: {stream.selected_audio}</span>}
-          {stream.subtitles && stream.subtitles.length > 0 && (
-            <span>Subs: {stream.subtitles.map((s) => s.label).join(', ')}</span>
-          )}
           <span className="opacity-60">via media proxy</span>
         </div>
       )}
