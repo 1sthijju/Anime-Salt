@@ -49,6 +49,7 @@ export function MoviPlayer({
       return;
     }
 
+    // Referer/Origin are injected server-side by /proxy/media
     el.setAttribute('headers', '{}');
     el.setAttribute(
       'engine',
@@ -92,6 +93,7 @@ export function MoviPlayer({
     const events = ['loadedmetadata', 'canplay', 'playing', 'trackschange'];
     events.forEach((evt) => el.addEventListener(evt, readTracks));
 
+    // Retry after delays (some engines load tracks late)
     const timers = [
       window.setTimeout(readTracks, 800),
       window.setTimeout(readTracks, 2500),
@@ -194,6 +196,9 @@ export function MoviPlayer({
           label={s.label}
           kind="subtitles"
           default={i === 0 ? true : undefined}
+          onError={(e) => {
+            console.error(`Subtitle track failed to load: ${s.label}`, s.url, e);
+          }}
         />
       ))}
     </movi-player>
