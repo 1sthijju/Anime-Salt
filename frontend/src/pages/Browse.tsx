@@ -31,10 +31,17 @@ export default function Browse() {
           data = await api.genre(slug, pageNum);
         } else if (kind) {
           // Catalog route
-          if (kind === 'ongoing' || kind === 'completed') {
-            data = await api[kind](pageNum);
-          } else {
-            data = await api.browse(kind as 'series' | 'movies' | 'anime' | 'cartoon', pageNum);
+          if (kind === 'ongoing') {
+            data = await api.ongoing(pageNum);
+          } else if (kind === 'completed') {
+            data = await api.completed(pageNum);
+          } else if (
+            kind === 'series' ||
+            kind === 'movies' ||
+            kind === 'anime' ||
+            kind === 'cartoon'
+          ) {
+            data = await api.browse(kind, pageNum);
           }
         }
 
