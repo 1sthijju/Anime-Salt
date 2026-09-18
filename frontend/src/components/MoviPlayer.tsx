@@ -17,6 +17,7 @@ interface Props {
   title?: string;
   slug: string;
   activeSubtitle?: Subtitle | null;
+  onToggleSubtitle?: (enabled: boolean) => void;
   onError?: (message: string) => void;
   onAudioTracks?: (tracks: AudioTrackInfo[]) => void;
   audioTrackIndex?: number | null;
@@ -29,6 +30,7 @@ export function MoviPlayer({
   title,
   slug,
   activeSubtitle,
+  onToggleSubtitle,
   onError,
   onAudioTracks,
   audioTrackIndex,
@@ -41,6 +43,7 @@ export function MoviPlayer({
   const [cues, setCues] = useState<VttCue[]>([]);
   const [cueText, setCueText] = useState('');
 
+  // Fetch + parse VTT; ALWAYS clear both states when disabled
   useEffect(() => {
     let cancelled = false;
     setCues([]);
@@ -51,23 +54,24 @@ export function MoviPlayer({
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.text();
       })
-      .then((t) => { if (!cancelled) setCues(parseVtt(t)); })
+      .then((t) => {
+        if (!cancelled) setCues(parseVtt(t));
+      })
       .catch((e) => console.error('Subtitle fetch failed:', activeSubtitle.url, e));
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [activeSubtitle?.url]);
 
-  // rAF-synced cue display (smoother than timeupdate)
+  // rAF sync loop — NEVER early-returns, so the overlay self-heals every frame
   useEffect(() => {
-    if (!cues.length) return;
     let raf = 0;
     const tick = () => {
       const el = ref.current as any;
-      if (el && typeof el.currentTime === 'number') {
-        const t = el.currentTime;
-        const cue = cues.find((c) => t >= c.start && t <= c.end);
-        const next = cue ? cue.text : '';
-        setCueText((prev) => (prev === next ? prev : next));
-      }
+      const t = el && typeof el.currentTime === 'number' ? el.currentTime : -1;
+      const cue = t >= 0 ? cues.find((c) => t >= c.start && t <= c.end) : undefined;
+      const next = cue ? cue.text : '';
+      setCueText((prev) => (prev === next ? prev : next));
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
@@ -173,6 +177,8 @@ export function MoviPlayer({
     );
   }
 
+  const hasSubs = !!activeSubtitle;
+
   return (
     <div className="relative">
       <movi-player
@@ -185,6 +191,23 @@ export function MoviPlayer({
         persist="volume speed audiolang"
         persistkey="animesalt"
       />
+
+      {/* CC button on the player */}
+      {onToggleSubtitle && (stream?.subtitles?.length ?? 0) > 0 && (
+        <button
+          onClick={() => onToggleSubtitle(!hasSubs)}
+          title="Toggle subtitles"
+          className={`absolute top-3 right-12 z-20 rounded-md px-2.5 py-1.5 text-xs font-bold backdrop-blur border transition ${
+            hasSubs
+              ? 'bg-accent/90 border-accent text-white'
+              : 'bg-black/50 border-white/20 text-white/70 hover:text-white'
+          }`}
+        >
+          CC
+        </button>
+      )}
+
+      {/* Subtitle overlay */}
       {cueText && (
         <div className="pointer-events-none absolute inset-x-0 bottom-20 z-10 flex justify-center px-6">
           <div
