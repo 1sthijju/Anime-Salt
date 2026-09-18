@@ -24,7 +24,7 @@ export function parseVtt(vtt: string): VttCue[] {
     if (!lines.length) continue;
     if (/^(WEBVTT|NOTE|STYLE|REGION)/.test(lines[0])) continue;
     let idx = 0;
-    if (!lines[0].includes('-->')) idx = 1; // skip cue identifier
+    if (!lines[0].includes('-->')) idx = 1;
     const timeLine = lines[idx];
     if (!timeLine || !timeLine.includes('-->')) continue;
     const [startStr, endStr] = timeLine.split('-->');
@@ -33,9 +33,9 @@ export function parseVtt(vtt: string): VttCue[] {
     const text = lines
       .slice(idx + 1)
       .join('\n')
-      .replace(/<[^>]+>/g, '')                       // strip inline tags
+      .replace(/<[^>]+>/g, '')
       .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
-      .replace(/^\\-/gm, '-')                        // FirePlayer escaped dashes
+      .replace(/^\\-/gm, '-')
       .trim();
     if (text) cues.push({ start, end, text });
   }
