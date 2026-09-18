@@ -64,13 +64,7 @@ export function parseEpisodesFromHtml(html, seasonNum) {
   return eps;
 }
 
-/**
- * Extract the embed iframe URL for a given server index from an episode page.
- * Handles nested wrapper divs via lookahead boundaries, then falls back to
- * the Nth iframe in document order.
- */
 export function extractEmbedForIndex(html, index) {
-  // Strategy 1: capture the options-N container with tolerant boundary detection
   const containerRegex = new RegExp(
     `<div[^>]*id="options-${index}"[^>]*>([\\s\\S]*?)(?=<div[^>]*id="options-\\d+|<div[^>]*class="[^"]*(?:server-section|download|related)[^"]*"|</section>|<footer[^>]*>|$)`,
     'i'
@@ -80,8 +74,6 @@ export function extractEmbedForIndex(html, index) {
     const iframeMatch = containerMatch[1].match(/<iframe[^>]*(?:src|data-src)="([^"]+)"/i);
     if (iframeMatch && iframeMatch[1]) return iframeMatch[1];
   }
-
-  // Strategy 2: fallback — pick the Nth iframe in document order
   const iframeRegex = /<iframe[^>]*(?:src|data-src)="([^"]+)"/gi;
   let m, i = 0;
   while ((m = iframeRegex.exec(html)) !== null) {
@@ -91,34 +83,95 @@ export function extractEmbedForIndex(html, index) {
   return "";
 }
 
-/**
- * ROBUST Taxonomy extraction: searches for ANY URL containing the taxonomy word.
- * Handles /genre/action/, /category/genre/action/, ?genre=action, etc.
- * Returns {slug, name, url} objects.
- */
 export function extractTaxonomy(html, tax) {
   const results = [];
-  // Match href=".../[tax]/[slug]/" or href=".../[tax]/[slug]"
   const regex = new RegExp(`href="([^"]*\\/${tax}\\/([^\\/"]+)\\/?)["']`, "gi");
   let m;
   while ((m = regex.exec(html)) !== null) {
     const fullUrl = m[1];
     const slug = m[2];
-    
-    // Extract the visible text from the <a> tag
     const tagEnd = html.indexOf("</a>", m.index);
     const tagStart = html.lastIndexOf(">", m.index);
     let name = "";
     if (tagStart > -1 && tagEnd > tagStart) {
       name = html.substring(tagStart + 1, tagEnd).replace(/<[^>]+>/g, "").trim();
     }
-    
-    // Fallback: use the slug as the name (capitalized)
     if (!name) name = slug.replace(/-/g, " ").replace(/\b\w/g, l => l.toUpperCase());
-    
     if (slug && name && !results.find(r => r.slug === slug)) {
       results.push({ slug, name, url: fullUrl });
     }
   }
   return results;
+}
+
+// ===========================================================================
+// HOMEPAGE SECTION SPLITTER
+// Finds each titled block on the homepage and extracts its items.
+// ===========================================================================
+export const HOME_SECTION_TITLES = [
+  "Most-Watched Series",
+  "Most-Watched Films",
+  "Fresh Drops",
+  "On-Air Series",
+  "New Anime Arrivals",
+  "Just In: Cartoon Series",
+  "Latest Anime Movies",
+  "Fresh Cartoon Films",
+  "Latest Episodes",
+];
+
+// "Just In: Cartoon Series" -> /Just[^A-Za-z0-9]{0,3}In[^A-Za-z0-9]{0,3}Cartoon.../i
+function titleRegex(title) {
+  const words = title.split(/[^A-Za-z0-9]+/).filter(Boolean);
+  return new RegExp(words.join("[^A-Za-z0-9]{0,3}"), "i");
+}
+
+function isInsideScriptOrStyle(html, idx) {
+  const before = html.slice(0, idx);
+  if (before.lastIndexOf("<script") > before.lastIndexOf("</script")) return true;
+  if (before.lastIndexOf("<style") > before.lastIndexOf("</style")) return true;
+  return false;
+}
+
+// First occurrence of the title that is a HEADING, not a nav/menu link
+function findSectionStart(html, title) {
+  const re = titleRegex(title);
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    if (isInsideScriptOrStyle(html, m.index)) continue;
+    const back = html.lastIndexOf("<", m.index);
+    if (back === -1 || m.index - back > 200) continue;
+    const tagMatch = html.slice(back, back + 40).match(/^<\s*([a-zA-Z0-9]+)/);
+    const tag = tagMatch ? tagMatch[1].toLowerCase() : "";
+    if (tag === "a" || tag === "option" || tag === "script" || tag === "style") continue;
+    return m.index;
+  }
+  return -1;
+}
+
+export function extractHomeSections(html) {
+  const positions = [];
+  for (const title of HOME_SECTION_TITLES) {
+    const idx = findSectionStart(html, title);
+    if (idx !== -1) positions.push({ title, idx });
+  }
+  positions.sort((a, b) => a.idx - b.idx);
+
+  const sections = {};
+  for (let i = 0; i < positions.length; i++) {
+    const start = positions[i].idx;
+    const end = i + 1 < positions.length ? positions[i + 1].idx : html.length;
+    const slice = html.slice(start, end);
+
+    let items = extractPopularItems(slice);          // ranked chart blocks
+    if (!items.length) items = extractAnimeList(slice); // article grids
+
+    items = items.map(it => ({
+      ...it,
+      type: it.url && it.url.includes("/movies/") ? "movie" : (it.type || "series"),
+    })).slice(0, 25);
+
+    sections[positions[i].title] = items;
+  }
+  return sections;
 }
