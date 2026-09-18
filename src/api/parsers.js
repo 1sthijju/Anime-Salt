@@ -44,7 +44,7 @@ export function extractPopularItems(html, targetType) {
   return results;
 }
 
-// Episodes + their thumbnail stills (lazy-load aware)
+// Episodes + their thumbnail stills (every lazy-load + background-image pattern)
 export function parseEpisodesFromHtml(html, seasonNum) {
   const eps = [];
   const epRegex = /<a[^>]+href="([^"]+\/episode\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
@@ -61,17 +61,21 @@ export function parseEpisodesFromHtml(html, seasonNum) {
     const titleMatch = match[2].match(/class="[^"]*(?:entry-title|title)[^"]*"[^>]*>([^<]+)/i) || match[2].match(/>([^<]+)</i);
     const title = titleMatch ? titleMatch[1].trim().replace(/^\d+\s*/, "").replace(/\s*View\s*$/i, "").trim() : `Episode ${epNum}`;
 
-    // Episode still / thumbnail
+    // Episode still — try every common lazy-load attribute, then background-image
     let image = "";
     const imgTag = match[2].match(/<img[^>]*>/i);
     if (imgTag) {
-      const lazy = imgTag[0].match(/\b(?:data-lazy-src|data-original|data-src|data-cfsrc)="([^"]+)"/i);
+      const lazy = imgTag[0].match(/\b(?:data-lazy-src|data-original|data-src|data-cfsrc|data-bg|data-lazy|data-echo|data-srcset)="([^"]+)"/i);
       const plain = imgTag[0].match(/\bsrc="([^"]+)"/i);
       image = lazy ? lazy[1] : (plain && !plain[1].startsWith("data:") ? plain[1] : "");
     }
-    if (image.startsWith("//")) image = "https:" + image;
+    if (!image) {
+      const bgMatch = match[2].match(/style="[^"]*background-image:\s*url\(['"]?([^'")]+)['"]?\)/i);
+      if (bgMatch) image = bgMatch[1];
+    }
+    if (image && image.startsWith("//")) image = "https:" + image;
 
-    if (!eps.find(e => e.slug === epSlug)) eps.push({ num: epNum, season: sNum, title, slug: epSlug, url, image });
+    if (!eps.find(e => e.slug === epSlug)) eps.push({ num: epNum, season: sNum, title, slug: epSlug, url, image: image || null });
   }
   return eps;
 }
@@ -131,7 +135,6 @@ export const HOME_SECTION_TITLES = [
   "Latest Episodes",
 ];
 
-// "Just In: Cartoon Series" -> /Just[^A-Za-z0-9]{0,3}In[^A-Za-z0-9]{0,3}Cartoon.../i
 function titleRegex(title) {
   const words = title.split(/[^A-Za-z0-9]+/).filter(Boolean);
   return new RegExp(words.join("[^A-Za-z0-9]{0,3}"), "i");
@@ -144,7 +147,6 @@ function isInsideScriptOrStyle(html, idx) {
   return false;
 }
 
-// First occurrence of the title that is a HEADING, not a nav/menu link
 function findSectionStart(html, title) {
   const re = titleRegex(title);
   let m;
@@ -174,8 +176,8 @@ export function extractHomeSections(html) {
     const end = i + 1 < positions.length ? positions[i + 1].idx : html.length;
     const slice = html.slice(start, end);
 
-    let items = extractPopularItems(slice);          // ranked chart blocks
-    if (!items.length) items = extractAnimeList(slice); // article grids
+    let items = extractPopularItems(slice);
+    if (!items.length) items = extractAnimeList(slice);
 
     items = items.map(it => ({
       ...it,
