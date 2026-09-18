@@ -2,115 +2,50 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
-  --movi-accent: #8B5CF6 #22D3EE;
+@layer base {
+  html {
+    scroll-behavior: smooth;
+  }
+  body {
+    @apply bg-bg font-sans text-white antialiased;
+  }
+  ::selection {
+    @apply bg-accent/60 text-white;
+  }
 }
 
-body {
-  @apply bg-bg text-gray-100 antialiased;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+@layer components {
+  .container-x {
+    @apply mx-auto w-full max-w-7xl px-4 sm:px-6;
+  }
+  .nav-link {
+    @apply rounded-lg px-3 py-2 text-sm font-medium text-muted transition-colors hover:bg-card hover:text-white;
+  }
+  .btn-primary {
+    @apply inline-flex items-center gap-2 rounded-xl bg-accent px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-accent-soft hover:shadow-glow;
+  }
+  .btn-ghost {
+    @apply inline-flex items-center gap-2 rounded-xl border border-line bg-card/60 px-5 py-2.5 text-sm font-semibold text-white/80 transition hover:border-accent/60 hover:text-white;
+  }
+  .chip {
+    @apply rounded-full border border-line bg-card px-3 py-1 text-xs font-medium text-muted transition hover:border-accent/60 hover:text-white;
+  }
+  .chip-active {
+    @apply border-accent bg-accent/20 text-white;
+  }
 }
 
-movi-player {
-  display: block;
-  width: 100%;
-  aspect-ratio: 16/9;
-  border-radius: 0.75rem;
-  overflow: hidden;
-  background: #000;
-}
+/* Scrollbar */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: #0a0a12; }
+::-webkit-scrollbar-thumb { background: #2a2a45; border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: #8b5cf6; }
 
-.scrollbar-hide::-webkit-scrollbar { display: none; }
-.scrollbar-hide { scrollbar-width: none; }
+/* Horizontal rails: hide scrollbar */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
 
+/* Skeleton shimmer */
 .skeleton {
-  background: linear-gradient(90deg, #1f1f2a 25%, #2a2a3a 50%, #1f1f2a 75%);
-  background-size: 200% 100%;
-  animation: shimmer 1.5s infinite;
-}
-
-@keyframes shimmer {
-  0% { background-position: -200% 0; }
-  100% { background-position: 200% 0; }
-}
-
-/* =========================================
-   ANIME PLAYER THEME
-   ========================================= */
-
-.anime-player-container {
-  position: relative;
-  border-radius: 1rem;
-  overflow: hidden;
-  box-shadow: 0 0 40px rgba(139, 92, 246, 0.2), 0 0 80px rgba(139, 92, 246, 0.1);
-  transition: box-shadow 0.3s ease;
-}
-
-.anime-player-container:hover {
-  box-shadow: 0 0 60px rgba(139, 92, 246, 0.4), 0 0 120px rgba(139, 92, 246, 0.2);
-}
-
-.anime-player {
-  /* Anime Theme CSS Variables for Movi Player */
-  --movi-accent: #8b5cf6;           /* Violet-500 */
-  --movi-accent-hover: #a78bfa;     /* Violet-400 */
-  --movi-text: #ffffff;
-  --movi-text-muted: #a1a1aa;
-  --movi-bg: rgba(15, 15, 25, 0.95);
-  --movi-bg-hover: rgba(25, 25, 40, 0.95);
-  --movi-border: rgba(139, 92, 246, 0.3);
-  --movi-border-hover: rgba(139, 92, 246, 0.6);
-  --movi-radius: 0.75rem;
-  --movi-control-size: 2.5rem;
-  
-  width: 100%;
-  height: 100%;
-  border-radius: 1rem;
-}
-
-/* Ambient mode glow effect */
-.anime-player[ambient="true"] {
-  animation: ambient-glow 4s ease-in-out infinite alternate;
-}
-
-@keyframes ambient-glow {
-  0% { box-shadow: 0 0 40px rgba(139, 92, 246, 0.4); }
-  100% { box-shadow: 0 0 80px rgba(139, 92, 246, 0.6), 0 0 120px rgba(236, 72, 153, 0.3); }
-}
-
-.anime-subtitle-text {
-  animation: subtitle-fade 0.3s ease-out;
-}
-
-@keyframes subtitle-fade {
-  from { opacity: 0; transform: translateY(10px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
-.skip-button {
-  font-weight: 600;
-  font-size: 0.875rem;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
-}
-
-.skip-button:hover {
-  transform: translateY(-2px) scale(1.05);
-  box-shadow: 0 6px 20px rgba(139, 92, 246, 0.6);
-}
-
-.anime-glow {
-  animation: loading-glow 2s ease-in-out infinite alternate;
-}
-
-@keyframes loading-glow {
-  0% { box-shadow: 0 0 20px rgba(139, 92, 246, 0.2); }
-  100% { box-shadow: 0 0 40px rgba(139, 92, 246, 0.4); }
-}
-
-/* Focus states for accessibility */
-.anime-player-container:focus-within {
-  outline: 2px solid rgba(139, 92, 246, 0.5);
-  outline-offset: 2px;
+  @apply animate-pulse rounded-xl bg-card;
 }
