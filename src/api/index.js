@@ -65,6 +65,7 @@ function isContentPage(html) {
 const BAD_IMAGE = /cropped-|icon\.png|logo\.png|favicon|AnimeSalticon/i;
 // Landscape TMDB profiles = backdrops / episode stills, never posters
 const LANDSCAPE_TMDB = /image\.tmdb\.org\/t\/p\/w(?:780|1280|1920|original)\//i;
+const PORTRAIT_TMDB = /image\.tmdb\.org\/t\/p\/w(?:500|342|185|154)\//i;
 
 // ---------------------------------------------------------------------------
 // Worker entry
@@ -83,7 +84,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.18.0",
+          version: "3.19.0",
           endpoints: {
             system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings", "/api/debug/poster"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
@@ -117,7 +118,7 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.18.0-edge",
+          version: "3.19.0-edge",
           endpointsCount: 31
         });
       }
@@ -210,7 +211,7 @@ export default {
       }
 
       // ====================================================================
-      // DEBUG: verbatim poster markup
+      // DEBUG: verbatim poster/backdrop markup before the title
       // ====================================================================
       if (path === "/api/debug/poster") {
         const id = params.get("id");
@@ -486,8 +487,10 @@ export default {
       }
 
       // ====================================================================
-      // Anime / movie details — v3.18.0: poster = last img before <h1>,
-      // year = runtime-adjacent year in visible text
+      // Anime / movie details — v3.19.0
+      // poster  = last portrait img right before <h1>
+      // backdrop = landscape artwork (bg-image or landscape img) before <h1>
+      // year    = runtime-adjacent year in visible text
       // ====================================================================
       if (path === "/api/info") {
         const animeId = params.get("id") || params.get("slug");
@@ -523,11 +526,11 @@ export default {
                         || data.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
         const title = titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').trim() : "Unknown";
 
-        // ---------------- POSTER ----------------
-        // The poster card is the LAST image right above the <h1> title.
+        // Slice of HTML before the title (hero area: backdrop + poster live here)
         const titleIdx = data.search(/<h1/i);
         const beforeTitle = data.slice(0, titleIdx > -1 ? titleIdx : 20000);
 
+        // ---------------- POSTER ----------------
         let poster = "";
         const imgsBefore = [...beforeTitle.matchAll(/<img[^>]*>/gi)];
         for (let i = imgsBefore.length - 1; i >= 0 && !poster; i--) {
@@ -537,20 +540,19 @@ export default {
           const url = srcM[1];
           if (url.startsWith("data:")) continue;          // lazy placeholder
           if (BAD_IMAGE.test(url)) continue;              // site icon/logo
-          if (LANDSCAPE_TMDB.test(url)) continue;         // backdrop / episode still
+          if (LANDSCAPE_TMDB.test(url)) continue;         // backdrop / still
           poster = url;
         }
-
-        // Fallback: last background-image before the title
+        // Fallback: background-image before title (portrait or any non-icon)
         if (!poster) {
           const bgs = [...beforeTitle.matchAll(/background-image:\s*url\(['"]?([^'")]+)['"]?\)/gi)];
           for (let i = bgs.length - 1; i >= 0 && !poster; i--) {
             const url = bgs[i][1];
-            if (url.startsWith("data:") || BAD_IMAGE.test(url) || LANDSCAPE_TMDB.test(url)) continue;
+            if (url.startsWith("data:") || BAD_IMAGE.test(url)) continue;
+            if (LANDSCAPE_TMDB.test(url)) continue;
             poster = url;
           }
         }
-
         // Fallback: og:image (filtered)
         if (!poster) {
           const ogMatch = data.match(/<meta[^>]*property="og:image"[^>]*content="([^"]+)"/i);
@@ -558,14 +560,31 @@ export default {
             poster = ogMatch[1];
           }
         }
-
-        // Last resort: first portrait-profile TMDB url anywhere
+        // Last resort: first portrait TMDB url anywhere
         if (!poster) {
           const t = data.match(/https:\/\/image\.tmdb\.org\/t\/p\/w(?:500|342|185|154)\/[^"'\s<>]+/);
           if (t) poster = t[0];
         }
-
         if (poster.startsWith("//")) poster = "https:" + poster;
+
+        // ---------------- BACKDROP (hero background artwork) ----------------
+        let backdrop = "";
+        const bgUrls = [...beforeTitle.matchAll(/background-image:\s*url\(['"]?([^'")]+)['"]?\)/gi)]
+          .map(m => m[1]);
+        const landscapeImgs = imgsBefore.map(tag => {
+          const srcM = tag[0].match(/\b(?:data-lazy-src|data-original|data-src|data-cfsrc|src)="([^"]+)"/i);
+          return srcM ? srcM[1] : "";
+        });
+        const bgCandidates = [...bgUrls, ...landscapeImgs].filter(u => u && !u.startsWith("data:"));
+        backdrop = bgCandidates.find(u => LANDSCAPE_TMDB.test(u)) || "";
+        if (!backdrop) {
+          const lm = data.match(/https:\/\/image\.tmdb\.org\/t\/p\/w(?:1280|780|1920|original)\/[^"'\s<>)]+/);
+          if (lm) backdrop = lm[0];
+        }
+        if (!backdrop) {
+          backdrop = bgCandidates.find(u => !BAD_IMAGE.test(u)) || "";
+        }
+        if (backdrop.startsWith("//")) backdrop = "https:" + backdrop;
 
         // Description
         const descMatch = data.match(/<div[^>]*id="overview-text"[^>]*>([\s\S]*?)<\/div>/i) 
@@ -591,7 +610,6 @@ export default {
         }
 
         // ---------------- YEAR ----------------
-        // Visible text only (tags stripped) so SVG viewBox digits can't interfere.
         const textOnly = data
           .replace(/<script[\s\S]*?<\/script>/gi, " ")
           .replace(/<style[\s\S]*?<\/style>/gi, " ")
@@ -599,12 +617,10 @@ export default {
           .replace(/&[a-z#0-9]+;/gi, " ");
 
         let year = null;
-        // "24 min 2004" / "1h 37m 2015" — runtime chip followed by year chip
         const runtimeYear = textOnly.match(/(?:\d+\s*h(?:rs?)?(?:\s*\d+\s*m(?:in)?)?|\d+\s*m(?:in)?)\s*((?:19|20)\d{2})\b/i);
         if (runtimeYear) {
           year = parseInt(runtimeYear[1]);
         }
-        // schema.org JSON-LD
         if (!year) {
           const jsonLdMatch = data.match(/<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/i);
           if (jsonLdMatch) {
@@ -617,12 +633,10 @@ export default {
             } catch (e) {}
           }
         }
-        // meta tag
         if (!year) {
           const ym = textOnly.match(/release\s*year\s*((?:19|20)\d{2})/i);
           if (ym) year = parseInt(ym[1]);
         }
-        // earliest plausible year in visible text
         if (!year) {
           const years = [...textOnly.matchAll(/\b((?:19|20)\d{2})\b/g)]
             .map(m => parseInt(m[1]))
@@ -669,7 +683,6 @@ export default {
               totalEpisodes = epData.episodes.length;
             }
           } catch (e) {}
-          // Cross-check with visible "46 Episodes" chip
           if (!totalEpisodes) {
             const epChip = textOnly.match(/(\d+)\s*Episodes/i);
             if (epChip) totalEpisodes = parseInt(epChip[1]);
@@ -684,6 +697,7 @@ export default {
             id: animeId, 
             title, 
             poster, 
+            backdrop,
             description, 
             type, 
             totalEpisodes, 
@@ -697,7 +711,7 @@ export default {
       }
 
       // ====================================================================
-      // Episodes — with MOVIE fallback (synthetic single episode)
+      // Episodes — with MOVIE fallback (synthetic episode + poster as still)
       // ====================================================================
       if (path.startsWith("/api/episodes/")) {
         const animeId = path.split("/")[3];
@@ -714,12 +728,15 @@ export default {
 
         if (!episodes.length) {
           let title = animeId.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+          let image = "";
           try {
             const html = await cachedJSON(`html:movies:${animeId}`, () => fetchPage(`/movies/${animeId}/`), CACHE_TTL_HOME);
             const t = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
             if (t) title = t[1].replace(/<[^>]+>/g, "").trim();
+            const stillMatch = html.match(/https:\/\/image\.tmdb\.org\/t\/p\/w(?:500|342|185|154)\/[^"'\s<>]+/);
+            if (stillMatch) image = stillMatch[0];
           } catch (e) {}
-          const ep = { num: 1, season: 1, title, slug: animeId, url: `${BASE_URL}/movies/${animeId}/` };
+          const ep = { num: 1, season: 1, title, slug: animeId, url: `${BASE_URL}/movies/${animeId}/`, image };
           return jsonResponse({
             success: true,
             data: {
