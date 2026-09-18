@@ -62,7 +62,6 @@ function isContentPage(html) {
 const BAD_IMAGE = /cropped-|icon\.png|logo\.png|favicon|AnimeSalticon/i;
 const LANDSCAPE_TMDB = /image\.tmdb\.org\/t\/p\/w(?:780|1280|1920|original)\//i;
 const PORTRAIT_TMDB = /image\.tmdb\.org\/t\/p\/w(?:500|342|185|154)\//i;
-// Rejects site-branded assets (animesalt logos/long banners) from being picked as backdrop
 const SITE_ASSET = /animesalt\.cx\/wp-content\/uploads|AnimeSalt|cropped-|icon\.png|logo\.png|favicon/i;
 
 // ---------------------------------------------------------------------------
@@ -79,7 +78,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.21.0",
+          version: "3.23.0",
           endpoints: {
             system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings", "/api/debug/poster"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
@@ -110,7 +109,7 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.21.0-edge",
+          version: "3.23.0-edge",
           endpointsCount: 31
         });
       }
@@ -415,7 +414,7 @@ export default {
       }
 
       // ====================================================================
-      // Anime / movie details — v3.21.0
+      // Anime / movie details — v3.23.0 (Full Page Parity)
       // ====================================================================
       if (path === "/api/info") {
         const animeId = params.get("id") || params.get("slug");
@@ -483,31 +482,20 @@ export default {
         if (poster.startsWith("//")) poster = "https:" + poster;
 
         // ---------------- BACKDROP (landscape ONLY) ----------------
-        // Strict: ONLY accept TMDB landscape profiles (w1280/w780/w1920)
-        // If no landscape exists on the page, backdrop stays empty
         let backdrop = "";
-        
-        // 1) Collect all image URLs from background-image + img tags before title
-        const bgUrls = [...beforeTitle.matchAll(/background-image:\s*url\(['"]?([^'")]+)['"]?\)/gi)].map(m => m[1]);
-        const allImgs = imgsBefore.map(tag => {
-          const srcM = tag[0].match(/\b(?:data-lazy-src|data-original|data-src|data-cfsrc|src)="([^"]+)"/i);
-          return srcM ? srcM[1] : "";
-        });
-        const allCandidates = [...bgUrls, ...allImgs]
-          .filter(u => u && !u.startsWith("data:") && !SITE_ASSET.test(u) && !BAD_IMAGE.test(u));
-        
-        // 2) ONLY accept TMDB landscape profile from before-title area
-        backdrop = allCandidates.find(u => LANDSCAPE_TMDB.test(u)) || "";
-        
-        // 3) Fallback: search ENTIRE document for any TMDB landscape URL
+        const unescaped = data.replace(/\\\//g, "/"); // themes often escape slashes in JSON
+        const urlInStyles = [...unescaped.matchAll(/url\(\s*['"]?(https?:\/\/[^'")]+|\/\/[^'")]+)['"]?\s*\)/gi)].map(m => m[1]);
+        const srcsetUrls = [...unescaped.matchAll(/\bsrcset="([^"]+)"/gi)].map(m => m[1].split(/[ ,]/)[0]);
+        const preloadUrls = [...unescaped.matchAll(/<link[^>]*rel="preload"[^>]*as="image"[^>]*href="([^"]+)"/gi)].map(m => m[1]);
+        const bgCandidates = [...urlInStyles, ...srcsetUrls, ...preloadUrls]
+          .filter(u => u && !u.startsWith("data:") && !SITE_ASSET.test(u) && !BAD_IMAGE.test(u))
+          .map(u => (u.startsWith("//") ? "https:" + u : u));
+
+        backdrop = bgCandidates.find(u => LANDSCAPE_TMDB.test(u)) || "";
         if (!backdrop) {
-          const lm = data.match(/https:\/\/image\.tmdb\.org\/t\/p\/w(?:1280|780|1920|original)\/[^"'\s<>)]+/);
+          const lm = unescaped.match(/https:\/\/image\.tmdb\.org\/t\/p\/w(?:1280|780|1920|original)\/[^"'\s<>\\)]+/);
           if (lm) backdrop = lm[0];
         }
-        
-        // 4) NO fallback to portrait — if no landscape exists, backdrop stays empty
-        // (This prevents backdrop = same-as-poster)
-        
         if (backdrop.startsWith("//")) backdrop = "https:" + backdrop;
 
         // Description
@@ -533,13 +521,26 @@ export default {
           if (l && !languages.includes(l)) languages.push(l); 
         }
 
-        // Year
+        // Tag-stripped text for metadata chips
         const textOnly = data
           .replace(/<script[\s\S]*?<\/script>/gi, " ")
           .replace(/<style[\s\S]*?<\/style>/gi, " ")
           .replace(/<[^>]+>/g, " ")
           .replace(/&[a-z#0-9]+;/gi, " ");
 
+        // ---------------- QUICK PLAY + RUNTIME ----------------
+        const sxe = (s, e) => ({ season: parseInt(s, 10), episode: parseInt(e, 10), slug: `${animeId}-${s}x${e}` });
+        let firstEp = null, latestDub = null, latestSub = null;
+        const mFirst = textOnly.match(/First\s*S(\d+)\s*E(\d+)/i);
+        const mDub   = textOnly.match(/Latest\s*Dub\s*S(\d+)\s*E(\d+)/i);
+        const mSub   = textOnly.match(/Latest\s*Sub\s*S(\d+)\s*E(\d+)/i);
+        if (mFirst) firstEp = sxe(mFirst[1], mFirst[2]);
+        if (mDub)   latestDub = sxe(mDub[1], mDub[2]);
+        if (mSub)   latestSub = sxe(mSub[1], mSub[2]);
+        const runtimeMatch = textOnly.match(/(\d+)\s*min\b/i);
+        const runtime = runtimeMatch ? parseInt(runtimeMatch[1], 10) : null;
+
+        // Year
         let year = null;
         const runtimeYear = textOnly.match(/(?:\d+\s*h(?:rs?)?(?:\s*\d+\s*m(?:in)?)?|\d+\s*m(?:in)?)\s*((?:19|20)\d{2})\b/i);
         if (runtimeYear) year = parseInt(runtimeYear[1]);
@@ -565,24 +566,24 @@ export default {
           if (years.length) year = Math.min(...years);
         }
 
-        // Status
+        // ---------------- STATUS ----------------
+        // Page has NO status chip → derive: explicit label → category check → Unknown
         let status = type === "movies" ? "Released" : "Unknown";
         if (type === "series") {
-          const statusPatterns = [
-            /Status[^<]*<[^>]*>([^<]+)/i,
-            /class="[^"]*status[^"]*"[^>]*>([^<]+)/i,
-            /<meta[^>]*name="status"[^>]*content="([^"]+)"/i,
-          ];
-          for (const pattern of statusPatterns) {
-            const m = data.match(pattern);
-            if (m) { 
-              const s = m[1] ? m[1].trim() : "";
-              if (s && s.length < 50) { status = s; break; }
+          const label = textOnly.match(/Status\s*[:\-]\s*(Ongoing|Completed|Airing|Finished|Ended)/i);
+          if (label) {
+            status = /Ongoing|Airing/i.test(label[1]) ? "Ongoing" : "Completed";
+          } else {
+            try {
+              const ong = await cachedJSON("html:/category/status/ongoing/", () => fetchPage("/category/status/ongoing/"), CACHE_TTL_HOME);
+              if (extractAnimeList(ong).some(i => i.id === animeId)) status = "Ongoing";
+            } catch (e) {}
+            if (status === "Unknown") {
+              try {
+                const comp = await cachedJSON("html:/category/status/completed/", () => fetchPage("/category/status/completed/"), CACHE_TTL_HOME);
+                if (extractAnimeList(comp).some(i => i.id === animeId)) status = "Completed";
+              } catch (e) {}
             }
-          }
-          if (status === "Unknown") {
-            if (/Ongoing|Airing|In\s+Production/i.test(textOnly)) status = "Ongoing";
-            else if (/Completed|Finished|Ended/i.test(textOnly)) status = "Completed";
           }
         }
 
@@ -611,7 +612,22 @@ export default {
 
         return jsonResponse({ 
           success: true, 
-          data: { id: animeId, title, poster, backdrop, description, type, totalEpisodes, year, status, seasons, genres, languages }
+          data: { 
+            id: animeId, 
+            title, 
+            poster, 
+            backdrop, 
+            description, 
+            type, 
+            totalEpisodes, 
+            year, 
+            status, 
+            seasons, 
+            genres, 
+            languages,
+            runtime,
+            quickPlay: { first: firstEp, latestDub: latestDub, latestSub: latestSub }
+          } 
         });
       }
 
