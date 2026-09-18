@@ -41,8 +41,6 @@ async function categoryPage(path, tax, params, altPrefixes = []) {
   return jsonResponse({ success: true, page, term, data: [] });
 }
 
-// Movies embed their player on /movies/<slug>/, series on /series/<slug>/,
-// episodes on /episode/<slug>/. Try all three for playback markup.
 async function getPlaybackHtml(slug) {
   const candidates = [`/episode/${slug}/`, `/movies/${slug}/`, `/series/${slug}/`];
   for (const p of candidates) {
@@ -54,7 +52,6 @@ async function getPlaybackHtml(slug) {
   return "";
 }
 
-// Reject 404/error pages; require at least one real-content marker
 function isContentPage(html) {
   if (!html) return false;
   if (/<title>[^<]*404/i.test(html)) return false;
@@ -63,9 +60,10 @@ function isContentPage(html) {
 }
 
 const BAD_IMAGE = /cropped-|icon\.png|logo\.png|favicon|AnimeSalticon/i;
-// Landscape TMDB profiles = backdrops / episode stills, never posters
 const LANDSCAPE_TMDB = /image\.tmdb\.org\/t\/p\/w(?:780|1280|1920|original)\//i;
 const PORTRAIT_TMDB = /image\.tmdb\.org\/t\/p\/w(?:500|342|185|154)\//i;
+// Rejects site-branded assets (animesalt logos/long banners) from being picked as backdrop
+const SITE_ASSET = /animesalt\.cx\/wp-content\/uploads|AnimeSalt|cropped-|icon\.png|logo\.png|favicon/i;
 
 // ---------------------------------------------------------------------------
 // Worker entry
@@ -78,13 +76,10 @@ export default {
     const params = url.searchParams;
 
     try {
-      // ====================================================================
-      // Index
-      // ====================================================================
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.19.0",
+          version: "3.20.0",
           endpoints: {
             system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings", "/api/debug/poster"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
@@ -102,9 +97,6 @@ export default {
         });
       }
 
-      // ====================================================================
-      // Health
-      // ====================================================================
       if (path === "/api/health") {
         const t0 = Date.now();
         let upstreamOnline = false, upstreamLatency = 0, upstreamError = null;
@@ -118,14 +110,11 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.19.0-edge",
+          version: "3.20.0-edge",
           endpointsCount: 31
         });
       }
 
-      // ====================================================================
-      // Search
-      // ====================================================================
       if (path === "/api/search") {
         const keyword = params.get("keyword") || params.get("q");
         const page = parseInt(params.get("page") || "1", 10);
@@ -135,13 +124,9 @@ export default {
         return jsonResponse({ success: true, page, data: extractAnimeList(data) });
       }
 
-      // ====================================================================
-      // HOME
-      // ====================================================================
       if (path === "/api/home") {
         const homeData = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
         const secs = extractHomeSections(homeData);
-
         const mostWatchedSeries = secs["Most-Watched Series"] || [];
         const mostWatchedFilms = secs["Most-Watched Films"] || [];
 
@@ -176,23 +161,13 @@ export default {
         return jsonResponse({
           success: true,
           data: {
-            mostWatchedSeries,
-            mostWatchedFilms,
-            latest: latestEpisodes,
-            ongoing,
-            completed,
-            movies,
-            freshDrops,
+            mostWatchedSeries, mostWatchedFilms, latest: latestEpisodes, ongoing, completed, movies, freshDrops,
             popular: [...mostWatchedSeries.slice(0, 12), ...mostWatchedFilms.slice(0, 12)],
-            popularSeries: mostWatchedSeries.slice(0, 12),
-            popularFilms: mostWatchedFilms.slice(0, 12),
+            popularSeries: mostWatchedSeries.slice(0, 12), popularFilms: mostWatchedFilms.slice(0, 12),
           },
         });
       }
 
-      // ====================================================================
-      // DEBUG: homepage headings
-      // ====================================================================
       if (path === "/api/debug/home-headings") {
         const html = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
         const headings = [];
@@ -210,9 +185,6 @@ export default {
         return jsonResponse({ success: true, data: [...new Set(headings)].slice(0, 50) });
       }
 
-      // ====================================================================
-      // DEBUG: verbatim poster/backdrop markup before the title
-      // ====================================================================
       if (path === "/api/debug/poster") {
         const id = params.get("id");
         if (!id) return jsonResponse({ success: false, error: "id required" }, 400);
@@ -235,17 +207,10 @@ export default {
         return jsonResponse({ success: true, data: extractAnimeList(data).slice(0, 20) });
       }
 
-      // ====================================================================
-      // Fresh Drops
-      // ====================================================================
       if (path === "/api/fresh-drops") {
         const page = parseInt(params.get("page") || "1", 10);
         const prefixes = [
-          "/category/status/fresh-drops/",
-          "/new/",
-          "/recent/",
-          "/latest/",
-          "/category/status/recently-added/"
+          "/category/status/fresh-drops/", "/new/", "/recent/", "/latest/", "/category/status/recently-added/"
         ];
         for (const base of prefixes) {
           const p = page > 1 ? `${base}page/${page}/` : base;
@@ -259,9 +224,6 @@ export default {
         return jsonResponse({ success: true, page: 1, data: extractAnimeList(data).slice(0, 30) });
       }
 
-      // ====================================================================
-      // Popular charts
-      // ====================================================================
       if (path === "/api/popular") {
         const type = params.get("type");
         const data = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
@@ -304,9 +266,6 @@ export default {
         return jsonResponse({ success: true, data: results });
       }
 
-      // ====================================================================
-      // Status categories
-      // ====================================================================
       if (path === "/api/completed") {
         const page = parseInt(params.get("page") || "1", 10);
         const p = page > 1 ? `/category/status/completed/page/${page}/` : "/category/status/completed/";
@@ -325,9 +284,6 @@ export default {
         } catch (e) { return jsonResponse({ success: true, page, data: [] }); }
       }
 
-      // ====================================================================
-      // Type / genre categories
-      // ====================================================================
       if (path.startsWith("/api/type/")) {
         const type = path.split("/")[3];
         const subtype = params.get("subtype") || "series";
@@ -354,9 +310,6 @@ export default {
         return jsonResponse({ success: true, page, genre: category, data: [] });
       }
 
-      // ====================================================================
-      // Content-type catalogs
-      // ====================================================================
       if (path === "/api/series") {
         const page = parseInt(params.get("page") || "1", 10);
         const p = page > 1 ? `/category/type/series/page/${page}/` : "/category/type/series/";
@@ -369,11 +322,7 @@ export default {
       if (path === "/api/movies") {
         const page = parseInt(params.get("page") || "1", 10);
         const prefixes = [
-          "/category/type/movies/",
-          "/movies/",
-          "/type/movie/",
-          "/format/movie/",
-          "/category/type/movie/"
+          "/category/type/movies/", "/movies/", "/type/movie/", "/format/movie/", "/category/type/movie/"
         ];
         for (const base of prefixes) {
           const p = page > 1 ? `${base}page/${page}/` : base;
@@ -389,11 +338,7 @@ export default {
       if (path === "/api/anime") {
         const page = parseInt(params.get("page") || "1", 10);
         const prefixes = [
-          "/category/genre/anime/",
-          "/genre/anime/",
-          "/category/type/anime/",
-          "/type/anime/",
-          "/anime/"
+          "/category/genre/anime/", "/genre/anime/", "/category/type/anime/", "/type/anime/", "/anime/"
         ];
         for (const base of prefixes) {
           const p = page > 1 ? `${base}page/${page}/` : base;
@@ -409,11 +354,7 @@ export default {
       if (path === "/api/cartoon") {
         const page = parseInt(params.get("page") || "1", 10);
         const prefixes = [
-          "/category/genre/cartoon/",
-          "/genre/cartoon/",
-          "/category/type/cartoon/",
-          "/type/cartoon/",
-          "/cartoon/"
+          "/category/genre/cartoon/", "/genre/cartoon/", "/category/type/cartoon/", "/type/cartoon/", "/cartoon/"
         ];
         for (const base of prefixes) {
           const p = page > 1 ? `${base}page/${page}/` : base;
@@ -426,9 +367,6 @@ export default {
         return jsonResponse({ success: true, page, data: [] });
       }
 
-      // ====================================================================
-      // Taxonomy lists
-      // ====================================================================
       if (path === "/api/genres" || path === "/api/languages" || path === "/api/countries" || path === "/api/discover") {
         const pagesToTry = ["/", "/category/type/series/", "/series/", "/category/genre/action/", "/genre/action/"];
         let genres = [], languages = [], countries = [];
@@ -446,17 +384,10 @@ export default {
         if (path === "/api/countries") return jsonResponse({ success: true, data: countries });
         return jsonResponse({
           success: true,
-          data: {
-            genres, languages, countries,
-            types: ["series", "movies", "anime", "cartoon"],
-            statuses: ["ongoing", "completed"],
-          },
+          data: { genres, languages, countries, types: ["series", "movies", "anime", "cartoon"], statuses: ["ongoing", "completed"] },
         });
       }
 
-      // ====================================================================
-      // Generic taxonomy passthrough
-      // ====================================================================
       if (path.startsWith("/api/category/")) {
         const parts = path.split("/").filter(Boolean);
         const tax = parts[2];
@@ -472,9 +403,6 @@ export default {
       if (path.startsWith("/api/studio/"))   return await categoryPage(path, "studio", params, ["/studio/"]);
       if (path.startsWith("/api/year/"))     return await categoryPage(path, "year", params, ["/release-year/", "/year/", "/category/year/"]);
 
-      // ====================================================================
-      // Random pick
-      // ====================================================================
       if (path === "/api/random") {
         const page = 1 + Math.floor(Math.random() * 10);
         const p = `/category/type/series/page/${page}/`;
@@ -487,10 +415,7 @@ export default {
       }
 
       // ====================================================================
-      // Anime / movie details — v3.19.0
-      // poster  = last portrait img right before <h1>
-      // backdrop = landscape artwork (bg-image or landscape img) before <h1>
-      // year    = runtime-adjacent year in visible text
+      // Anime / movie details — v3.20.0
       // ====================================================================
       if (path === "/api/info") {
         const animeId = params.get("id") || params.get("slug");
@@ -501,19 +426,13 @@ export default {
 
         try {
           const seriesHtml = await cachedJSON(`html:series:${animeId}`, () => fetchPage(`/series/${animeId}/`), CACHE_TTL_HOME);
-          if (isContentPage(seriesHtml)) {
-            data = seriesHtml;
-            type = "series";
-          }
+          if (isContentPage(seriesHtml)) { data = seriesHtml; type = "series"; }
         } catch (e) { /* fall through */ }
 
         if (!data) {
           try {
             const movieHtml = await cachedJSON(`html:movies:${animeId}`, () => fetchPage(`/movies/${animeId}/`), CACHE_TTL_HOME);
-            if (isContentPage(movieHtml)) {
-              data = movieHtml;
-              type = "movies";
-            }
+            if (isContentPage(movieHtml)) { data = movieHtml; type = "movies"; }
           } catch (e) { /* both missing */ }
         }
 
@@ -521,68 +440,64 @@ export default {
           return jsonResponse({ success: false, error: "Content not found" }, 404);
         }
 
-        // Title
         const titleMatch = data.match(/<h1[^>]*class="[^"]*entry-title[^"]*"[^>]*>([\s\S]*?)<\/h1>/i) 
                         || data.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
         const title = titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').trim() : "Unknown";
 
-        // Slice of HTML before the title (hero area: backdrop + poster live here)
         const titleIdx = data.search(/<h1/i);
         const beforeTitle = data.slice(0, titleIdx > -1 ? titleIdx : 20000);
+        const imgsBefore = [...beforeTitle.matchAll(/<img[^>]*>/gi)];
 
         // ---------------- POSTER ----------------
         let poster = "";
-        const imgsBefore = [...beforeTitle.matchAll(/<img[^>]*>/gi)];
         for (let i = imgsBefore.length - 1; i >= 0 && !poster; i--) {
           const tag = imgsBefore[i][0];
           const srcM = tag.match(/\b(?:data-lazy-src|data-original|data-src|data-cfsrc|src)="([^"]+)"/i);
           if (!srcM) continue;
           const url = srcM[1];
-          if (url.startsWith("data:")) continue;          // lazy placeholder
-          if (BAD_IMAGE.test(url)) continue;              // site icon/logo
-          if (LANDSCAPE_TMDB.test(url)) continue;         // backdrop / still
+          if (url.startsWith("data:")) continue;
+          if (BAD_IMAGE.test(url)) continue;
+          if (LANDSCAPE_TMDB.test(url)) continue;
+          if (SITE_ASSET.test(url)) continue;
           poster = url;
         }
-        // Fallback: background-image before title (portrait or any non-icon)
         if (!poster) {
           const bgs = [...beforeTitle.matchAll(/background-image:\s*url\(['"]?([^'")]+)['"]?\)/gi)];
           for (let i = bgs.length - 1; i >= 0 && !poster; i--) {
             const url = bgs[i][1];
-            if (url.startsWith("data:") || BAD_IMAGE.test(url)) continue;
+            if (url.startsWith("data:") || BAD_IMAGE.test(url) || SITE_ASSET.test(url)) continue;
             if (LANDSCAPE_TMDB.test(url)) continue;
             poster = url;
           }
         }
-        // Fallback: og:image (filtered)
         if (!poster) {
           const ogMatch = data.match(/<meta[^>]*property="og:image"[^>]*content="([^"]+)"/i);
-          if (ogMatch && !ogMatch[1].startsWith("data:") && !BAD_IMAGE.test(ogMatch[1]) && !LANDSCAPE_TMDB.test(ogMatch[1])) {
+          if (ogMatch && !ogMatch[1].startsWith("data:") && !BAD_IMAGE.test(ogMatch[1]) && !LANDSCAPE_TMDB.test(ogMatch[1]) && !SITE_ASSET.test(ogMatch[1])) {
             poster = ogMatch[1];
           }
         }
-        // Last resort: first portrait TMDB url anywhere
         if (!poster) {
           const t = data.match(/https:\/\/image\.tmdb\.org\/t\/p\/w(?:500|342|185|154)\/[^"'\s<>]+/);
           if (t) poster = t[0];
         }
         if (poster.startsWith("//")) poster = "https:" + poster;
 
-        // ---------------- BACKDROP (hero background artwork) ----------------
+        // ---------------- BACKDROP ----------------
         let backdrop = "";
-        const bgUrls = [...beforeTitle.matchAll(/background-image:\s*url\(['"]?([^'")]+)['"]?\)/gi)]
-          .map(m => m[1]);
+        const bgUrls = [...beforeTitle.matchAll(/background-image:\s*url\(['"]?([^'")]+)['"]?\)/gi)].map(m => m[1]);
         const landscapeImgs = imgsBefore.map(tag => {
           const srcM = tag[0].match(/\b(?:data-lazy-src|data-original|data-src|data-cfsrc|src)="([^"]+)"/i);
           return srcM ? srcM[1] : "";
         });
-        const bgCandidates = [...bgUrls, ...landscapeImgs].filter(u => u && !u.startsWith("data:"));
+        const bgCandidates = [...bgUrls, ...landscapeImgs]
+          .filter(u => u && !u.startsWith("data:") && !SITE_ASSET.test(u) && !BAD_IMAGE.test(u));
         backdrop = bgCandidates.find(u => LANDSCAPE_TMDB.test(u)) || "";
         if (!backdrop) {
           const lm = data.match(/https:\/\/image\.tmdb\.org\/t\/p\/w(?:1280|780|1920|original)\/[^"'\s<>)]+/);
           if (lm) backdrop = lm[0];
         }
-        if (!backdrop) {
-          backdrop = bgCandidates.find(u => !BAD_IMAGE.test(u)) || "";
+        if (!backdrop && bgCandidates.length > 0) {
+          backdrop = bgCandidates[0];
         }
         if (backdrop.startsWith("//")) backdrop = "https:" + backdrop;
 
@@ -609,7 +524,7 @@ export default {
           if (l && !languages.includes(l)) languages.push(l); 
         }
 
-        // ---------------- YEAR ----------------
+        // Year
         const textOnly = data
           .replace(/<script[\s\S]*?<\/script>/gi, " ")
           .replace(/<style[\s\S]*?<\/style>/gi, " ")
@@ -618,9 +533,7 @@ export default {
 
         let year = null;
         const runtimeYear = textOnly.match(/(?:\d+\s*h(?:rs?)?(?:\s*\d+\s*m(?:in)?)?|\d+\s*m(?:in)?)\s*((?:19|20)\d{2})\b/i);
-        if (runtimeYear) {
-          year = parseInt(runtimeYear[1]);
-        }
+        if (runtimeYear) year = parseInt(runtimeYear[1]);
         if (!year) {
           const jsonLdMatch = data.match(/<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/i);
           if (jsonLdMatch) {
@@ -639,12 +552,11 @@ export default {
         }
         if (!year) {
           const years = [...textOnly.matchAll(/\b((?:19|20)\d{2})\b/g)]
-            .map(m => parseInt(m[1]))
-            .filter(y => y >= 1950 && y <= 2024);
+            .map(m => parseInt(m[1])).filter(y => y >= 1950 && y <= 2024);
           if (years.length) year = Math.min(...years);
         }
 
-        // ---------------- STATUS ----------------
+        // Status
         let status = type === "movies" ? "Released" : "Unknown";
         if (type === "series") {
           const statusPatterns = [
@@ -656,10 +568,7 @@ export default {
             const m = data.match(pattern);
             if (m) { 
               const s = m[1] ? m[1].trim() : "";
-              if (s && s.length < 50) {
-                status = s;
-                break;
-              }
+              if (s && s.length < 50) { status = s; break; }
             }
           }
           if (status === "Unknown") {
@@ -668,7 +577,7 @@ export default {
           }
         }
 
-        // ---------------- SEASONS / EPISODE COUNT ----------------
+        // Seasons / episodes
         let seasons = [], totalEpisodes = 0;
         if (type === "series") {
           try { 
@@ -693,25 +602,12 @@ export default {
 
         return jsonResponse({ 
           success: true, 
-          data: { 
-            id: animeId, 
-            title, 
-            poster, 
-            backdrop,
-            description, 
-            type, 
-            totalEpisodes, 
-            year, 
-            status, 
-            seasons, 
-            genres, 
-            languages 
-          } 
+          data: { id: animeId, title, poster, backdrop, description, type, totalEpisodes, year, status, seasons, genres, languages }
         });
       }
 
       // ====================================================================
-      // Episodes — with MOVIE fallback (synthetic episode + poster as still)
+      // Episodes — with MOVIE fallback
       // ====================================================================
       if (path.startsWith("/api/episodes/")) {
         const animeId = path.split("/")[3];
@@ -736,17 +632,12 @@ export default {
             const stillMatch = html.match(/https:\/\/image\.tmdb\.org\/t\/p\/w(?:500|342|185|154)\/[^"'\s<>]+/);
             if (stillMatch) image = stillMatch[0];
           } catch (e) {}
-          const ep = { num: 1, season: 1, title, slug: animeId, url: `${BASE_URL}/movies/${animeId}/`, image };
+          const ep = { num: 1, season: 1, title, slug: animeId, url: `${BASE_URL}/movies/${animeId}/`, image: image || null };
           return jsonResponse({
             success: true,
             data: {
-              animeId,
-              requestedSeason,
-              availableSeasons: [1],
-              totalEpisodes: 1,
-              failedSeasons: [],
-              groupedEpisodes: { "1": [ep] },
-              isMovie: true,
+              animeId, requestedSeason, availableSeasons: [1], totalEpisodes: 1, failedSeasons: [],
+              groupedEpisodes: { "1": [ep] }, isMovie: true,
             },
           });
         }
@@ -757,11 +648,14 @@ export default {
           groupedEpisodes[ep.season].push(ep);
         }
 
-        return jsonResponse({ success: true, data: { animeId, requestedSeason, availableSeasons: seasons.map(s => s.num), totalEpisodes: episodes.length, failedSeasons, groupedEpisodes } });
+        return jsonResponse({ 
+          success: true, 
+          data: { animeId, requestedSeason, availableSeasons: seasons.map(s => s.num), totalEpisodes: episodes.length, failedSeasons, groupedEpisodes } 
+        });
       }
 
       // ====================================================================
-      // Servers — movie-aware via getPlaybackHtml
+      // Servers
       // ====================================================================
       if (path === "/api/servers") {
         const epSlug = params.get("ep");
@@ -799,7 +693,7 @@ export default {
       }
 
       // ====================================================================
-      // Stream resolver — movie-aware via getPlaybackHtml
+      // Stream resolver
       // ====================================================================
       if (path === "/api/stream") {
         const epSlug = params.get("ep");
@@ -846,10 +740,8 @@ export default {
         if (resolvedStream) {
           const workerOrigin = new URL(request.url).origin;
           const primary = resolvedStream.direct_hls || resolvedStream.qualities?.[0]?.url || null;
-
           let groups = { audio: [], subtitles: [] };
           if (resolvedStream.direct_hls) groups = await getMasterInfo(resolvedStream.direct_hls);
-
           let proxied = primary ? proxyMediaUrl(workerOrigin, primary) : null;
           if (proxied && audio) proxied += `&audio=${encodeURIComponent(audio)}`;
 
@@ -863,14 +755,9 @@ export default {
           return jsonResponse({
             success: true,
             data: {
-              ...resolvedStream,
-              subtitles,
-              proxied_url: proxied,
-              audio_languages: groups.audio,
-              subtitle_languages: groups.subtitles,
-              selected_audio: audio || null,
-              serverIndex,
-              selectedLanguage,
+              ...resolvedStream, subtitles, proxied_url: proxied,
+              audio_languages: groups.audio, subtitle_languages: groups.subtitles,
+              selected_audio: audio || null, serverIndex, selectedLanguage,
               isIframe: false,
               referer: resolvedStream.host === "as-cdn26.top" ? "https://as-cdn26.top/" : "https://abyssplayer.com/",
             },
@@ -879,9 +766,6 @@ export default {
         return jsonResponse({ success: true, data: { embedUrl, serverIndex, selectedLanguage, isIframe: true, referer: `${BASE_URL}/movies/${epSlug}/` } });
       }
 
-      // ====================================================================
-      // Raw WordPress AJAX passthrough
-      // ====================================================================
       if (path === "/api/ajax") {
         const action = params.get("action");
         if (!action) return jsonResponse({ success: false, error: "action required" }, 400);
@@ -891,9 +775,6 @@ export default {
         return new Response(frag, { headers: { "Content-Type": "text/html; charset=utf-8", ...corsHeaders } });
       }
 
-      // ====================================================================
-      // Media proxy
-      // ====================================================================
       if (path === "/proxy/media") {
         return await handleMediaProxy(request);
       }
