@@ -20,7 +20,7 @@ export default function Watch() {
   // Manifest-driven HLS audio language (server-side DEFAULT switching)
   const [hlsAudio, setHlsAudio] = useState<string | undefined>(undefined);
 
-  // Player-exposed audio tracks (bonus)
+  // Player-exposed audio tracks
   const [audioTracks, setAudioTracks] = useState<AudioTrackInfo[]>([]);
   const [audioTrackIdx, setAudioTrackIdx] = useState<number | null>(null);
 
@@ -43,7 +43,7 @@ export default function Watch() {
     setHlsAudio(undefined);
     setAudioTracks([]);
     setAudioTrackIdx(null);
-    setSubtitleIdx(0); // Default ON for first subtitle
+    setSubtitleIdx(0);
     setErr(null);
     setServersLoading(true);
     setLoading(true);
@@ -89,7 +89,7 @@ export default function Watch() {
       .then((s) => {
         if (cancelled) return;
         setStream(s);
-        // Auto-enable first subtitle if available
+        // Auto-enable first subtitle if available and user hasn't explicitly turned them off
         if (s.subtitles && s.subtitles.length > 0 && subtitleIdx === null) {
           setSubtitleIdx(0);
         }
@@ -138,6 +138,13 @@ export default function Watch() {
     setSubtitleIdx(i);
   }, []);
 
+  const handleToggleSubtitle = useCallback((enabled: boolean) => {
+    setSubtitleIdx((prev) => {
+      if (enabled) return prev === null ? 0 : prev;
+      return null;
+    });
+  }, []);
+
   const handlePlayerError = useCallback((msg: string) => {
     setErr(msg);
   }, []);
@@ -166,7 +173,7 @@ export default function Watch() {
         ← Back to anime
       </Link>
 
-      {/* Player (with custom subtitle overlay) */}
+      {/* Player (with custom subtitle overlay + CC button) */}
       <MoviPlayer
         stream={stream}
         qualityIndex={activeQuality}
@@ -174,6 +181,7 @@ export default function Watch() {
         title={prettyTitle}
         slug={episode}
         activeSubtitle={stream?.subtitles?.[subtitleIdx ?? -1] ?? null}
+        onToggleSubtitle={handleToggleSubtitle}
         onError={handlePlayerError}
         onAudioTracks={setAudioTracks}
         audioTrackIndex={audioTrackIdx}
@@ -235,4 +243,4 @@ export default function Watch() {
       </div>
     </div>
   );
-} 
+}
