@@ -105,22 +105,13 @@ export function extractTaxonomy(html, tax) {
 }
 
 // ===========================================================================
-// HOMEPAGE SECTION SPLITTER
-// Finds each titled block on the homepage and extracts its items.
+// HOMEPAGE SECTION SPLITTER — matches actual animesalt.cx headings
 // ===========================================================================
 export const HOME_SECTION_TITLES = [
   "Most-Watched Series",
   "Most-Watched Films",
-  "Fresh Drops",
-  "On-Air Series",
-  "New Anime Arrivals",
-  "Just In: Cartoon Series",
-  "Latest Anime Movies",
-  "Fresh Cartoon Films",
-  "Latest Episodes",
 ];
 
-// "Just In: Cartoon Series" -> /Just[^A-Za-z0-9]{0,3}In[^A-Za-z0-9]{0,3}Cartoon.../i
 function titleRegex(title) {
   const words = title.split(/[^A-Za-z0-9]+/).filter(Boolean);
   return new RegExp(words.join("[^A-Za-z0-9]{0,3}"), "i");
@@ -133,7 +124,6 @@ function isInsideScriptOrStyle(html, idx) {
   return false;
 }
 
-// First occurrence of the title that is a HEADING, not a nav/menu link
 function findSectionStart(html, title) {
   const re = titleRegex(title);
   let m;
@@ -163,8 +153,8 @@ export function extractHomeSections(html) {
     const end = i + 1 < positions.length ? positions[i + 1].idx : html.length;
     const slice = html.slice(start, end);
 
-    let items = extractPopularItems(slice);          // ranked chart blocks
-    if (!items.length) items = extractAnimeList(slice); // article grids
+    let items = extractPopularItems(slice);
+    if (!items.length) items = extractAnimeList(slice);
 
     items = items.map(it => ({
       ...it,
