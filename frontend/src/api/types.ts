@@ -1,4 +1,4 @@
-export interface Anime {
+export interface CardItem {
   id: string;
   title: string;
   image: string;
@@ -6,8 +6,40 @@ export interface Anime {
   url: string;
 }
 
-export interface PopularItem extends Anime {
+export interface RankedItem extends CardItem {
   rank: number;
+}
+
+export interface HomeData {
+  latest: CardItem[];
+  mostWatchedSeries: RankedItem[];
+  mostWatchedFilms: RankedItem[];
+  freshDrops: CardItem[];
+  onAirSeries: CardItem[];
+  newAnimeArrivals: CardItem[];
+  cartoonSeries: CardItem[];
+  animeMovies: CardItem[];
+  cartoonFilms: CardItem[];
+  popular: RankedItem[];
+  popularSeries: RankedItem[];
+  popularFilms: RankedItem[];
+  ongoing: CardItem[];
+  completed: CardItem[];
+  movies: CardItem[];
+}
+
+export interface TaxonomyItem {
+  slug: string;
+  name: string;
+  url: string;
+}
+
+export interface DiscoverData {
+  genres: TaxonomyItem[];
+  languages: TaxonomyItem[];
+  countries: TaxonomyItem[];
+  types: string[];
+  statuses: string[];
 }
 
 export interface AnimeInfo {
@@ -17,9 +49,9 @@ export interface AnimeInfo {
   description: string;
   type: 'series' | 'movies';
   totalEpisodes: number;
-  year?: number;
-  status?: string;
-  seasons: { num: number; title: string; value?: string }[];
+  year: number | null;
+  status: string;
+  seasons: { num: number; title: string }[];
   genres: string[];
   languages: string[];
 }
@@ -39,23 +71,12 @@ export interface EpisodeList {
   groupedEpisodes: Record<string, Episode[]>;
 }
 
-export interface MultiLang {
-  language: string;
-  link: string;
-}
-
 export interface Server {
   index: number;
   serverName: string;
   embedUrl: string | null;
   isMultiLang: boolean;
-  languages: MultiLang[];
-}
-
-export interface Quality {
-  resolution: string;
-  size?: number;
-  url: string;
+  languages: { language: string; link: string }[];
 }
 
 export interface Subtitle {
@@ -72,22 +93,14 @@ export interface StreamData {
   host?: string;
   source_type?: 'hls' | 'mp4';
   direct_hls?: string;
-  qualities?: Quality[];
+  qualities?: { resolution: string; size?: number; url: string }[];
   subtitles?: Subtitle[];
-  embedUrl?: string;
-  isIframe?: boolean;
-  serverIndex: number;
-  selectedLanguage?: string | null;
-  referer?: string;
   proxied_url?: string | null;
   audio_languages?: AudioLanguage[];
-  subtitle_languages?: AudioLanguage[];
   selected_audio?: string | null;
-}
-
-export interface ApiResponse<T> {
-  success: boolean;
-  error?: string;
-  data?: T;
-  page?: number;
+  serverIndex: number;
+  selectedLanguage?: string | null;
+  isIframe?: boolean;
+  embedUrl?: string;
+  referer?: string;
 }
