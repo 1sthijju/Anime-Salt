@@ -79,7 +79,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.14.0",
+          version: "3.15.0",
           endpoints: {
             system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
@@ -113,7 +113,7 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.14.0-edge",
+          version: "3.15.0-edge",
           endpointsCount: 30
         });
       }
@@ -462,7 +462,7 @@ export default {
       }
 
       // ====================================================================
-      // Anime / movie details — 404-safe, movie-aware, improved parsing
+      // Anime / movie details — 404-safe, movie-aware, improved parsing v3.15.0
       // ====================================================================
       if (path === "/api/info") {
         const animeId = params.get("id") || params.get("slug");
@@ -500,16 +500,27 @@ export default {
                         || data.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
         const title = titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').trim() : "Unknown";
 
-        // Poster — try multiple patterns (series + movies use different markup)
+        // Poster — prioritize TMDB URLs, filter out data: URIs (lazy-load placeholders)
         let poster = "";
         const posterPatterns = [
+          /<div[^>]*class="[^"]*(?:poster|thumb|featured)[^"]*"[^>]*>[\s\S]*?<img[^>]*(?:data-src|src)="([^"]+)"/i,
           /<img[^>]*class="[^"]*(?:wp-post-image|poster|featured-image)[^"]*"[^>]*(?:data-src|src)="([^"]+)"/i,
-          /<div[^>]*class="[^"]*(?:poster|thumb|featured|image)[^"]*"[^>]*>[\s\S]*?<img[^>]*(?:data-src|src)="([^"]+)"/i,
           /<meta[^>]*property="og:image"[^>]*content="([^"]+)"/i,
         ];
         for (const pattern of posterPatterns) {
           const m = data.match(pattern);
-          if (m) { poster = m[1]; break; }
+          if (m) {
+            const url = m[1];
+            if (url.startsWith("data:")) continue; // skip lazy-load placeholders
+            if (url.includes("image.tmdb.org") || url.includes("themoviedb.org")) {
+              poster = url;
+              break;
+            }
+            if (url.startsWith("http")) {
+              poster = url;
+              break;
+            }
+          }
         }
         if (poster.startsWith("//")) poster = "https:" + poster;
 
@@ -528,7 +539,7 @@ export default {
           if (g && !genres.includes(g)) genres.push(g); 
         }
 
-        // Languages
+        // Languages (may be empty for movies if JS-rendered)
         const languages = []; 
         const langRegex = /href="[^"]*\/category\/language\/[^"]*"[^>]*>([^<]+)<\/a>/gi;
         while ((match = langRegex.exec(data)) !== null) { 
@@ -536,42 +547,71 @@ export default {
           if (l && !languages.includes(l)) languages.push(l); 
         }
 
-        // Year — extract from metadata or content area (avoid CDN cache dates like 2025)
+        // Year — search meta tags, schema.org, and content area
         let year = null;
-        const yearMetaMatch = data.match(/<meta[^>]*name="release[_-]?year"[^>]*content="(\d{4})"/i);
+        
+        // 1. Check release year meta tags
+        const yearMetaMatch = data.match(/<meta[^>]*name="release[_-]?year"[^>]*content="(\d{4})"/i)
+                           || data.match(/<meta[^>]*itemprop="datePublished"[^>]*content="(\d{4})/i)
+                           || data.match(/<meta[^>]*property="video:release_date"[^>]*content="(\d{4})/i);
         if (yearMetaMatch) {
           year = parseInt(yearMetaMatch[1]);
         } else {
-          // Look for year in content area only (skip headers/footers with cache dates)
+          // 2. Search schema.org JSON-LD
+          const jsonLdMatch = data.match(/<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/i);
+          if (jsonLdMatch) {
+            try {
+              const jsonLd = JSON.parse(jsonLdMatch[1]);
+              const dateStr = jsonLd.datePublished || jsonLd.dateCreated;
+              if (dateStr) {
+                const y = parseInt(dateStr.slice(0, 4));
+                if (y >= 1950 && y <= 2030) year = y;
+              }
+            } catch (e) {}
+          }
+        }
+        
+        // 3. Fallback: search content area for 4-digit years
+        if (!year) {
           const mainStart = data.indexOf('<main');
           const mainEnd = data.indexOf('</main>');
           const contentArea = mainStart > -1 && mainEnd > mainStart 
             ? data.slice(mainStart, mainEnd) 
-            : data.slice(0, Math.min(data.length, 5000));
-          // Match years 1950-2024, prefer earlier years (anime rarely starts in 2025+)
+            : data.slice(0, Math.min(data.length, 8000));
+          
           const yearMatches = [...contentArea.matchAll(/\b((?:19|20)\d{2})\b/g)]
-            .map(m => parseInt(m[1]))
-            .filter(y => y >= 1950 && y <= 2024);
+            .map(m => ({ year: parseInt(m[1]), pos: m.index }))
+            .filter(y => y.year >= 1950 && y.year <= 2030);
+          
           if (yearMatches.length > 0) {
-            // Take the earliest year (most likely the release year)
-            year = Math.min(...yearMatches);
+            year = Math.min(...yearMatches.map(y => y.year));
           }
         }
 
-        // Status — try multiple patterns
-        let status = "Unknown";
-        const statusPatterns = [
-          /Status[^<]*<[^>]*>([^<]+)/i,
-          /class="[^"]*status[^"]*"[^>]*>([^<]+)/i,
-          /<meta[^>]*name="status"[^>]*content="([^"]+)"/i,
-          /Ongoing|Completed|Finished|Airing/i, // fallback: look for keywords
-        ];
-        for (const pattern of statusPatterns) {
-          const m = data.match(pattern);
-          if (m) { 
-            status = m[1] ? m[1].trim() : m[0]; 
-            if (status.length > 50) status = "Unknown"; // too long, probably matched wrong
-            break; 
+        // Status — for movies default to "Released", for series try patterns
+        let status = type === "movies" ? "Released" : "Unknown";
+        
+        if (type === "series") {
+          const statusPatterns = [
+            /Status[^<]*<[^>]*>([^<]+)/i,
+            /class="[^"]*status[^"]*"[^>]*>([^<]+)/i,
+            /<meta[^>]*name="status"[^>]*content="([^"]+)"/i,
+          ];
+          for (const pattern of statusPatterns) {
+            const m = data.match(pattern);
+            if (m) { 
+              const s = m[1] ? m[1].trim() : "";
+              if (s && s.length < 50) {
+                status = s;
+                break;
+              }
+            }
+          }
+          
+          // Keyword fallback
+          if (status === "Unknown") {
+            if (/Ongoing|Airing|In\s+Production/i.test(data)) status = "Ongoing";
+            else if (/Completed|Finished|Ended/i.test(data)) status = "Completed";
           }
         }
 
