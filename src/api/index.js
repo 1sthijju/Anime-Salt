@@ -1,6 +1,6 @@
 import { jsonResponse, corsHeaders, BASE_URL, CACHE_TTL_HOME, CACHE_TTL, CHROME_HEADERS } from "./config.js";
 import { cachedJSON, fetchPage, siteAjax, getSeriesHtml } from "./net.js";
-import { extractAnimeList, extractPopularItems, extractEmbedForIndex, extractTaxonomy } from "./parsers.js";
+import { extractAnimeList, extractPopularItems, extractEmbedForIndex, extractTaxonomy, extractHomeSections } from "./parsers.js";
 import { getEpisodesData } from "./episodes.js";
 import { resolveAsCdn26, resolveAbyss, normalizeAbyssUrl } from "./decryptors.js";
 import { proxyMediaUrl, handleMediaProxy, parseHlsMediaGroups } from "./media-proxy.js";
@@ -25,7 +25,6 @@ async function getMasterInfo(masterUrl) {
   }, CACHE_TTL);
 }
 
-// Generic paginated category resolver with fallback URL prefixes
 async function categoryPage(path, tax, params, altPrefixes = []) {
   const term = path.split("/")[3];
   if (!term) return jsonResponse({ success: false, error: "Term required" }, 400);
@@ -59,7 +58,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.9.0",
+          version: "3.10.0",
           endpoints: {
             system: ["/api/health", "/api/ajax", "/proxy/media"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
@@ -74,6 +73,10 @@ export default {
             detail: ["/api/info?id=", "/api/episodes/:id", "/api/servers?ep=", "/api/stream?ep="],
             misc: ["/api/search?keyword=", "/api/random"],
           },
+          homeSections: [
+            "latest", "mostWatchedSeries", "mostWatchedFilms", "freshDrops",
+            "onAirSeries", "newAnimeArrivals", "cartoonSeries", "animeMovies", "cartoonFilms",
+          ],
         });
       }
 
@@ -93,7 +96,7 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.9.0-edge",
+          version: "3.10.0-edge",
           endpointsCount: 30
         });
       }
@@ -111,54 +114,68 @@ export default {
       }
 
       // ====================================================================
-      // Home (complete: 8 sections) — FIXED: multi-path movies + type detection
+      // HOME — mirrors animesalt.cx homepage, section by section
       // ====================================================================
       if (path === "/api/home") {
-        // Try multiple movie paths since /category/type/movies/ may not exist
-        let moviesHtml = "";
-        for (const moviePath of ["/category/type/movies/", "/movies/", "/type/movie/"]) {
-          try {
-            const data = await fetchPage(moviePath);
-            const items = extractAnimeList(data);
-            if (items.length) { moviesHtml = data; break; }
-          } catch (e) { /* try next */ }
-        }
+        const homeData = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
+        const secs = extractHomeSections(homeData);
+        const get = (key) => secs[key] || [];
 
-        const [homeData, ongoingData, completedData, freshData] = await Promise.all([
-          cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME),
-          cachedJSON("html:/category/status/ongoing/", () => fetchPage("/category/status/ongoing/"), CACHE_TTL_HOME).catch(() => ""),
-          cachedJSON("html:/category/status/completed/", () => fetchPage("/category/status/completed/"), CACHE_TTL_HOME).catch(() => ""),
-          cachedJSON("html:/category/status/fresh-drops/", () => fetchPage("/category/status/fresh-drops/"), CACHE_TTL_HOME).catch(() => ""),
+        const mostWatchedSeries = get("Most-Watched Series");
+        const mostWatchedFilms  = get("Most-Watched Films");
+        const freshDrops        = get("Fresh Drops");
+        const onAirSeries       = get("On-Air Series");
+        const newAnimeArrivals  = get("New Anime Arrivals");
+        const cartoonSeries     = get("Just In: Cartoon Series");
+        const animeMovies       = get("Latest Anime Movies");
+        const cartoonFilms      = get("Fresh Cartoon Films");
+        const latestEpisodes    = get("Latest Episodes");
+
+        const latest = latestEpisodes.length ? latestEpisodes : extractAnimeList(homeData).slice(0, 20);
+        const popular = [...mostWatchedSeries, ...mostWatchedFilms];
+
+        // Fallbacks (only fetched when the homepage section is missing/empty)
+        const [ongoingFallback, completed, moviesFallback] = await Promise.all([
+          onAirSeries.length
+            ? Promise.resolve([])
+            : cachedJSON("html:/category/status/ongoing/", () => fetchPage("/category/status/ongoing/"), CACHE_TTL_HOME)
+                .then(h => extractAnimeList(h).slice(0, 18)).catch(() => []),
+          cachedJSON("html:/category/status/completed/", () => fetchPage("/category/status/completed/"), CACHE_TTL_HOME)
+            .then(h => extractAnimeList(h).slice(0, 18)).catch(() => []),
+          animeMovies.length
+            ? Promise.resolve([])
+            : (async () => {
+                for (const p of ["/movies/", "/category/type/movies/"]) {
+                  try {
+                    const h = await fetchPage(p);
+                    const it = extractAnimeList(h);
+                    if (it.length) return it.slice(0, 18);
+                  } catch (e) { /* next */ }
+                }
+                return [];
+              })(),
         ]);
-
-        const latest = extractAnimeList(homeData).slice(0, 20);
-
-        // Build popular list with CORRECT type detection based on URL
-        let popular = extractPopularItems(homeData);
-        if (popular.length === 0) {
-          popular = extractAnimeList(homeData).slice(0, 50).map((r, i) => ({ rank: i + 1, ...r }));
-        }
-
-        // FIX: Re-detect type from URL since extractPopularItems may miss /movies/ URLs
-        popular = popular.map(item => ({
-          ...item,
-          type: item.url && item.url.includes("/movies/") ? "movie" : (item.type || "series")
-        }));
-
-        const popularSeries = popular.filter(i => i.type === "series").slice(0, 12);
-        const popularFilms = popular.filter(i => i.type === "movie").slice(0, 12);
 
         return jsonResponse({
           success: true,
           data: {
+            // Homepage sections (1:1 with animesalt.cx)
             latest,
+            mostWatchedSeries,
+            mostWatchedFilms,
+            freshDrops,
+            onAirSeries,
+            newAnimeArrivals,
+            cartoonSeries,
+            animeMovies: animeMovies.length ? animeMovies : moviesFallback,
+            cartoonFilms,
+            // Legacy keys (frontend backwards-compat)
             popular,
-            popularSeries,
-            popularFilms,
-            ongoing: ongoingData ? extractAnimeList(ongoingData).slice(0, 18) : [],
-            completed: completedData ? extractAnimeList(completedData).slice(0, 18) : [],
-            movies: moviesHtml ? extractAnimeList(moviesHtml).slice(0, 18) : [],
-            freshDrops: freshData ? extractAnimeList(freshData).slice(0, 18) : [],
+            popularSeries: mostWatchedSeries.slice(0, 12),
+            popularFilms: mostWatchedFilms.slice(0, 12),
+            ongoing: onAirSeries.length ? onAirSeries : ongoingFallback,
+            completed,
+            movies: animeMovies.length ? animeMovies : moviesFallback,
           },
         });
       }
@@ -169,9 +186,14 @@ export default {
       }
 
       // ====================================================================
-      // Fresh Drops (tries multiple "recent" paths)
+      // Fresh Drops (homepage section first, then category fallbacks)
       // ====================================================================
       if (path === "/api/fresh-drops") {
+        const homeData = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
+        const secs = extractHomeSections(homeData);
+        if ((secs["Fresh Drops"] || []).length) {
+          return jsonResponse({ success: true, page: 1, data: secs["Fresh Drops"] });
+        }
         const page = parseInt(params.get("page") || "1", 10);
         const prefixes = [
           "/category/status/fresh-drops/",
@@ -188,9 +210,7 @@ export default {
             if (items.length) return jsonResponse({ success: true, page, data: items });
           } catch (e) { /* try next */ }
         }
-        // Final fallback: use the homepage latest grid
-        const data = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
-        return jsonResponse({ success: true, page: 1, data: extractAnimeList(data).slice(0, 30) });
+        return jsonResponse({ success: true, page: 1, data: extractAnimeList(homeData).slice(0, 30) });
       }
 
       // ====================================================================
@@ -203,20 +223,20 @@ export default {
         if (results.length === 0) {
           results = extractAnimeList(data).slice(0, 25).map((r, i) => ({ rank: i + 1, ...r }));
         }
+        results = results.map(item => ({
+          ...item,
+          type: item.url && item.url.includes("/movies/") ? "movie" : (item.type || "series"),
+        }));
         return jsonResponse({ success: true, data: results });
       }
 
       if (path === "/api/popular/films") {
-        const data = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
-        let results = extractPopularItems(data, "movie");
-        // Also include items where URL has /movies/
-        results = results.map(item => ({
-          ...item,
-          type: item.url && item.url.includes("/movies/") ? "movie" : item.type
-        })).filter(i => i.type === "movie");
-
-        if (results.length === 0) {
-          results = extractAnimeList(data)
+        const homeData = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
+        const secs = extractHomeSections(homeData);
+        let results = secs["Most-Watched Films"] || [];
+        if (!results.length) results = extractPopularItems(homeData, "movie");
+        if (!results.length) {
+          results = extractAnimeList(homeData)
             .filter(item => item.url && item.url.includes("/movies/"))
             .slice(0, 20)
             .map((r, i) => ({ rank: i + 1, ...r, type: "movie" }));
@@ -225,10 +245,12 @@ export default {
       }
 
       if (path === "/api/popular/series") {
-        const data = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
-        let results = extractPopularItems(data, "series");
-        if (results.length === 0) {
-          results = extractAnimeList(data)
+        const homeData = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
+        const secs = extractHomeSections(homeData);
+        let results = secs["Most-Watched Series"] || [];
+        if (!results.length) results = extractPopularItems(homeData, "series");
+        if (!results.length) {
+          results = extractAnimeList(homeData)
             .filter(item => item.type === "series")
             .slice(0, 20)
             .map((r, i) => ({ rank: i + 1, ...r }));
@@ -274,10 +296,7 @@ export default {
       if (path.startsWith("/api/genre/")) {
         const category = path.split("/")[3];
         const page = parseInt(params.get("page") || "1", 10);
-        const prefixes = [
-          `/category/genre/${category}/`,
-          `/genre/${category}/`
-        ];
+        const prefixes = [`/category/genre/${category}/`, `/genre/${category}/`];
         for (const base of prefixes) {
           const p = page > 1 ? `${base}page/${page}/` : base;
           try {
@@ -362,45 +381,27 @@ export default {
       }
 
       // ====================================================================
-      // Taxonomy lists — FIXED: try multiple pages to find nav links
+      // Taxonomy lists
       // ====================================================================
       if (path === "/api/genres" || path === "/api/languages" || path === "/api/countries" || path === "/api/discover") {
-        // Try multiple pages since homepage might not have all nav links in HTML
-        const pagesToTry = [
-          "/",
-          "/category/type/series/",
-          "/series/",
-          "/category/genre/action/",
-          "/genre/action/"
-        ];
-
-        let html = "";
-        let genres = [];
-        let languages = [];
-        let countries = [];
-
+        const pagesToTry = ["/", "/category/type/series/", "/series/", "/category/genre/action/", "/genre/action/"];
+        let genres = [], languages = [], countries = [];
         for (const p of pagesToTry) {
           try {
-            html = await cachedJSON(`html:${p}`, () => fetchPage(p), CACHE_TTL_HOME);
+            const html = await cachedJSON(`html:${p}`, () => fetchPage(p), CACHE_TTL_HOME);
             genres = extractTaxonomy(html, "genre");
             languages = extractTaxonomy(html, "language");
             countries = extractTaxonomy(html, "country");
-
-            // Break as soon as we find at least genres
             if (genres.length > 0) break;
           } catch (e) { /* try next page */ }
         }
-
         if (path === "/api/genres") return jsonResponse({ success: true, data: genres });
         if (path === "/api/languages") return jsonResponse({ success: true, data: languages });
         if (path === "/api/countries") return jsonResponse({ success: true, data: countries });
-
         return jsonResponse({
           success: true,
           data: {
-            genres,
-            languages,
-            countries,
+            genres, languages, countries,
             types: ["series", "movies", "anime", "cartoon"],
             statuses: ["ongoing", "completed"],
           },
@@ -408,7 +409,7 @@ export default {
       }
 
       // ====================================================================
-      // Generic taxonomy passthrough: /api/category/<tax>/<term>?page=N
+      // Generic taxonomy passthrough
       // ====================================================================
       if (path.startsWith("/api/category/")) {
         const parts = path.split("/").filter(Boolean);
@@ -418,9 +419,6 @@ export default {
         return await categoryPage(`/api/category/x/${term}`, tax, params, [`/${tax}/`]);
       }
 
-      // ====================================================================
-      // Named taxonomy routes
-      // ====================================================================
       if (path.startsWith("/api/country/"))  return await categoryPage(path, "country", params, ["/country/"]);
       if (path.startsWith("/api/language/")) return await categoryPage(path, "language", params, ["/language/"]);
       if (path.startsWith("/api/quality/"))  return await categoryPage(path, "quality", params, ["/quality/"]);
@@ -474,7 +472,7 @@ export default {
       }
 
       // ====================================================================
-      // Episodes (parallel season AJAX)
+      // Episodes
       // ====================================================================
       if (path.startsWith("/api/episodes/")) {
         const animeId = path.split("/")[3];
@@ -621,7 +619,7 @@ export default {
       }
 
       // ====================================================================
-      // Media proxy (CORS + manifest rewrite + SRT→VTT)
+      // Media proxy
       // ====================================================================
       if (path === "/proxy/media") {
         return await handleMediaProxy(request);
