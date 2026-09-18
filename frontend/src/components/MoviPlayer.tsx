@@ -49,7 +49,6 @@ export function MoviPlayer({
       return;
     }
 
-    // Referer/Origin are injected server-side by /proxy/media
     el.setAttribute('headers', '{}');
     el.setAttribute(
       'engine',
@@ -70,7 +69,6 @@ export function MoviPlayer({
       const elAny = el as any;
       let list: any[] = [];
       
-      // Try standard audioTracks property
       if (elAny.audioTracks && elAny.audioTracks.length) {
         list = Array.from(elAny.audioTracks);
       }
@@ -93,7 +91,6 @@ export function MoviPlayer({
     const events = ['loadedmetadata', 'canplay', 'playing', 'trackschange'];
     events.forEach((evt) => el.addEventListener(evt, readTracks));
 
-    // Retry after delays (some engines load tracks late)
     const timers = [
       window.setTimeout(readTracks, 800),
       window.setTimeout(readTracks, 2500),
@@ -192,6 +189,7 @@ export function MoviPlayer({
         <track
           key={s.url}
           src={s.url}
+          crossOrigin="anonymous"
           srcLang="en"
           label={s.label}
           kind="subtitles"
