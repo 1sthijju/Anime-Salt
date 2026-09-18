@@ -33,3 +33,84 @@ movi-player {
   0% { background-position: -200% 0; }
   100% { background-position: 200% 0; }
 }
+
+/* =========================================
+   ANIME PLAYER THEME
+   ========================================= */
+
+.anime-player-container {
+  position: relative;
+  border-radius: 1rem;
+  overflow: hidden;
+  box-shadow: 0 0 40px rgba(139, 92, 246, 0.2), 0 0 80px rgba(139, 92, 246, 0.1);
+  transition: box-shadow 0.3s ease;
+}
+
+.anime-player-container:hover {
+  box-shadow: 0 0 60px rgba(139, 92, 246, 0.4), 0 0 120px rgba(139, 92, 246, 0.2);
+}
+
+.anime-player {
+  /* Anime Theme CSS Variables for Movi Player */
+  --movi-accent: #8b5cf6;           /* Violet-500 */
+  --movi-accent-hover: #a78bfa;     /* Violet-400 */
+  --movi-text: #ffffff;
+  --movi-text-muted: #a1a1aa;
+  --movi-bg: rgba(15, 15, 25, 0.95);
+  --movi-bg-hover: rgba(25, 25, 40, 0.95);
+  --movi-border: rgba(139, 92, 246, 0.3);
+  --movi-border-hover: rgba(139, 92, 246, 0.6);
+  --movi-radius: 0.75rem;
+  --movi-control-size: 2.5rem;
+  
+  width: 100%;
+  height: 100%;
+  border-radius: 1rem;
+}
+
+/* Ambient mode glow effect */
+.anime-player[ambient="true"] {
+  animation: ambient-glow 4s ease-in-out infinite alternate;
+}
+
+@keyframes ambient-glow {
+  0% { box-shadow: 0 0 40px rgba(139, 92, 246, 0.4); }
+  100% { box-shadow: 0 0 80px rgba(139, 92, 246, 0.6), 0 0 120px rgba(236, 72, 153, 0.3); }
+}
+
+.anime-subtitle-text {
+  animation: subtitle-fade 0.3s ease-out;
+}
+
+@keyframes subtitle-fade {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.skip-button {
+  font-weight: 600;
+  font-size: 0.875rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+}
+
+.skip-button:hover {
+  transform: translateY(-2px) scale(1.05);
+  box-shadow: 0 6px 20px rgba(139, 92, 246, 0.6);
+}
+
+.anime-glow {
+  animation: loading-glow 2s ease-in-out infinite alternate;
+}
+
+@keyframes loading-glow {
+  0% { box-shadow: 0 0 20px rgba(139, 92, 246, 0.2); }
+  100% { box-shadow: 0 0 40px rgba(139, 92, 246, 0.4); }
+}
+
+/* Focus states for accessibility */
+.anime-player-container:focus-within {
+  outline: 2px solid rgba(139, 92, 246, 0.5);
+  outline-offset: 2px;
+}
