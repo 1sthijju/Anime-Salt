@@ -1,48 +1,33 @@
 import { useCallback } from 'react';
 
-const KEY_PREFIX = 'animesalt:resume:';
+const KEY_PREFIX = 'resume:';
 
 export function useResume(slug: string) {
-  const key = KEY_PREFIX + slug;
+  const key = `${KEY_PREFIX}${slug}`;
 
   const save = useCallback(
     (currentTime: number, duration: number) => {
-      if (currentTime < 10 || !duration) return;
+      if (!duration || currentTime < 10) return;
+      const data = { time: currentTime, duration, saved: Date.now() };
       try {
-        localStorage.setItem(
-          key,
-          JSON.stringify({
-            time: Math.floor(currentTime),
-            duration: Math.floor(duration),
-            savedAt: Date.now(),
-          })
-        );
+        localStorage.setItem(key, JSON.stringify(data));
       } catch {}
     },
     [key]
   );
 
-  const load = useCallback((): number | null => {
+  const load = useCallback(() => {
     try {
       const raw = localStorage.getItem(key);
       if (!raw) return null;
-      const { time, savedAt } = JSON.parse(raw);
-      // Expire after 30 days
-      if (Date.now() - savedAt > 1000 * 60 * 60 * 24 * 30) {
-        localStorage.removeItem(key);
-        return null;
-      }
-      return time;
+      const { time, saved } = JSON.parse(raw);
+      const age = Date.now() - saved;
+      const maxAge = 14 * 24 * 60 * 60 * 1000;
+      return age < maxAge ? time : null;
     } catch {
       return null;
     }
   }, [key]);
 
-  const clear = useCallback(() => {
-    try {
-      localStorage.removeItem(key);
-    } catch {}
-  }, [key]);
-
-  return { save, load, clear };
+  return { save, load };
 }
