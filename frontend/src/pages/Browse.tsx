@@ -70,7 +70,7 @@ export default function Browse() {
     load(next, true);
   };
 
-  const handleGenreChange = (g: string | null) => {
+  const handleGenreChange = (g: string | null | undefined) => {
     if (g) {
       navigate(`/genre/${g}`);
     } else {
@@ -78,8 +78,8 @@ export default function Browse() {
     }
   };
 
-  const handleLanguageChange = (l: string | null) => {
-    setLanguage(l);
+  const handleLanguageChange = (l: string | null | undefined) => {
+    setLanguage(l || null);
     // Future: could filter client-side or add query param
   };
 
