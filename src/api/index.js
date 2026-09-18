@@ -30,7 +30,6 @@ async function categoryPage(path, tax, params, altPrefixes = []) {
   const term = path.split("/")[3];
   if (!term) return jsonResponse({ success: false, error: "Term required" }, 400);
   const page = parseInt(params.get("page") || "1", 10);
-  // Try the standard /category/<tax>/<term>/ first, then all altPrefixes
   const bases = [`/category/${tax}/${term}/`, ...altPrefixes.map(a => `${a}${term}/`)];
   for (const base of bases) {
     const p = page > 1 ? `${base}page/${page}/` : base;
@@ -67,7 +66,11 @@ export default {
             charts: ["/api/popular", "/api/popular/films", "/api/popular/series"],
             browse: ["/api/series", "/api/movies", "/api/anime", "/api/cartoon", "/api/ongoing", "/api/completed"],
             taxonomy_lists: ["/api/genres", "/api/languages", "/api/countries", "/api/discover"],
-            taxonomy_pages: ["/api/genre/:g", "/api/type/:t", "/api/country/:c", "/api/language/:l", "/api/quality/:q", "/api/season/:s", "/api/studio/:st", "/api/year/:y", "/api/category/:tax/:term"],
+            taxonomy_pages: [
+              "/api/genre/:g", "/api/type/:t", "/api/country/:c", "/api/language/:l",
+              "/api/quality/:q", "/api/season/:s", "/api/studio/:st", "/api/year/:y",
+              "/api/category/:tax/:term"
+            ],
             detail: ["/api/info?id=", "/api/episodes/:id", "/api/servers?ep=", "/api/stream?ep="],
             misc: ["/api/search?keyword=", "/api/random"],
           },
@@ -85,7 +88,14 @@ export default {
           upstreamOnline = typeof html === "string" && (html.includes("animesalt") || html.includes("<html"));
           upstreamLatency = Date.now() - t0;
         } catch (err) { upstreamError = err.message; }
-        return jsonResponse({ success: upstreamOnline, status: upstreamOnline ? "healthy" : "degraded", timestamp: new Date().toISOString(), upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError }, version: "3.9.0-edge", endpointsCount: 30 });
+        return jsonResponse({
+          success: upstreamOnline,
+          status: upstreamOnline ? "healthy" : "degraded",
+          timestamp: new Date().toISOString(),
+          upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
+          version: "3.9.0-edge",
+          endpointsCount: 30
+        });
       }
 
       // ====================================================================
@@ -101,22 +111,40 @@ export default {
       }
 
       // ====================================================================
-      // Home (complete: 8 sections)
+      // Home (complete: 8 sections) — FIXED: multi-path movies + type detection
       // ====================================================================
       if (path === "/api/home") {
-        const [homeData, ongoingData, completedData, moviesData, freshData] = await Promise.all([
+        // Try multiple movie paths since /category/type/movies/ may not exist
+        let moviesHtml = "";
+        for (const moviePath of ["/category/type/movies/", "/movies/", "/type/movie/"]) {
+          try {
+            const data = await fetchPage(moviePath);
+            const items = extractAnimeList(data);
+            if (items.length) { moviesHtml = data; break; }
+          } catch (e) { /* try next */ }
+        }
+
+        const [homeData, ongoingData, completedData, freshData] = await Promise.all([
           cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME),
           cachedJSON("html:/category/status/ongoing/", () => fetchPage("/category/status/ongoing/"), CACHE_TTL_HOME).catch(() => ""),
           cachedJSON("html:/category/status/completed/", () => fetchPage("/category/status/completed/"), CACHE_TTL_HOME).catch(() => ""),
-          cachedJSON("html:movies:1", () => fetchPage("/category/type/movies/"), CACHE_TTL_HOME).catch(() => ""),
           cachedJSON("html:/category/status/fresh-drops/", () => fetchPage("/category/status/fresh-drops/"), CACHE_TTL_HOME).catch(() => ""),
         ]);
 
         const latest = extractAnimeList(homeData).slice(0, 20);
+
+        // Build popular list with CORRECT type detection based on URL
         let popular = extractPopularItems(homeData);
         if (popular.length === 0) {
-          popular = extractAnimeList(homeData).slice(0, 25).map((r, i) => ({ rank: i + 1, ...r }));
+          popular = extractAnimeList(homeData).slice(0, 50).map((r, i) => ({ rank: i + 1, ...r }));
         }
+
+        // FIX: Re-detect type from URL since extractPopularItems may miss /movies/ URLs
+        popular = popular.map(item => ({
+          ...item,
+          type: item.url && item.url.includes("/movies/") ? "movie" : (item.type || "series")
+        }));
+
         const popularSeries = popular.filter(i => i.type === "series").slice(0, 12);
         const popularFilms = popular.filter(i => i.type === "movie").slice(0, 12);
 
@@ -129,7 +157,7 @@ export default {
             popularFilms,
             ongoing: ongoingData ? extractAnimeList(ongoingData).slice(0, 18) : [],
             completed: completedData ? extractAnimeList(completedData).slice(0, 18) : [],
-            movies: moviesData ? extractAnimeList(moviesData).slice(0, 18) : [],
+            movies: moviesHtml ? extractAnimeList(moviesHtml).slice(0, 18) : [],
             freshDrops: freshData ? extractAnimeList(freshData).slice(0, 18) : [],
           },
         });
@@ -160,7 +188,7 @@ export default {
             if (items.length) return jsonResponse({ success: true, page, data: items });
           } catch (e) { /* try next */ }
         }
-        // Final fallback: just use the homepage latest grid
+        // Final fallback: use the homepage latest grid
         const data = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
         return jsonResponse({ success: true, page: 1, data: extractAnimeList(data).slice(0, 30) });
       }
@@ -172,18 +200,26 @@ export default {
         const type = params.get("type");
         const data = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
         let results = extractPopularItems(data, type);
-        if (results.length === 0) results = extractAnimeList(data).slice(0, 25).map((r, i) => ({ rank: i + 1, ...r }));
+        if (results.length === 0) {
+          results = extractAnimeList(data).slice(0, 25).map((r, i) => ({ rank: i + 1, ...r }));
+        }
         return jsonResponse({ success: true, data: results });
       }
 
       if (path === "/api/popular/films") {
         const data = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
         let results = extractPopularItems(data, "movie");
+        // Also include items where URL has /movies/
+        results = results.map(item => ({
+          ...item,
+          type: item.url && item.url.includes("/movies/") ? "movie" : item.type
+        })).filter(i => i.type === "movie");
+
         if (results.length === 0) {
           results = extractAnimeList(data)
-            .filter(item => item.type === "movie")
+            .filter(item => item.url && item.url.includes("/movies/"))
             .slice(0, 20)
-            .map((r, i) => ({ rank: i + 1, ...r }));
+            .map((r, i) => ({ rank: i + 1, ...r, type: "movie" }));
         }
         return jsonResponse({ success: true, data: results });
       }
@@ -238,18 +274,19 @@ export default {
       if (path.startsWith("/api/genre/")) {
         const category = path.split("/")[3];
         const page = parseInt(params.get("page") || "1", 10);
-        const p = page > 1 ? `/category/genre/${category}/page/${page}/` : `/category/genre/${category}/`;
-        try {
-          const data = await cachedJSON(`html:${p}`, () => fetchPage(p), CACHE_TTL_HOME);
-          return jsonResponse({ success: true, page, genre: category, data: extractAnimeList(data) });
-        } catch (e) {
-          // Fallback: try /genre/{category}/ directly
-          const p2 = page > 1 ? `/genre/${category}/page/${page}/` : `/genre/${category}/`;
+        const prefixes = [
+          `/category/genre/${category}/`,
+          `/genre/${category}/`
+        ];
+        for (const base of prefixes) {
+          const p = page > 1 ? `${base}page/${page}/` : base;
           try {
-            const data = await cachedJSON(`html:${p2}`, () => fetchPage(p2), CACHE_TTL_HOME);
-            return jsonResponse({ success: true, page, genre: category, data: extractAnimeList(data) });
-          } catch (e2) { return jsonResponse({ success: true, page, genre: category, data: [] }); }
+            const data = await cachedJSON(`html:${p}`, () => fetchPage(p), CACHE_TTL_HOME);
+            const items = extractAnimeList(data);
+            if (items.length) return jsonResponse({ success: true, page, genre: category, data: items });
+          } catch (e) { /* try next */ }
         }
+        return jsonResponse({ success: true, page, genre: category, data: [] });
       }
 
       // ====================================================================
@@ -325,30 +362,45 @@ export default {
       }
 
       // ====================================================================
-      // Taxonomy lists (scraped from site nav)
+      // Taxonomy lists — FIXED: try multiple pages to find nav links
       // ====================================================================
       if (path === "/api/genres" || path === "/api/languages" || path === "/api/countries" || path === "/api/discover") {
-        let html = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
-        let genres = extractTaxonomy(html, "genre");
-        let languages = extractTaxonomy(html, "language");
-        let countries = extractTaxonomy(html, "country");
-        
-        // If home page doesn't have them, try the series listing page
-        if (!genres.length) {
-          html = await cachedJSON("html:series:1", () => fetchPage("/category/type/series/"), CACHE_TTL_HOME);
-          genres = extractTaxonomy(html, "genre");
-          languages = languages.length ? languages : extractTaxonomy(html, "language");
-          countries = countries.length ? countries : extractTaxonomy(html, "country");
+        // Try multiple pages since homepage might not have all nav links in HTML
+        const pagesToTry = [
+          "/",
+          "/category/type/series/",
+          "/series/",
+          "/category/genre/action/",
+          "/genre/action/"
+        ];
+
+        let html = "";
+        let genres = [];
+        let languages = [];
+        let countries = [];
+
+        for (const p of pagesToTry) {
+          try {
+            html = await cachedJSON(`html:${p}`, () => fetchPage(p), CACHE_TTL_HOME);
+            genres = extractTaxonomy(html, "genre");
+            languages = extractTaxonomy(html, "language");
+            countries = extractTaxonomy(html, "country");
+
+            // Break as soon as we find at least genres
+            if (genres.length > 0) break;
+          } catch (e) { /* try next page */ }
         }
-        
+
         if (path === "/api/genres") return jsonResponse({ success: true, data: genres });
         if (path === "/api/languages") return jsonResponse({ success: true, data: languages });
         if (path === "/api/countries") return jsonResponse({ success: true, data: countries });
-        
+
         return jsonResponse({
           success: true,
           data: {
-            genres, languages, countries,
+            genres,
+            languages,
+            countries,
             types: ["series", "movies", "anime", "cartoon"],
             statuses: ["ongoing", "completed"],
           },
@@ -357,7 +409,6 @@ export default {
 
       // ====================================================================
       // Generic taxonomy passthrough: /api/category/<tax>/<term>?page=N
-      // Now tries BOTH /category/<tax>/<term>/ AND /<tax>/<term>/
       // ====================================================================
       if (path.startsWith("/api/category/")) {
         const parts = path.split("/").filter(Boolean);
@@ -368,7 +419,7 @@ export default {
       }
 
       // ====================================================================
-      // Named taxonomy routes (tries both /category/<tax>/ and /<tax>/)
+      // Named taxonomy routes
       // ====================================================================
       if (path.startsWith("/api/country/"))  return await categoryPage(path, "country", params, ["/country/"]);
       if (path.startsWith("/api/language/")) return await categoryPage(path, "language", params, ["/language/"]);
