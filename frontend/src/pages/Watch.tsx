@@ -24,6 +24,9 @@ export default function Watch() {
   const [audioTracks, setAudioTracks] = useState<AudioTrackInfo[]>([]);
   const [audioTrackIdx, setAudioTrackIdx] = useState<number | null>(null);
 
+  // Subtitle selection (null = off, 0+ = index into stream.subtitles)
+  const [subtitleIdx, setSubtitleIdx] = useState<number | null>(0);
+
   const [loading, setLoading] = useState(true);
   const [serversLoading, setServersLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -40,6 +43,7 @@ export default function Watch() {
     setHlsAudio(undefined);
     setAudioTracks([]);
     setAudioTrackIdx(null);
+    setSubtitleIdx(0); // Default ON for first subtitle
     setErr(null);
     setServersLoading(true);
     setLoading(true);
@@ -85,6 +89,10 @@ export default function Watch() {
       .then((s) => {
         if (cancelled) return;
         setStream(s);
+        // Auto-enable first subtitle if available
+        if (s.subtitles && s.subtitles.length > 0 && subtitleIdx === null) {
+          setSubtitleIdx(0);
+        }
       })
       .catch((e) => {
         if (cancelled) return;
@@ -126,6 +134,10 @@ export default function Watch() {
     setAudioTrackIdx(i);
   }, []);
 
+  const handleSubtitleChange = useCallback((i: number | null) => {
+    setSubtitleIdx(i);
+  }, []);
+
   const handlePlayerError = useCallback((msg: string) => {
     setErr(msg);
   }, []);
@@ -154,14 +166,14 @@ export default function Watch() {
         ← Back to anime
       </Link>
 
-      {/* Player (with subtitle tracks injected) */}
+      {/* Player (with custom subtitle overlay) */}
       <MoviPlayer
         stream={stream}
         qualityIndex={activeQuality}
         loading={loading}
         title={prettyTitle}
         slug={episode}
-        subtitles={stream?.subtitles}
+        activeSubtitle={stream?.subtitles?.[subtitleIdx ?? -1] ?? null}
         onError={handlePlayerError}
         onAudioTracks={setAudioTracks}
         audioTrackIndex={audioTrackIdx}
@@ -184,11 +196,14 @@ export default function Watch() {
             audioTrackIndex={audioTrackIdx}
             audioLanguages={stream?.audio_languages}
             activeAudioLang={stream?.selected_audio ?? null}
+            subtitles={stream?.subtitles ?? []}
+            activeSubtitleIndex={subtitleIdx}
             onServerChange={handleServerChange}
             onLangChange={handleLangChange}
             onQualityChange={handleQualityChange}
             onAudioTrackChange={handleAudioTrackChange}
             onAudioLangChange={handleAudioLangChange}
+            onSubtitleChange={handleSubtitleChange}
           />
         </div>
       ) : (
