@@ -2,14 +2,7 @@ import { useRef, useEffect, useLayoutEffect, useState } from 'react';
 import type { StreamData, Subtitle } from '../api/types';
 import { api } from '../api/client';
 import { useResume } from '../hooks/useResume';
-
-// Augment React's TrackHTMLAttributes to include the crossOrigin attribute
-// (missing from @types/react but valid per HTML spec for <track> elements)
-declare module 'react' {
-  interface TrackHTMLAttributes<T> {
-    crossOrigin?: 'anonymous' | 'use-credentials' | '';
-  }
-}
+import { parseVtt, type VttCue } from '../lib/vtt';
 
 export interface AudioTrackInfo {
   index: number;
@@ -23,7 +16,7 @@ interface Props {
   loading?: boolean;
   title?: string;
   slug: string;
-  subtitles?: Subtitle[];
+  activeSubtitle?: Subtitle | null;
   onError?: (message: string) => void;
   onAudioTracks?: (tracks: AudioTrackInfo[]) => void;
   audioTrackIndex?: number | null;
@@ -35,7 +28,7 @@ export function MoviPlayer({
   loading,
   title,
   slug,
-  subtitles,
+  activeSubtitle,
   onError,
   onAudioTracks,
   audioTrackIndex,
@@ -44,75 +37,80 @@ export function MoviPlayer({
   const { save, load } = useResume(slug);
   const [sourceKey, setSourceKey] = useState(0);
 
-  // ------------------------------------------------------------
-  // Set the source whenever stream / quality changes
-  // ------------------------------------------------------------
+  // ---------------- Subtitle overlay state ----------------
+  const [cues, setCues] = useState<VttCue[]>([]);
+  const [cueText, setCueText] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    setCues([]);
+    setCueText('');
+    if (!activeSubtitle?.url) return;
+    fetch(activeSubtitle.url)
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.text();
+      })
+      .then((t) => { if (!cancelled) setCues(parseVtt(t)); })
+      .catch((e) => console.error('Subtitle fetch failed:', activeSubtitle.url, e));
+    return () => { cancelled = true; };
+  }, [activeSubtitle?.url]);
+
+  // rAF-synced cue display (smoother than timeupdate)
+  useEffect(() => {
+    if (!cues.length) return;
+    let raf = 0;
+    const tick = () => {
+      const el = ref.current as any;
+      if (el && typeof el.currentTime === 'number') {
+        const t = el.currentTime;
+        const cue = cues.find((c) => t >= c.start && t <= c.end);
+        const next = cue ? cue.text : '';
+        setCueText((prev) => (prev === next ? prev : next));
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [cues]);
+
+  // ---------------- Source ----------------
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el || !stream || stream.isIframe) return;
-
     const playUrl = api.getProxiedUrl(stream, qualityIndex);
-    if (!playUrl) {
-      onError?.('No playable URL in stream response');
-      return;
-    }
-
+    if (!playUrl) { onError?.('No playable URL in stream response'); return; }
     el.setAttribute('headers', '{}');
-    el.setAttribute(
-      'engine',
-      stream.source_type === 'hls' ? 'shaka hlsjs native wasm' : 'native wasm'
-    );
+    el.setAttribute('engine', stream.source_type === 'hls' ? 'shaka hlsjs native wasm' : 'native wasm');
     el.setAttribute('src', playUrl);
     setSourceKey((k) => k + 1);
   }, [stream, qualityIndex, onError]);
 
-  // ------------------------------------------------------------
-  // Discover audio tracks (HLS audio groups load asynchronously)
-  // ------------------------------------------------------------
+  // ---------------- Audio tracks ----------------
   useEffect(() => {
     const el = ref.current;
     if (!el || !onAudioTracks) return;
-
     const readTracks = () => {
-      const elAny = el as any;
-      let list: any[] = [];
-      
-      if (elAny.audioTracks && elAny.audioTracks.length) {
-        list = Array.from(elAny.audioTracks);
-      }
-      
-      if (list.length === 0) {
-        onAudioTracks([]);
-        return;
-      }
-
-      const tracks = list.map((t: any, i: number) => ({
-        index: typeof t.id === 'number' ? t.id : (typeof t.index === 'number' ? t.index : i),
-        label: t.label || t.name || t.language || `Audio ${i + 1}`,
-        language: t.language || '',
-      }));
-      onAudioTracks(tracks);
+      const list = (el as any).audioTracks;
+      if (!list || !list.length) { onAudioTracks([]); return; }
+      onAudioTracks(
+        Array.from(list).map((t: any, i: number) => ({
+          index: typeof t.id === 'number' ? t.id : i,
+          label: t.label || t.name || t.language || `Audio ${i + 1}`,
+          language: t.language || '',
+        }))
+      );
     };
-
     readTracks();
-
     const events = ['loadedmetadata', 'canplay', 'playing', 'trackschange'];
     events.forEach((evt) => el.addEventListener(evt, readTracks));
-
-    const timers = [
-      window.setTimeout(readTracks, 800),
-      window.setTimeout(readTracks, 2500),
-    ];
-
+    const timers = [window.setTimeout(readTracks, 800), window.setTimeout(readTracks, 2500)];
     return () => {
       events.forEach((evt) => el.removeEventListener(evt, readTracks));
       timers.forEach((t) => window.clearTimeout(t));
     };
   }, [sourceKey, onAudioTracks]);
 
-  // ------------------------------------------------------------
-  // Apply the selected audio track
-  // ------------------------------------------------------------
   useEffect(() => {
     const el = ref.current;
     if (!el || audioTrackIndex == null) return;
@@ -124,9 +122,7 @@ export function MoviPlayer({
     try { list.selectedIndex = audioTrackIndex; } catch {}
   }, [audioTrackIndex, sourceKey]);
 
-  // ------------------------------------------------------------
-  // Resume playback position
-  // ------------------------------------------------------------
+  // ---------------- Resume + persist ----------------
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
@@ -140,9 +136,6 @@ export function MoviPlayer({
     return () => el.removeEventListener('loadedmetadata', handler);
   }, [sourceKey, load]);
 
-  // ------------------------------------------------------------
-  // Persist playback position
-  // ------------------------------------------------------------
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
@@ -157,9 +150,7 @@ export function MoviPlayer({
     };
   }, [save]);
 
-  // ------------------------------------------------------------
-  // Render states
-  // ------------------------------------------------------------
+  // ---------------- Render ----------------
   if (loading) {
     return (
       <div className="aspect-video rounded-xl bg-card flex items-center justify-center">
@@ -183,30 +174,27 @@ export function MoviPlayer({
   }
 
   return (
-    <movi-player
-      ref={ref}
-      controls
-      autoplay
-      resume
-      theme="dark"
-      title={title || ''}
-      persist="volume speed audiolang subtitlelang"
-      persistkey="animesalt"
-    >
-      {(subtitles || []).map((s, i) => (
-        <track
-          key={s.url}
-          src={s.url}
-          crossOrigin="anonymous"
-          srcLang="en"
-          label={s.label}
-          kind="subtitles"
-          default={i === 0 ? true : undefined}
-          onError={(e) => {
-            console.error(`Subtitle track failed to load: ${s.label}`, s.url, e);
-          }}
-        />
-      ))}
-    </movi-player>
+    <div className="relative">
+      <movi-player
+        ref={ref}
+        controls
+        autoplay
+        resume
+        theme="dark"
+        title={title || ''}
+        persist="volume speed audiolang"
+        persistkey="animesalt"
+      />
+      {cueText && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-20 z-10 flex justify-center px-6">
+          <div
+            className="rounded-md bg-black/70 px-3 py-1.5 text-center text-sm md:text-base text-white whitespace-pre-line leading-snug"
+            style={{ textShadow: '0 1px 2px rgba(0,0,0,0.9)' }}
+          >
+            {cueText}
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
