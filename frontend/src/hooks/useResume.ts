@@ -2,13 +2,17 @@ import { useCallback } from 'react';
 
 const KEY_PREFIX = 'resume:';
 
+export interface ResumeMeta {
+  title?: string;
+}
+
 export function useResume(slug: string) {
   const key = `${KEY_PREFIX}${slug}`;
 
   const save = useCallback(
-    (currentTime: number, duration: number) => {
+    (currentTime: number, duration: number, meta?: ResumeMeta) => {
       if (!duration || currentTime < 10) return;
-      const data = { time: currentTime, duration, saved: Date.now() };
+      const data = { time: currentTime, duration, saved: Date.now(), title: meta?.title };
       try {
         localStorage.setItem(key, JSON.stringify(data));
       } catch {}
