@@ -92,17 +92,33 @@ export function extractEmbedForIndex(html, index) {
 }
 
 /**
- * Extract a taxonomy list (genres / languages / countries / etc.)
- * from any page's navigation links: /category/<tax>/<slug>/
+ * ROBUST Taxonomy extraction: searches for ANY URL containing the taxonomy word.
+ * Handles /genre/action/, /category/genre/action/, ?genre=action, etc.
+ * Returns {slug, name, url} objects.
  */
 export function extractTaxonomy(html, tax) {
   const results = [];
-  const regex = new RegExp(`href="[^"]*\\/category\\/${tax}\\/([^\\/"]+)\\/?"[^>]*>([^<]+)<`, "gi");
+  // Match href=".../[tax]/[slug]/" or href=".../[tax]/[slug]"
+  const regex = new RegExp(`href="([^"]*\\/${tax}\\/([^\\/"]+)\\/?)["']`, "gi");
   let m;
   while ((m = regex.exec(html)) !== null) {
-    const slug = m[1];
-    const name = m[2].trim();
-    if (slug && name && !results.find(r => r.slug === slug)) results.push({ slug, name });
+    const fullUrl = m[1];
+    const slug = m[2];
+    
+    // Extract the visible text from the <a> tag
+    const tagEnd = html.indexOf("</a>", m.index);
+    const tagStart = html.lastIndexOf(">", m.index);
+    let name = "";
+    if (tagStart > -1 && tagEnd > tagStart) {
+      name = html.substring(tagStart + 1, tagEnd).replace(/<[^>]+>/g, "").trim();
+    }
+    
+    // Fallback: use the slug as the name (capitalized)
+    if (!name) name = slug.replace(/-/g, " ").replace(/\b\w/g, l => l.toUpperCase());
+    
+    if (slug && name && !results.find(r => r.slug === slug)) {
+      results.push({ slug, name, url: fullUrl });
+    }
   }
   return results;
 }
