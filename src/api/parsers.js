@@ -44,7 +44,6 @@ export function extractPopularItems(html, targetType) {
   return results;
 }
 
-// Episodes + their thumbnail stills (every lazy-load + background-image pattern)
 export function parseEpisodesFromHtml(html, seasonNum) {
   const eps = [];
   const epRegex = /<a[^>]+href="([^"]+\/episode\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
@@ -61,19 +60,29 @@ export function parseEpisodesFromHtml(html, seasonNum) {
     const titleMatch = match[2].match(/class="[^"]*(?:entry-title|title)[^"]*"[^>]*>([^<]+)/i) || match[2].match(/>([^<]+)</i);
     const title = titleMatch ? titleMatch[1].trim().replace(/^\d+\s*/, "").replace(/\s*View\s*$/i, "").trim() : `Episode ${epNum}`;
 
-    // Episode still — try every common lazy-load attribute, then background-image
+    // thumbnail: search inside anchor first, then in window before it (sibling layout)
     let image = "";
-    const imgTag = match[2].match(/<img[^>]*>/i);
-    if (imgTag) {
-      const lazy = imgTag[0].match(/\b(?:data-lazy-src|data-original|data-src|data-cfsrc|data-bg|data-lazy|data-echo|data-srcset)="([^"]+)"/i);
-      const plain = imgTag[0].match(/\bsrc="([^"]+)"/i);
-      image = lazy ? lazy[1] : (plain && !plain[1].startsWith("data:") ? plain[1] : "");
-    }
+    const grabUrl = (fragment) => {
+      const tags = [...fragment.matchAll(/<img[^>]*>/gi)];
+      for (let i = tags.length - 1; i >= 0; i--) {
+        const tag = tags[i][0];
+        const lazy = tag.match(/\b(?:data-lazy-src|data-original|data-src|data-cfsrc|data-bg|data-lazy)="([^"]+)"/i);
+        const srcset = tag.match(/\bsrcset="([^"]+)"/i);
+        const plain = tag.match(/\bsrc="([^"]+)"/i);
+        let u = lazy ? lazy[1] : (srcset ? srcset[1].split(/[ ,]/)[0] : (plain && !plain[1].startsWith("data:") ? plain[1] : ""));
+        if (u && !u.startsWith("data:")) return u;
+      }
+      const bg = fragment.match(/background(?:-image)?:\s*(?:[^;'"()]*?,\s*)?url\(\s*['"]?([^'")]+)['"]?\s*\)/i);
+      if (bg && !bg[1].startsWith("data:")) return bg[1];
+      return "";
+    };
+
+    image = grabUrl(match[2]);
     if (!image) {
-      const bgMatch = match[2].match(/style="[^"]*background-image:\s*url\(['"]?([^'")]+)['"]?\)/i);
-      if (bgMatch) image = bgMatch[1];
+      const windowStart = Math.max(0, match.index - 800);
+      image = grabUrl(html.slice(windowStart, match.index));
     }
-    if (image && image.startsWith("//")) image = "https:" + image;
+    if (image.startsWith("//")) image = "https:" + image;
 
     if (!eps.find(e => e.slug === epSlug)) eps.push({ num: epNum, season: sNum, title, slug: epSlug, url, image: image || null });
   }
@@ -120,9 +129,6 @@ export function extractTaxonomy(html, tax) {
   return results;
 }
 
-// ===========================================================================
-// HOMEPAGE SECTION SPLITTER
-// ===========================================================================
 export const HOME_SECTION_TITLES = [
   "Most-Watched Series",
   "Most-Watched Films",
