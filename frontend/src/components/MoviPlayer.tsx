@@ -3,6 +3,14 @@ import type { StreamData, Subtitle } from '../api/types';
 import { api } from '../api/client';
 import { useResume } from '../hooks/useResume';
 
+// Augment React's TrackHTMLAttributes to include the crossOrigin attribute
+// (missing from @types/react but valid per HTML spec for <track> elements)
+declare module 'react' {
+  interface TrackHTMLAttributes<T> {
+    crossOrigin?: 'anonymous' | 'use-credentials' | '';
+  }
+}
+
 export interface AudioTrackInfo {
   index: number;
   label: string;
