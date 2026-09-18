@@ -12,8 +12,8 @@ export default function Browse() {
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(false);
   const [hasMore, setHasMore] = useState(true);
-  const [genre, setGenre] = useState<string | null>(null);
-  const [language, setLanguage] = useState<string | null>(null);
+  const [genre, setGenre] = useState<string | undefined>(undefined);
+  const [language, setLanguage] = useState<string | undefined>(undefined);
 
   const title = slug
     ? `${slug.charAt(0).toUpperCase() + slug.slice(1)}`
@@ -27,10 +27,8 @@ export default function Browse() {
       try {
         let data: CardItem[] = [];
         if (slug) {
-          // Genre route
           data = await api.genre(slug, pageNum);
         } else if (kind) {
-          // Catalog route
           if (kind === 'ongoing') {
             data = await api.ongoing(pageNum);
           } else if (kind === 'completed') {
@@ -70,7 +68,8 @@ export default function Browse() {
     load(next, true);
   };
 
-  const handleGenreChange = (g: string | null | undefined) => {
+  const handleGenreChange = (g: string | null) => {
+    setGenre(g || undefined);
     if (g) {
       navigate(`/genre/${g}`);
     } else {
@@ -78,9 +77,8 @@ export default function Browse() {
     }
   };
 
-  const handleLanguageChange = (l: string | null | undefined) => {
-    setLanguage(l || null);
-    // Future: could filter client-side or add query param
+  const handleLanguageChange = (l: string | null) => {
+    setLanguage(l || undefined);
   };
 
   return (
