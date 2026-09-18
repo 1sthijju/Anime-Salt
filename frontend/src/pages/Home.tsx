@@ -1,59 +1,62 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { api } from '../api/client';
-import type { Anime, PopularItem } from '../api/types';
-import { AnimeGrid } from '../components/AnimeCard';
-import { Loading, CardGridSkeleton } from '../components/ui/Loading';
-import { Error } from '../components/ui/Error';
+import type { HomeData } from '../api/types';
+import { Hero } from '../components/ui/Hero';
+import { SectionRail } from '../components/ui/SectionRail';
+import { RailSkeleton } from '../components/ui/Skeletons';
 
 export default function Home() {
-  const [latest, setLatest] = useState<Anime[] | null>(null);
-  const [popular, setPopular] = useState<PopularItem[] | null>(null);
-  const [err, setErr] = useState<string | null>(null);
+  const [data, setData] = useState<HomeData | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
-  const load = async () => {
-    setErr(null);
-    try {
-      const [l, p] = await Promise.all([api.latestEpisodes(), api.popular()]);
-      setLatest(l);
-      setPopular(p);
-    } catch (e) {
-      setErr((e as Error).message);
-    }
-  };
+  const load = useCallback(() => {
+    setError(null);
+    setData(null);
+    api
+      .home()
+      .then(setData)
+      .catch((e) => setError((e as Error).message));
+  }, []);
 
   useEffect(() => {
     load();
-  }, []);
+  }, [load]);
+
+  if (error) {
+    return (
+      <div className="container-x py-32 text-center">
+        <p className="text-sm text-red-400">Failed to load home feed: {error}</p>
+        <button className="btn-ghost mt-4" onClick={load}>
+          Retry
+        </button>
+      </div>
+    );
+  }
 
   return (
-    <div className="space-y-12 animate-fade-in">
-      {/* Hero */}
-      <section className="relative rounded-2xl overflow-hidden bg-gradient-to-br from-violet-900/40 via-bg to-cyan-900/30 p-8 md:p-12 border border-border">
-        <h1 className="text-4xl md:text-5xl font-bold mb-4">
-          Watch Anime,{' '}
-          <span className="bg-gradient-to-r from-accent to-accent2 bg-clip-text text-transparent">
-            Ad-Free.
-          </span>
-        </h1>
-        <p className="text-gray-300 max-w-xl leading-relaxed">
-          Stream thousands of episodes in 4K HDR with Movi Player — HLS & MP4 streaming,
-          multi-language audio, and zero transcoding.
-        </p>
-      </section>
+    <div className="pb-12">
+      <Hero item={data?.mostWatchedSeries?.[0] ?? null} loading={!data} />
 
-      {err && <Error message={err} onRetry={load} />}
-
-      {/* Latest */}
-      <section>
-        <h2 className="text-xl font-semibold mb-4">🔥 Latest Episodes</h2>
-        {latest ? <AnimeGrid items={latest} /> : <CardGridSkeleton count={12} />}
-      </section>
-
-      {/* Popular */}
-      <section>
-        <h2 className="text-xl font-semibold mb-4">🏆 Popular</h2>
-        {popular ? <AnimeGrid items={popular.slice(0, 18)} /> : <CardGridSkeleton count={12} />}
-      </section>
+      {!data ? (
+        <>
+          <RailSkeleton />
+          <RailSkeleton />
+          <RailSkeleton />
+        </>
+      ) : (
+        <>
+          <SectionRail title="Latest Updates" items={data.latest} href="/browse/series" />
+          <SectionRail title="Most-Watched Series" items={data.mostWatchedSeries} ranked />
+          <SectionRail title="Most-Watched Films" items={data.mostWatchedFilms} ranked href="/browse/movies" />
+          <SectionRail title="On-Air Series" items={data.onAirSeries?.length ? data.onAirSeries : data.ongoing} />
+          <SectionRail title="Fresh Drops" items={data.freshDrops} />
+          <SectionRail title="New Anime Arrivals" items={data.newAnimeArrivals} />
+          <SectionRail title="Latest Anime Movies" items={data.animeMovies?.length ? data.animeMovies : data.movies} href="/browse/movies" />
+          <SectionRail title="Just In: Cartoon Series" items={data.cartoonSeries} href="/browse/cartoon" />
+          <SectionRail title="Fresh Cartoon Films" items={data.cartoonFilms} href="/browse/cartoon" />
+          <SectionRail title="Completed & Binge-Ready" items={data.completed} />
+        </>
+      )}
     </div>
   );
 }
