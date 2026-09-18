@@ -1,5 +1,5 @@
 import { jsonResponse, corsHeaders, BASE_URL, CACHE_TTL_HOME, CACHE_TTL, CHROME_HEADERS } from "./config.js";
-import { cachedJSON, fetchPage, siteAjax, getSeriesHtml } from "./net.js";
+import { cachedJSON, fetchPage, siteAjax } from "./net.js";
 import { extractAnimeList, extractPopularItems, extractEmbedForIndex, extractTaxonomy, extractHomeSections } from "./parsers.js";
 import { getEpisodesData } from "./episodes.js";
 import { resolveAsCdn26, resolveAbyss, normalizeAbyssUrl } from "./decryptors.js";
@@ -54,6 +54,14 @@ async function getPlaybackHtml(slug) {
   return "";
 }
 
+// Reject 404/error pages; require at least one real-content marker
+function isContentPage(html) {
+  if (!html) return false;
+  if (/<title>[^<]*404/i.test(html)) return false;
+  if (/>\s*404\s+Not\s+Found\s*</i.test(html)) return false;
+  return /entry-title|server-btn|<iframe|overview-text/i.test(html);
+}
+
 // ---------------------------------------------------------------------------
 // Worker entry
 // ---------------------------------------------------------------------------
@@ -71,7 +79,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.12.0",
+          version: "3.13.0",
           endpoints: {
             system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
@@ -105,7 +113,7 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.12.0-edge",
+          version: "3.13.0-edge",
           endpointsCount: 30
         });
       }
@@ -454,14 +462,38 @@ export default {
       }
 
       // ====================================================================
-      // Anime details
+      // Anime / movie details — 404-safe, movie-aware
       // ====================================================================
       if (path === "/api/info") {
         const animeId = params.get("id") || params.get("slug");
         if (!animeId) return jsonResponse({ success: false, error: "Anime ID (slug) is required" }, 400);
-        let data, type = "series";
-        try { data = await getSeriesHtml(animeId); }
-        catch (e) { data = await cachedJSON(`html:movies:${animeId}`, () => fetchPage(`/movies/${animeId}/`)); type = "movies"; }
+
+        let data = "";
+        let type = "series";
+
+        // Try series page first
+        try {
+          const seriesHtml = await cachedJSON(`html:series:${animeId}`, () => fetchPage(`/series/${animeId}/`), CACHE_TTL_HOME);
+          if (isContentPage(seriesHtml)) {
+            data = seriesHtml;
+            type = "series";
+          }
+        } catch (e) { /* series missing, fall through to movies */ }
+
+        // Then movie page
+        if (!data) {
+          try {
+            const movieHtml = await cachedJSON(`html:movies:${animeId}`, () => fetchPage(`/movies/${animeId}/`), CACHE_TTL_HOME);
+            if (isContentPage(movieHtml)) {
+              data = movieHtml;
+              type = "movies";
+            }
+          } catch (e) { /* both missing */ }
+        }
+
+        if (!data) {
+          return jsonResponse({ success: false, error: "Content not found" }, 404);
+        }
 
         const titleMatch = data.match(/<h1[^>]*class="[^"]*entry-title[^"]*"[^>]*>([\s\S]*?)<\/h1>/i) || data.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
         const title = titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').trim() : "Unknown";
