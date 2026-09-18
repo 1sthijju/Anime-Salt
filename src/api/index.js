@@ -41,6 +41,19 @@ async function categoryPage(path, tax, params, altPrefixes = []) {
   return jsonResponse({ success: true, page, term, data: [] });
 }
 
+// Movies embed their player on /movies/<slug>/, series on /series/<slug>/,
+// episodes on /episode/<slug>/. Try all three for playback markup.
+async function getPlaybackHtml(slug) {
+  const candidates = [`/episode/${slug}/`, `/movies/${slug}/`, `/series/${slug}/`];
+  for (const p of candidates) {
+    try {
+      const html = await cachedJSON(`html:playback:${p}`, () => fetchPage(p), CACHE_TTL_HOME);
+      if (html && /server-btn|<iframe/i.test(html)) return html;
+    } catch (e) { /* try next */ }
+  }
+  return "";
+}
+
 // ---------------------------------------------------------------------------
 // Worker entry
 // ---------------------------------------------------------------------------
@@ -58,7 +71,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.11.0",
+          version: "3.12.0",
           endpoints: {
             system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
@@ -92,7 +105,7 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.11.0-edge",
+          version: "3.12.0-edge",
           endpointsCount: 30
         });
       }
@@ -110,17 +123,15 @@ export default {
       }
 
       // ====================================================================
-      // HOME — reflects actual animesalt.cx homepage structure
+      // HOME
       // ====================================================================
       if (path === "/api/home") {
         const homeData = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
         const secs = extractHomeSections(homeData);
-        
-        // Homepage sections (from actual page)
+
         const mostWatchedSeries = secs["Most-Watched Series"] || [];
         const mostWatchedFilms = secs["Most-Watched Films"] || [];
-        
-        // Additional sections from category pages (not on homepage)
+
         const [latestEpisodes, ongoing, completed, movies, freshDrops] = await Promise.all([
           Promise.resolve(extractAnimeList(homeData).slice(0, 20)),
           cachedJSON("html:/category/status/ongoing/", () => fetchPage("/category/status/ongoing/"), CACHE_TTL_HOME)
@@ -152,16 +163,13 @@ export default {
         return jsonResponse({
           success: true,
           data: {
-            // Homepage sections
             mostWatchedSeries,
             mostWatchedFilms,
-            // Category-based sections
             latest: latestEpisodes,
             ongoing,
             completed,
             movies,
             freshDrops,
-            // Legacy keys (backwards compat)
             popular: [...mostWatchedSeries.slice(0, 12), ...mostWatchedFilms.slice(0, 12)],
             popularSeries: mostWatchedSeries.slice(0, 12),
             popularFilms: mostWatchedFilms.slice(0, 12),
@@ -170,7 +178,7 @@ export default {
       }
 
       // ====================================================================
-      // DEBUG: Discover homepage section headings
+      // DEBUG
       // ====================================================================
       if (path === "/api/debug/home-headings") {
         const html = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
@@ -186,10 +194,7 @@ export default {
           const text = (match[1] || '').trim();
           if (text.length > 3 && text.length < 80) headings.push(text);
         }
-        return jsonResponse({ 
-          success: true, 
-          data: [...new Set(headings)].slice(0, 50),
-        });
+        return jsonResponse({ success: true, data: [...new Set(headings)].slice(0, 50) });
       }
 
       if (path === "/api/latest-episodes") {
@@ -201,11 +206,6 @@ export default {
       // Fresh Drops
       // ====================================================================
       if (path === "/api/fresh-drops") {
-        const homeData = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
-        const secs = extractHomeSections(homeData);
-        if ((secs["Fresh Drops"] || []).length) {
-          return jsonResponse({ success: true, page: 1, data: secs["Fresh Drops"] });
-        }
         const page = parseInt(params.get("page") || "1", 10);
         const prefixes = [
           "/category/status/fresh-drops/",
@@ -222,7 +222,8 @@ export default {
             if (items.length) return jsonResponse({ success: true, page, data: items });
           } catch (e) { /* try next */ }
         }
-        return jsonResponse({ success: true, page: 1, data: extractAnimeList(homeData).slice(0, 30) });
+        const data = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
+        return jsonResponse({ success: true, page: 1, data: extractAnimeList(data).slice(0, 30) });
       }
 
       // ====================================================================
@@ -484,13 +485,43 @@ export default {
       }
 
       // ====================================================================
-      // Episodes
+      // Episodes — with MOVIE fallback (synthetic single episode)
       // ====================================================================
       if (path.startsWith("/api/episodes/")) {
         const animeId = path.split("/")[3];
         const seasonParam = params.get("season");
         const requestedSeason = seasonParam ? parseInt(seasonParam, 10) : "all";
-        const { episodes, seasons, failedSeasons } = await getEpisodesData(animeId, requestedSeason);
+
+        let episodes = [], seasons = [], failedSeasons = [];
+        try {
+          const r = await getEpisodesData(animeId, requestedSeason);
+          episodes = r.episodes || [];
+          seasons = r.seasons || [];
+          failedSeasons = r.failedSeasons || [];
+        } catch (e) { /* movie or broken series page */ }
+
+        // MOVIE FALLBACK: one synthetic "Full Movie" episode so the watch flow works
+        if (!episodes.length) {
+          let title = animeId.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+          try {
+            const html = await cachedJSON(`html:movies:${animeId}`, () => fetchPage(`/movies/${animeId}/`), CACHE_TTL_HOME);
+            const t = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+            if (t) title = t[1].replace(/<[^>]+>/g, "").trim();
+          } catch (e) {}
+          const ep = { num: 1, season: 1, title, slug: animeId, url: `${BASE_URL}/movies/${animeId}/` };
+          return jsonResponse({
+            success: true,
+            data: {
+              animeId,
+              requestedSeason,
+              availableSeasons: [1],
+              totalEpisodes: 1,
+              failedSeasons: [],
+              groupedEpisodes: { "1": [ep] },
+              isMovie: true,
+            },
+          });
+        }
 
         const groupedEpisodes = {};
         for (const ep of episodes) {
@@ -502,43 +533,45 @@ export default {
       }
 
       // ====================================================================
-      // Servers
+      // Servers — movie-aware via getPlaybackHtml
       // ====================================================================
       if (path === "/api/servers") {
         const epSlug = params.get("ep");
         if (!epSlug) return jsonResponse({ success: false, error: "Episode slug (ep) is required" }, 400);
-        const data = await cachedJSON(`html:episode:${epSlug}`, () => fetchPage(`/episode/${epSlug}/`));
+        const data = await getPlaybackHtml(epSlug);
         const servers = [];
-        const serverRegex = /<div[^>]*class="[^"]*server-btn[^"]*"[^>]*onclick="changeServer\((\d+)\)"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/gi;
-        let match;
-        while ((match = serverRegex.exec(data)) !== null) {
-          const index = parseInt(match[1]);
-          const serverHtml = match[2];
-          const nameMatch = serverHtml.match(/class="[^"]*server-name[^"]*"[^>]*>([^<]+)/i);
-          const infoMatch = serverHtml.match(/class="[^"]*server-info[^"]*"[^>]*>([^<]+)/i);
-          const serverNameHeader = nameMatch ? nameMatch[1].trim() : `SERVER ${index + 1}`;
-          const serverInfo = infoMatch ? infoMatch[1].trim() : "";
-          const fullName = serverInfo ? `${serverNameHeader} - ${serverInfo}` : serverNameHeader;
+        if (data) {
+          const serverRegex = /<div[^>]*class="[^"]*server-btn[^"]*"[^>]*onclick="changeServer\((\d+)\)"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/gi;
+          let match;
+          while ((match = serverRegex.exec(data)) !== null) {
+            const index = parseInt(match[1]);
+            const serverHtml = match[2];
+            const nameMatch = serverHtml.match(/class="[^"]*server-name[^"]*"[^>]*>([^<]+)/i);
+            const infoMatch = serverHtml.match(/class="[^"]*server-info[^"]*"[^>]*>([^<]+)/i);
+            const serverNameHeader = nameMatch ? nameMatch[1].trim() : `SERVER ${index + 1}`;
+            const serverInfo = infoMatch ? infoMatch[1].trim() : "";
+            const fullName = serverInfo ? `${serverNameHeader} - ${serverInfo}` : serverNameHeader;
 
-          const embedUrl = extractEmbedForIndex(data, index);
+            const embedUrl = extractEmbedForIndex(data, index);
 
-          let languages = [];
-          if (embedUrl && embedUrl.includes("multi-lang-plyr/player.php?data=")) {
-            try {
-              const b64Match = embedUrl.match(/data=([A-Za-z0-9+/=]+)/);
-              if (b64Match && b64Match[1]) {
-                const parsed = JSON.parse(atob(b64Match[1]));
-                languages = Array.isArray(parsed) ? parsed.map(l => ({ ...l, link: normalizeAbyssUrl(l.link) })) : [];
-              }
-            } catch (e) {}
+            let languages = [];
+            if (embedUrl && embedUrl.includes("multi-lang-plyr/player.php?data=")) {
+              try {
+                const b64Match = embedUrl.match(/data=([A-Za-z0-9+/=]+)/);
+                if (b64Match && b64Match[1]) {
+                  const parsed = JSON.parse(atob(b64Match[1]));
+                  languages = Array.isArray(parsed) ? parsed.map(l => ({ ...l, link: normalizeAbyssUrl(l.link) })) : [];
+                }
+              } catch (e) {}
+            }
+            servers.push({ index, serverName: fullName, embedUrl: embedUrl || null, isMultiLang: languages.length > 0, languages });
           }
-          servers.push({ index, serverName: fullName, embedUrl: embedUrl || null, isMultiLang: languages.length > 0, languages });
         }
         return jsonResponse({ success: true, data: servers });
       }
 
       // ====================================================================
-      // Stream resolver
+      // Stream resolver — movie-aware via getPlaybackHtml
       // ====================================================================
       if (path === "/api/stream") {
         const epSlug = params.get("ep");
@@ -546,10 +579,10 @@ export default {
         const lang = params.get("lang");
         const audio = params.get("audio");
         if (!epSlug) return jsonResponse({ success: false, error: "Episode slug (ep) is required" }, 400);
-        const data = await cachedJSON(`html:episode:${epSlug}`, () => fetchPage(`/episode/${epSlug}/`));
+        const data = await getPlaybackHtml(epSlug);
         const serverIndex = parseInt(serverParam, 10);
 
-        let embedUrl = extractEmbedForIndex(data, serverIndex) || null;
+        let embedUrl = data ? extractEmbedForIndex(data, serverIndex) || null : null;
         let selectedLanguage = null;
         if (embedUrl && embedUrl.includes("multi-lang-plyr/player.php?data=")) {
           try {
@@ -615,7 +648,7 @@ export default {
             },
           });
         }
-        return jsonResponse({ success: true, data: { embedUrl, serverIndex, selectedLanguage, isIframe: true, referer: `${BASE_URL}/episode/${epSlug}/` } });
+        return jsonResponse({ success: true, data: { embedUrl, serverIndex, selectedLanguage, isIframe: true, referer: `${BASE_URL}/movies/${epSlug}/` } });
       }
 
       // ====================================================================
