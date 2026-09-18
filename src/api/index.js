@@ -33,8 +33,31 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.7.0",
-          endpoints: ["/api/health", "/api/search", "/api/latest-episodes", "/api/popular", "/api/completed", "/api/ongoing", "/api/type/:type", "/api/genre/:category", "/api/info", "/api/episodes/:id", "/api/servers", "/api/stream", "/api/ajax", "/proxy/media"],
+          version: "3.8.0",
+          endpoints: [
+            "/api/health",
+            "/api/search",
+            "/api/home",
+            "/api/latest-episodes",
+            "/api/fresh-drops",
+            "/api/popular",
+            "/api/popular/films",
+            "/api/popular/series",
+            "/api/completed",
+            "/api/ongoing",
+            "/api/type/:type",
+            "/api/genre/:category",
+            "/api/series",
+            "/api/movies",
+            "/api/anime",
+            "/api/cartoon",
+            "/api/info",
+            "/api/episodes/:id",
+            "/api/servers",
+            "/api/stream",
+            "/api/ajax",
+            "/proxy/media"
+          ],
         });
       }
 
@@ -46,7 +69,7 @@ export default {
           upstreamOnline = typeof html === "string" && (html.includes("animesalt") || html.includes("<html"));
           upstreamLatency = Date.now() - t0;
         } catch (err) { upstreamError = err.message; }
-        return jsonResponse({ success: upstreamOnline, status: upstreamOnline ? "healthy" : "degraded", timestamp: new Date().toISOString(), upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError }, version: "3.7.0-edge", endpointsCount: 14 });
+        return jsonResponse({ success: upstreamOnline, status: upstreamOnline ? "healthy" : "degraded", timestamp: new Date().toISOString(), upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError }, version: "3.8.0-edge", endpointsCount: 22 });
       }
 
       if (path === "/api/search") {
@@ -58,9 +81,39 @@ export default {
         return jsonResponse({ success: true, page, data: extractAnimeList(data) });
       }
 
+      // ============================================
+      // NEW: Complete home page data
+      // ============================================
+      if (path === "/api/home") {
+        const data = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
+        const latest = extractAnimeList(data).slice(0, 20);
+        const popular = extractPopularItems(data);
+        if (popular.length === 0) {
+          const fallback = extractAnimeList(data).slice(0, 25).map((r, i) => ({ rank: i + 1, ...r }));
+          return jsonResponse({ success: true, data: { latest, popular: fallback } });
+        }
+        return jsonResponse({ success: true, data: { latest, popular } });
+      }
+
       if (path === "/api/latest-episodes") {
         const data = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
         return jsonResponse({ success: true, data: extractAnimeList(data).slice(0, 20) });
+      }
+
+      // ============================================
+      // NEW: Fresh Drops (recently added content)
+      // ============================================
+      if (path === "/api/fresh-drops") {
+        const page = parseInt(params.get("page") || "1", 10);
+        const p = page > 1 ? `/category/status/fresh-drops/page/${page}/` : "/category/status/fresh-drops/";
+        try {
+          const data = await cachedJSON(`html:${p}`, () => fetchPage(p), CACHE_TTL_HOME);
+          return jsonResponse({ success: true, page, data: extractAnimeList(data) });
+        } catch (e) {
+          // Fallback: use latest episodes if fresh-drops doesn't exist
+          const data = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
+          return jsonResponse({ success: true, page: 1, data: extractAnimeList(data).slice(0, 30) });
+        }
       }
 
       if (path === "/api/popular") {
@@ -68,6 +121,36 @@ export default {
         const data = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
         let results = extractPopularItems(data, type);
         if (results.length === 0) results = extractAnimeList(data).slice(0, 25).map((r, i) => ({ rank: i + 1, ...r }));
+        return jsonResponse({ success: true, data: results });
+      }
+
+      // ============================================
+      // NEW: Most-Watched Films
+      // ============================================
+      if (path === "/api/popular/films") {
+        const data = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
+        let results = extractPopularItems(data, "movie");
+        if (results.length === 0) {
+          results = extractAnimeList(data)
+            .filter(item => item.type === "movie")
+            .slice(0, 20)
+            .map((r, i) => ({ rank: i + 1, ...r }));
+        }
+        return jsonResponse({ success: true, data: results });
+      }
+
+      // ============================================
+      // NEW: Most-Watched Series
+      // ============================================
+      if (path === "/api/popular/series") {
+        const data = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
+        let results = extractPopularItems(data, "series");
+        if (results.length === 0) {
+          results = extractAnimeList(data)
+            .filter(item => item.type === "series")
+            .slice(0, 20)
+            .map((r, i) => ({ rank: i + 1, ...r }));
+        }
         return jsonResponse({ success: true, data: results });
       }
 
@@ -108,6 +191,68 @@ export default {
           const data = await cachedJSON(`html:${p}`, () => fetchPage(p), CACHE_TTL_HOME);
           return jsonResponse({ success: true, page, genre: category, data: extractAnimeList(data) });
         } catch (e) { return jsonResponse({ success: true, page, genre: category, data: [] }); }
+      }
+
+      // ============================================
+      // NEW: Series category
+      // ============================================
+      if (path === "/api/series") {
+        const page = parseInt(params.get("page") || "1", 10);
+        const p = page > 1 ? `/category/type/series/page/${page}/` : "/category/type/series/";
+        try {
+          const data = await cachedJSON(`html:series:${page}`, () => fetchPage(p), CACHE_TTL_HOME);
+          return jsonResponse({ success: true, page, data: extractAnimeList(data) });
+        } catch (e) { return jsonResponse({ success: true, page, data: [] }); }
+      }
+
+      // ============================================
+      // NEW: Movies category
+      // ============================================
+      if (path === "/api/movies") {
+        const page = parseInt(params.get("page") || "1", 10);
+        const p = page > 1 ? `/category/type/movies/page/${page}/` : "/category/type/movies/";
+        try {
+          const data = await cachedJSON(`html:movies:${page}`, () => fetchPage(p), CACHE_TTL_HOME);
+          return jsonResponse({ success: true, page, data: extractAnimeList(data) });
+        } catch (e) { return jsonResponse({ success: true, page, data: [] }); }
+      }
+
+      // ============================================
+      // NEW: Anime category
+      // ============================================
+      if (path === "/api/anime") {
+        const page = parseInt(params.get("page") || "1", 10);
+        const p = page > 1 ? `/category/genre/anime/page/${page}/` : "/category/genre/anime/";
+        try {
+          const data = await cachedJSON(`html:anime:${page}`, () => fetchPage(p), CACHE_TTL_HOME);
+          return jsonResponse({ success: true, page, data: extractAnimeList(data) });
+        } catch (e) {
+          // Fallback: try type/anime if genre/anime doesn't exist
+          const p2 = page > 1 ? `/category/type/anime/page/${page}/` : "/category/type/anime/";
+          try {
+            const data = await cachedJSON(`html:anime-type:${page}`, () => fetchPage(p2), CACHE_TTL_HOME);
+            return jsonResponse({ success: true, page, data: extractAnimeList(data) });
+          } catch (e2) { return jsonResponse({ success: true, page, data: [] }); }
+        }
+      }
+
+      // ============================================
+      // NEW: Cartoon category
+      // ============================================
+      if (path === "/api/cartoon") {
+        const page = parseInt(params.get("page") || "1", 10);
+        const p = page > 1 ? `/category/genre/cartoon/page/${page}/` : "/category/genre/cartoon/";
+        try {
+          const data = await cachedJSON(`html:cartoon:${page}`, () => fetchPage(p), CACHE_TTL_HOME);
+          return jsonResponse({ success: true, page, data: extractAnimeList(data) });
+        } catch (e) {
+          // Fallback: try type/cartoon if genre/cartoon doesn't exist
+          const p2 = page > 1 ? `/category/type/cartoon/page/${page}/` : "/category/type/cartoon/";
+          try {
+            const data = await cachedJSON(`html:cartoon-type:${page}`, () => fetchPage(p2), CACHE_TTL_HOME);
+            return jsonResponse({ success: true, page, data: extractAnimeList(data) });
+          } catch (e2) { return jsonResponse({ success: true, page, data: [] }); }
+        }
       }
 
       if (path === "/api/info") {
@@ -232,16 +377,12 @@ export default {
           const workerOrigin = new URL(request.url).origin;
           const primary = resolvedStream.direct_hls || resolvedStream.qualities?.[0]?.url || null;
 
-          // Parse available audio/subtitle renditions from the HLS master
           let groups = { audio: [], subtitles: [] };
           if (resolvedStream.direct_hls) groups = await getMasterInfo(resolvedStream.direct_hls);
 
-          // Proxied URL carries the chosen audio so the proxy flips DEFAULT flags
           let proxied = primary ? proxyMediaUrl(workerOrigin, primary) : null;
           if (proxied && audio) proxied += `&audio=${encodeURIComponent(audio)}`;
 
-          // Subtitle VTTs (SRT disguised as .jpg upstream) forced to text/vtt through proxy
-          // Pass the embed referer so the CDN accepts the request
           const subtitles = (resolvedStream.subtitles || []).map(s => ({
             label: s.label,
             url: proxyMediaUrl(workerOrigin, s.url) + 
