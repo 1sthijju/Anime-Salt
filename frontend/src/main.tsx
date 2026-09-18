@@ -1,6 +1,6 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-import 'movi-player'; // registers the <movi-player> custom element
+import 'movi-player';
 import App from './App';
 import './index.css';
 
