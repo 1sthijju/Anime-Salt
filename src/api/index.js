@@ -58,7 +58,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.10.0",
+          version: "3.11.0",
           endpoints: {
             system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
@@ -73,10 +73,6 @@ export default {
             detail: ["/api/info?id=", "/api/episodes/:id", "/api/servers?ep=", "/api/stream?ep="],
             misc: ["/api/search?keyword=", "/api/random"],
           },
-          homeSections: [
-            "latest", "mostWatchedSeries", "mostWatchedFilms", "freshDrops",
-            "onAirSeries", "newAnimeArrivals", "cartoonSeries", "animeMovies", "cartoonFilms",
-          ],
         });
       }
 
@@ -96,7 +92,7 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.10.0-edge",
+          version: "3.11.0-edge",
           endpointsCount: 30
         });
       }
@@ -114,65 +110,61 @@ export default {
       }
 
       // ====================================================================
-      // HOME — mirrors animesalt.cx homepage, section by section
+      // HOME — reflects actual animesalt.cx homepage structure
       // ====================================================================
       if (path === "/api/home") {
         const homeData = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
         const secs = extractHomeSections(homeData);
-        const get = (key) => secs[key] || [];
-
-        const mostWatchedSeries = get("Most-Watched Series");
-        const mostWatchedFilms  = get("Most-Watched Films");
-        const freshDrops        = get("Fresh Drops");
-        const onAirSeries       = get("On-Air Series");
-        const newAnimeArrivals  = get("New Anime Arrivals");
-        const cartoonSeries     = get("Just In: Cartoon Series");
-        const animeMovies       = get("Latest Anime Movies");
-        const cartoonFilms      = get("Fresh Cartoon Films");
-        const latestEpisodes    = get("Latest Episodes");
-
-        const latest = latestEpisodes.length ? latestEpisodes : extractAnimeList(homeData).slice(0, 20);
-        const popular = [...mostWatchedSeries, ...mostWatchedFilms];
-
-        const [ongoingFallback, completed, moviesFallback] = await Promise.all([
-          onAirSeries.length
-            ? Promise.resolve([])
-            : cachedJSON("html:/category/status/ongoing/", () => fetchPage("/category/status/ongoing/"), CACHE_TTL_HOME)
-                .then(h => extractAnimeList(h).slice(0, 18)).catch(() => []),
+        
+        // Homepage sections (from actual page)
+        const mostWatchedSeries = secs["Most-Watched Series"] || [];
+        const mostWatchedFilms = secs["Most-Watched Films"] || [];
+        
+        // Additional sections from category pages (not on homepage)
+        const [latestEpisodes, ongoing, completed, movies, freshDrops] = await Promise.all([
+          Promise.resolve(extractAnimeList(homeData).slice(0, 20)),
+          cachedJSON("html:/category/status/ongoing/", () => fetchPage("/category/status/ongoing/"), CACHE_TTL_HOME)
+            .then(h => extractAnimeList(h).slice(0, 18)).catch(() => []),
           cachedJSON("html:/category/status/completed/", () => fetchPage("/category/status/completed/"), CACHE_TTL_HOME)
             .then(h => extractAnimeList(h).slice(0, 18)).catch(() => []),
-          animeMovies.length
-            ? Promise.resolve([])
-            : (async () => {
-                for (const p of ["/movies/", "/category/type/movies/"]) {
-                  try {
-                    const h = await fetchPage(p);
-                    const it = extractAnimeList(h);
-                    if (it.length) return it.slice(0, 18);
-                  } catch (e) { /* next */ }
-                }
-                return [];
-              })(),
+          (async () => {
+            for (const p of ["/movies/", "/category/type/movies/"]) {
+              try {
+                const h = await fetchPage(p);
+                const items = extractAnimeList(h);
+                if (items.length) return items.slice(0, 18);
+              } catch (e) { /* next */ }
+            }
+            return [];
+          })(),
+          (async () => {
+            for (const base of ["/new/", "/recent/", "/latest/"]) {
+              try {
+                const h = await fetchPage(base);
+                const items = extractAnimeList(h);
+                if (items.length) return items.slice(0, 18);
+              } catch (e) { /* next */ }
+            }
+            return [];
+          })(),
         ]);
 
         return jsonResponse({
           success: true,
           data: {
-            latest,
+            // Homepage sections
             mostWatchedSeries,
             mostWatchedFilms,
+            // Category-based sections
+            latest: latestEpisodes,
+            ongoing,
+            completed,
+            movies,
             freshDrops,
-            onAirSeries,
-            newAnimeArrivals,
-            cartoonSeries,
-            animeMovies: animeMovies.length ? animeMovies : moviesFallback,
-            cartoonFilms,
-            popular,
+            // Legacy keys (backwards compat)
+            popular: [...mostWatchedSeries.slice(0, 12), ...mostWatchedFilms.slice(0, 12)],
             popularSeries: mostWatchedSeries.slice(0, 12),
             popularFilms: mostWatchedFilms.slice(0, 12),
-            ongoing: onAirSeries.length ? onAirSeries : ongoingFallback,
-            completed,
-            movies: animeMovies.length ? animeMovies : moviesFallback,
           },
         });
       }
@@ -183,26 +175,20 @@ export default {
       if (path === "/api/debug/home-headings") {
         const html = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
         const headings = [];
-        
-        // Extract all headings from various tag types
         const regex = /<(h[1-6]|div|span)[^>]*class="[^"]*(?:title|heading|section|widget)[^"]*"[^>]*>([^<]+)<\/\1>/gi;
         let match;
         while ((match = regex.exec(html)) !== null) {
           const text = (match[2] || '').trim();
           if (text.length > 3 && text.length < 80) headings.push(text);
         }
-        
-        // Also extract from plain h1-h6 tags
         const plainRegex = /<h[1-6][^>]*>([^<]+)<\/h[1-6]>/gi;
         while ((match = plainRegex.exec(html)) !== null) {
           const text = (match[1] || '').trim();
           if (text.length > 3 && text.length < 80) headings.push(text);
         }
-        
         return jsonResponse({ 
           success: true, 
           data: [...new Set(headings)].slice(0, 50),
-          note: "These are the actual heading texts found on the homepage. Update HOME_SECTION_TITLES in parsers.js to match these."
         });
       }
 
