@@ -9,11 +9,9 @@ interface Props {
   activeQuality: number;
   stream: StreamData | null;
 
-  // Player-exposed HLS audio tracks (bonus row)
   audioTracks?: AudioTrackInfo[];
   audioTrackIndex?: number | null;
 
-  // Manifest-driven audio languages (server-side control)
   audioLanguages?: AudioLanguage[];
   activeAudioLang?: string | null;
 
@@ -45,7 +43,9 @@ export function ServerControls({
   const qualities = stream?.qualities;
   const hasMultiQuality = !!qualities && qualities.length > 1;
   const hasMultiAudioTracks = audioTracks.length > 1;
-  const hasManifestAudio = audioLanguages.length > 1;
+  
+  // Only show manifest-driven audio row if player can't switch tracks itself
+  const hasManifestAudio = audioLanguages.length > 1 && audioTracks.length < 2;
 
   return (
     <div className="bg-card rounded-xl p-4 space-y-3">
@@ -81,7 +81,27 @@ export function ServerControls({
         </div>
       )}
 
-      {/* HLS manifest audio languages (server-side DEFAULT switching) */}
+      {/* Player-exposed audio tracks (instant switching) */}
+      {hasMultiAudioTracks && onAudioTrackChange && (
+        <div className="pt-3 border-t border-border">
+          <div className="text-xs text-muted mb-2 uppercase tracking-wide">Audio track</div>
+          <div className="flex flex-wrap gap-2">
+            {audioTracks.map((t) => (
+              <Badge
+                key={t.index}
+                variant="cyan"
+                active={(audioTrackIndex ?? 0) === t.index}
+                onClick={() => onAudioTrackChange(t.index)}
+              >
+                {t.label}
+                {t.language && <span className="ml-1 opacity-70">[{t.language}]</span>}
+              </Badge>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* HLS manifest audio languages (fallback for engines without track switching) */}
       {hasManifestAudio && onAudioLangChange && (
         <div className="pt-3 border-t border-border">
           <div className="text-xs text-muted mb-2 uppercase tracking-wide">Audio language</div>
@@ -94,26 +114,6 @@ export function ServerControls({
                 onClick={() => onAudioLangChange(a.code)}
               >
                 {a.name}
-              </Badge>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Player-exposed audio tracks (when the engine surfaces them) */}
-      {hasMultiAudioTracks && onAudioTrackChange && (
-        <div className="pt-3 border-t border-border">
-          <div className="text-xs text-muted mb-2 uppercase tracking-wide">Audio track (player)</div>
-          <div className="flex flex-wrap gap-2">
-            {audioTracks.map((t) => (
-              <Badge
-                key={t.index}
-                variant="cyan"
-                active={(audioTrackIndex ?? 0) === t.index}
-                onClick={() => onAudioTrackChange(t.index)}
-              >
-                {t.label}
-                {t.language && <span className="ml-1 opacity-70">[{t.language}]</span>}
               </Badge>
             ))}
           </div>
