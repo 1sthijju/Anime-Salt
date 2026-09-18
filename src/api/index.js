@@ -79,7 +79,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.20.0",
+          version: "3.21.0",
           endpoints: {
             system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings", "/api/debug/poster"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
@@ -110,7 +110,7 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.20.0-edge",
+          version: "3.21.0-edge",
           endpointsCount: 31
         });
       }
@@ -415,7 +415,7 @@ export default {
       }
 
       // ====================================================================
-      // Anime / movie details — v3.20.0
+      // Anime / movie details — v3.21.0
       // ====================================================================
       if (path === "/api/info") {
         const animeId = params.get("id") || params.get("slug");
@@ -448,7 +448,7 @@ export default {
         const beforeTitle = data.slice(0, titleIdx > -1 ? titleIdx : 20000);
         const imgsBefore = [...beforeTitle.matchAll(/<img[^>]*>/gi)];
 
-        // ---------------- POSTER ----------------
+        // ---------------- POSTER (portrait) ----------------
         let poster = "";
         for (let i = imgsBefore.length - 1; i >= 0 && !poster; i--) {
           const tag = imgsBefore[i][0];
@@ -482,23 +482,32 @@ export default {
         }
         if (poster.startsWith("//")) poster = "https:" + poster;
 
-        // ---------------- BACKDROP ----------------
+        // ---------------- BACKDROP (landscape ONLY) ----------------
+        // Strict: ONLY accept TMDB landscape profiles (w1280/w780/w1920)
+        // If no landscape exists on the page, backdrop stays empty
         let backdrop = "";
+        
+        // 1) Collect all image URLs from background-image + img tags before title
         const bgUrls = [...beforeTitle.matchAll(/background-image:\s*url\(['"]?([^'")]+)['"]?\)/gi)].map(m => m[1]);
-        const landscapeImgs = imgsBefore.map(tag => {
+        const allImgs = imgsBefore.map(tag => {
           const srcM = tag[0].match(/\b(?:data-lazy-src|data-original|data-src|data-cfsrc|src)="([^"]+)"/i);
           return srcM ? srcM[1] : "";
         });
-        const bgCandidates = [...bgUrls, ...landscapeImgs]
+        const allCandidates = [...bgUrls, ...allImgs]
           .filter(u => u && !u.startsWith("data:") && !SITE_ASSET.test(u) && !BAD_IMAGE.test(u));
-        backdrop = bgCandidates.find(u => LANDSCAPE_TMDB.test(u)) || "";
+        
+        // 2) ONLY accept TMDB landscape profile from before-title area
+        backdrop = allCandidates.find(u => LANDSCAPE_TMDB.test(u)) || "";
+        
+        // 3) Fallback: search ENTIRE document for any TMDB landscape URL
         if (!backdrop) {
           const lm = data.match(/https:\/\/image\.tmdb\.org\/t\/p\/w(?:1280|780|1920|original)\/[^"'\s<>)]+/);
           if (lm) backdrop = lm[0];
         }
-        if (!backdrop && bgCandidates.length > 0) {
-          backdrop = bgCandidates[0];
-        }
+        
+        // 4) NO fallback to portrait — if no landscape exists, backdrop stays empty
+        // (This prevents backdrop = same-as-poster)
+        
         if (backdrop.startsWith("//")) backdrop = "https:" + backdrop;
 
         // Description
