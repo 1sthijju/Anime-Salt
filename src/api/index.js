@@ -79,7 +79,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.13.0",
+          version: "3.14.0",
           endpoints: {
             system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
@@ -113,7 +113,7 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.13.0-edge",
+          version: "3.14.0-edge",
           endpointsCount: 30
         });
       }
@@ -462,7 +462,7 @@ export default {
       }
 
       // ====================================================================
-      // Anime / movie details — 404-safe, movie-aware
+      // Anime / movie details — 404-safe, movie-aware, improved parsing
       // ====================================================================
       if (path === "/api/info") {
         const animeId = params.get("id") || params.get("slug");
@@ -495,25 +495,123 @@ export default {
           return jsonResponse({ success: false, error: "Content not found" }, 404);
         }
 
-        const titleMatch = data.match(/<h1[^>]*class="[^"]*entry-title[^"]*"[^>]*>([\s\S]*?)<\/h1>/i) || data.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+        // Title
+        const titleMatch = data.match(/<h1[^>]*class="[^"]*entry-title[^"]*"[^>]*>([\s\S]*?)<\/h1>/i) 
+                        || data.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
         const title = titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').trim() : "Unknown";
-        const posterMatch = data.match(/<img[^>]*class="[^"]*(?:wp-post-image|poster)[^"]*"[^>]*(?:data-src|src)="([^"]+)"/i);
-        let poster = posterMatch ? posterMatch[1] : ""; if (poster.startsWith("//")) poster = "https:" + poster;
-        const descMatch = data.match(/<div[^>]*id="overview-text"[^>]*>([\s\S]*?)<\/div>/i) || data.match(/<div[^>]*class="[^"]*(?:synopsis|overview)[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
-        const description = descMatch ? descMatch[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim() : "";
-        const genres = []; const genreRegex = /href="[^"]*\/category\/genre\/[^"]*"[^>]*>([^<]+)<\/a>/gi; let match;
-        while ((match = genreRegex.exec(data)) !== null) { const g = match[1].trim(); if (g && !genres.includes(g)) genres.push(g); }
-        const languages = []; const langRegex = /href="[^"]*\/category\/language\/[^"]*"[^>]*>([^<]+)<\/a>/gi;
-        while ((match = langRegex.exec(data)) !== null) { const l = match[1].trim(); if (l && !languages.includes(l)) languages.push(l); }
-        const yearMatch = data.match(/\b(19[5-9]\d|20[0-2]\d)\b/);
-        const statusMatch = data.match(/Status[^<]*<[^>]*>([^<]+)/i);
 
+        // Poster — try multiple patterns (series + movies use different markup)
+        let poster = "";
+        const posterPatterns = [
+          /<img[^>]*class="[^"]*(?:wp-post-image|poster|featured-image)[^"]*"[^>]*(?:data-src|src)="([^"]+)"/i,
+          /<div[^>]*class="[^"]*(?:poster|thumb|featured|image)[^"]*"[^>]*>[\s\S]*?<img[^>]*(?:data-src|src)="([^"]+)"/i,
+          /<meta[^>]*property="og:image"[^>]*content="([^"]+)"/i,
+        ];
+        for (const pattern of posterPatterns) {
+          const m = data.match(pattern);
+          if (m) { poster = m[1]; break; }
+        }
+        if (poster.startsWith("//")) poster = "https:" + poster;
+
+        // Description
+        const descMatch = data.match(/<div[^>]*id="overview-text"[^>]*>([\s\S]*?)<\/div>/i) 
+                       || data.match(/<div[^>]*class="[^"]*(?:synopsis|overview|description)[^"]*"[^>]*>([\s\S]*?)<\/div>/i)
+                       || data.match(/<meta[^>]*name="description"[^>]*content="([^"]+)"/i);
+        const description = descMatch ? descMatch[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim() : "";
+
+        // Genres
+        const genres = []; 
+        const genreRegex = /href="[^"]*\/category\/genre\/[^"]*"[^>]*>([^<]+)<\/a>/gi; 
+        let match;
+        while ((match = genreRegex.exec(data)) !== null) { 
+          const g = match[1].trim(); 
+          if (g && !genres.includes(g)) genres.push(g); 
+        }
+
+        // Languages
+        const languages = []; 
+        const langRegex = /href="[^"]*\/category\/language\/[^"]*"[^>]*>([^<]+)<\/a>/gi;
+        while ((match = langRegex.exec(data)) !== null) { 
+          const l = match[1].trim(); 
+          if (l && !languages.includes(l)) languages.push(l); 
+        }
+
+        // Year — extract from metadata or content area (avoid CDN cache dates like 2025)
+        let year = null;
+        const yearMetaMatch = data.match(/<meta[^>]*name="release[_-]?year"[^>]*content="(\d{4})"/i);
+        if (yearMetaMatch) {
+          year = parseInt(yearMetaMatch[1]);
+        } else {
+          // Look for year in content area only (skip headers/footers with cache dates)
+          const mainStart = data.indexOf('<main');
+          const mainEnd = data.indexOf('</main>');
+          const contentArea = mainStart > -1 && mainEnd > mainStart 
+            ? data.slice(mainStart, mainEnd) 
+            : data.slice(0, Math.min(data.length, 5000));
+          // Match years 1950-2024, prefer earlier years (anime rarely starts in 2025+)
+          const yearMatches = [...contentArea.matchAll(/\b((?:19|20)\d{2})\b/g)]
+            .map(m => parseInt(m[1]))
+            .filter(y => y >= 1950 && y <= 2024);
+          if (yearMatches.length > 0) {
+            // Take the earliest year (most likely the release year)
+            year = Math.min(...yearMatches);
+          }
+        }
+
+        // Status — try multiple patterns
+        let status = "Unknown";
+        const statusPatterns = [
+          /Status[^<]*<[^>]*>([^<]+)/i,
+          /class="[^"]*status[^"]*"[^>]*>([^<]+)/i,
+          /<meta[^>]*name="status"[^>]*content="([^"]+)"/i,
+          /Ongoing|Completed|Finished|Airing/i, // fallback: look for keywords
+        ];
+        for (const pattern of statusPatterns) {
+          const m = data.match(pattern);
+          if (m) { 
+            status = m[1] ? m[1].trim() : m[0]; 
+            if (status.length > 50) status = "Unknown"; // too long, probably matched wrong
+            break; 
+          }
+        }
+
+        // Episodes/seasons — for series, calculate totalEpisodes from season titles
         let seasons = [], totalEpisodes = 0;
         if (type === "series") {
-          try { const epData = await getEpisodesData(animeId, "all"); seasons = epData.seasons; totalEpisodes = epData.episodes.length; } catch (e) {}
-        } else { totalEpisodes = 1; }
+          try { 
+            const epData = await getEpisodesData(animeId, "all"); 
+            seasons = epData.seasons; 
+            
+            // Calculate totalEpisodes from season titles (format: "Season X • Y-Z (N)")
+            if (seasons.length > 0) {
+              totalEpisodes = seasons.reduce((sum, s) => {
+                const countMatch = s.title.match(/\((\d+)\)/);
+                return sum + (countMatch ? parseInt(countMatch[1]) : 0);
+              }, 0);
+            } else {
+              totalEpisodes = epData.episodes.length;
+            }
+          } catch (e) {}
+        } else { 
+          totalEpisodes = 1; 
+        }
 
-        return jsonResponse({ success: true, data: { id: animeId, title, poster, description, type, totalEpisodes, year: yearMatch ? parseInt(yearMatch[0]) : null, status: statusMatch ? statusMatch[1].trim() : "Unknown", seasons, genres, languages } });
+        return jsonResponse({ 
+          success: true, 
+          data: { 
+            id: animeId, 
+            title, 
+            poster, 
+            description, 
+            type, 
+            totalEpisodes, 
+            year, 
+            status, 
+            seasons, 
+            genres, 
+            languages 
+          } 
+        });
       }
 
       // ====================================================================
