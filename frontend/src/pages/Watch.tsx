@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
-import { useParams, Link, useNavigate } from 'react-router-dom';
+import { useParams, Link } from 'react-router-dom';
 import { api } from '../api/client';
 import type { Server, StreamData } from '../api/types';
 import { MoviPlayer, type AudioTrackInfo } from '../components/MoviPlayer';
@@ -9,7 +9,6 @@ import { Loading } from '../components/ui/Loading';
 
 export default function Watch() {
   const { episode } = useParams<{ episode: string }>();
-  const navigate = useNavigate();
 
   // Servers + stream
   const [servers, setServers] = useState<Server[]>([]);
@@ -44,7 +43,7 @@ export default function Watch() {
     setHlsAudio(undefined);
     setAudioTracks([]);
     setAudioTrackIdx(null);
-    setSubtitleIdx(0); // subtitles ON by default
+    setSubtitleIdx(0);
     setErr(null);
     setServersLoading(true);
     setLoading(true);
@@ -143,17 +142,20 @@ export default function Watch() {
     setErr(msg);
   }, []);
 
+  if (!episode) {
+    return <Error message="No episode specified" />;
+  }
+
   // ------------------------------------------------------------
-  // Derived values (before any early return, for hook safety)
+  // Prev / next episode slugs + pretty title
   // ------------------------------------------------------------
-  const match = episode?.match(/-(\d+)x(\d+)$/);
+  const match = episode.match(/-(\d+)x(\d+)$/);
   const season = match ? Number(match[1]) : 1;
   const epNum = match ? Number(match[2]) : 1;
-  const animeSlug = episode ? episode.replace(/-\d+x\d+$/, '') : '';
+  const animeSlug = episode.replace(/-\d+x\d+$/, '');
   const prettyTitle = match
     ? `${animeSlug.replace(/-/g, ' ')} — S${season} E${epNum}`
-    : episode || '';
-  const nextEpisodeSlug = `${animeSlug}-${season}x${epNum + 1}`;
+    : episode;
 
   // For iframe-fallback servers: use the selected language link when available
   const currentServer = servers[activeServer];
@@ -161,14 +163,6 @@ export default function Watch() {
     (activeLang &&
       currentServer?.languages?.find((l) => l.language === activeLang)?.link) ||
     null;
-
-  const handleNextEpisode = useCallback(() => {
-    if (nextEpisodeSlug) navigate(`/watch/${nextEpisodeSlug}`);
-  }, [navigate, nextEpisodeSlug]);
-
-  if (!episode) {
-    return <Error message="No episode specified" />;
-  }
 
   return (
     <div className="animate-fade-in">
@@ -179,7 +173,7 @@ export default function Watch() {
         ← Back to anime
       </Link>
 
-      {/* Anime-themed player with ambient mode, skip buttons, custom controls */}
+      {/* Default Movi Player */}
       <MoviPlayer
         stream={stream}
         qualityIndex={activeQuality}
@@ -189,8 +183,6 @@ export default function Watch() {
         activeSubtitle={stream?.subtitles?.[subtitleIdx ?? -1] ?? null}
         onToggleSubtitle={handleToggleSubtitle}
         iframeSrc={iframeSrc}
-        nextEpisodeSlug={nextEpisodeSlug}
-        onNextEpisode={handleNextEpisode}
         onError={handlePlayerError}
         onAudioTracks={setAudioTracks}
         audioTrackIndex={audioTrackIdx}
@@ -243,12 +235,12 @@ export default function Watch() {
             ← Previous
           </Link>
         )}
-        <button
-          onClick={handleNextEpisode}
+        <Link
+          to={`/watch/${animeSlug}-${season}x${epNum + 1}`}
           className="px-4 py-2 bg-accent hover:bg-accent/80 rounded-lg text-sm ml-auto transition"
         >
           Next Episode →
-        </button>
+        </Link>
       </div>
     </div>
   );
