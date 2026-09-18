@@ -62,6 +62,10 @@ function isContentPage(html) {
   return /entry-title|server-btn|<iframe|overview-text/i.test(html);
 }
 
+const BAD_IMAGE = /cropped-|icon\.png|logo\.png|favicon|AnimeSalticon/i;
+// Landscape TMDB profiles = backdrops / episode stills, never posters
+const LANDSCAPE_TMDB = /image\.tmdb\.org\/t\/p\/w(?:780|1280|1920|original)\//i;
+
 // ---------------------------------------------------------------------------
 // Worker entry
 // ---------------------------------------------------------------------------
@@ -79,7 +83,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.17.0",
+          version: "3.18.0",
           endpoints: {
             system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings", "/api/debug/poster"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
@@ -113,7 +117,7 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.17.0-edge",
+          version: "3.18.0-edge",
           endpointsCount: 31
         });
       }
@@ -206,7 +210,7 @@ export default {
       }
 
       // ====================================================================
-      // DEBUG: verbatim poster markup (diagnose poster extraction)
+      // DEBUG: verbatim poster markup
       // ====================================================================
       if (path === "/api/debug/poster") {
         const id = params.get("id");
@@ -217,11 +221,12 @@ export default {
           try { html = await fetchPage(`/movies/${id}/`); } catch (e) {}
         }
         if (!html) return jsonResponse({ success: false, error: "not found" }, 404);
-        const imgs = [...html.matchAll(/<img[^>]*>/gi)].map(m => m[0]).slice(0, 12);
+        const titleIdx = html.search(/<h1/i);
+        const before = html.slice(0, titleIdx > -1 ? titleIdx : 20000);
+        const imgs = [...before.matchAll(/<img[^>]*>/gi)].map(m => m[0]).slice(-6);
         const metas = [...html.matchAll(/<meta[^>]*(?:og:image|twitter:image)[^>]*>/gi)].map(m => m[0]);
-        const posterDivs = [...html.matchAll(/<div[^>]*class="[^"]*(?:poster|thumb|featured)[^"]*"[^>]*>[\s\S]{0,300}/gi)].map(m => m[0]).slice(0, 4);
-        const bgImages = [...html.matchAll(/background-image:\s*url\([^)]*\)/gi)].map(m => m[0]).slice(0, 4);
-        return jsonResponse({ success: true, data: { imgs, metas, posterDivs, bgImages } });
+        const bgImages = [...before.matchAll(/background-image:\s*url\([^)]*\)/gi)].map(m => m[0]).slice(-4);
+        return jsonResponse({ success: true, data: { imgsBeforeTitle: imgs, metas, bgBeforeTitle: bgImages } });
       }
 
       if (path === "/api/latest-episodes") {
@@ -481,7 +486,8 @@ export default {
       }
 
       // ====================================================================
-      // Anime / movie details — 404-safe, movie-aware, v3.17.0 parsing
+      // Anime / movie details — v3.18.0: poster = last img before <h1>,
+      // year = runtime-adjacent year in visible text
       // ====================================================================
       if (path === "/api/info") {
         const animeId = params.get("id") || params.get("slug");
@@ -490,16 +496,14 @@ export default {
         let data = "";
         let type = "series";
 
-        // Try series page first
         try {
           const seriesHtml = await cachedJSON(`html:series:${animeId}`, () => fetchPage(`/series/${animeId}/`), CACHE_TTL_HOME);
           if (isContentPage(seriesHtml)) {
             data = seriesHtml;
             type = "series";
           }
-        } catch (e) { /* series missing, fall through to movies */ }
+        } catch (e) { /* fall through */ }
 
-        // Then movie page
         if (!data) {
           try {
             const movieHtml = await cachedJSON(`html:movies:${animeId}`, () => fetchPage(`/movies/${animeId}/`), CACHE_TTL_HOME);
@@ -519,40 +523,48 @@ export default {
                         || data.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
         const title = titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').trim() : "Unknown";
 
-        // Poster — TMDB first, then every lazy-load attribute, then CSS background
+        // ---------------- POSTER ----------------
+        // The poster card is the LAST image right above the <h1> title.
+        const titleIdx = data.search(/<h1/i);
+        const beforeTitle = data.slice(0, titleIdx > -1 ? titleIdx : 20000);
+
         let poster = "";
-        const tmdbMatch = data.match(/https:\/\/image\.tmdb\.org\/t\/p\/w\d+\/[^"'\s<>]+/);
-        if (tmdbMatch) {
-          poster = tmdbMatch[0];
-        } else {
-          const posterPatterns = [
-            // lazy-load attributes inside poster/thumb containers
-            /<div[^>]*class="[^"]*(?:poster|thumb|featured)[^"]*"[^>]*>[\s\S]{0,400}?<img[^>]*\b(?:data-lazy-src|data-original|data-src|data-cfsrc)="([^"]+)"/i,
-            /<img[^>]*class="[^"]*(?:wp-post-image|poster|lazyload|img-responsive)[^"]*"[^>]*\b(?:data-lazy-src|data-original|data-src|data-cfsrc)="([^"]+)"/i,
-            // CSS background-image on poster container
-            /class="[^"]*(?:poster|thumb|featured)[^"]*"[^>]*style="[^"]*background-image:\s*url\(['"]?([^'")]+)['"]?/i,
-            /style="[^"]*background-image:\s*url\(['"]?([^'")]+)['"]?[^"]*"[^>]*class="[^"]*(?:poster|thumb|featured)[^"]*"/i,
-            // plain src as last resort (skip data: placeholders)
-            /<div[^>]*class="[^"]*(?:poster|thumb|featured)[^"]*"[^>]*>[\s\S]{0,400}?<img[^>]*\bsrc="(?!data:)([^"]+)"/i,
-          ];
-          for (const pattern of posterPatterns) {
-            const m = data.match(pattern);
-            if (m) {
-              const url = m[1];
-              if (url.startsWith("data:")) continue;
-              if (/cropped-|icon\.png|logo\.png|favicon|AnimeSalticon/i.test(url)) continue;
-              poster = url;
-              break;
-            }
-          }
-          // og:image fallback (icon-filtered)
-          if (!poster) {
-            const ogMatch = data.match(/<meta[^>]*property="og:image"[^>]*content="([^"]+)"/i);
-            if (ogMatch && !/cropped-|icon\.png|logo\.png|favicon|AnimeSalticon/i.test(ogMatch[1]) && !ogMatch[1].startsWith("data:")) {
-              poster = ogMatch[1];
-            }
+        const imgsBefore = [...beforeTitle.matchAll(/<img[^>]*>/gi)];
+        for (let i = imgsBefore.length - 1; i >= 0 && !poster; i--) {
+          const tag = imgsBefore[i][0];
+          const srcM = tag.match(/\b(?:data-lazy-src|data-original|data-src|data-cfsrc|src)="([^"]+)"/i);
+          if (!srcM) continue;
+          const url = srcM[1];
+          if (url.startsWith("data:")) continue;          // lazy placeholder
+          if (BAD_IMAGE.test(url)) continue;              // site icon/logo
+          if (LANDSCAPE_TMDB.test(url)) continue;         // backdrop / episode still
+          poster = url;
+        }
+
+        // Fallback: last background-image before the title
+        if (!poster) {
+          const bgs = [...beforeTitle.matchAll(/background-image:\s*url\(['"]?([^'")]+)['"]?\)/gi)];
+          for (let i = bgs.length - 1; i >= 0 && !poster; i--) {
+            const url = bgs[i][1];
+            if (url.startsWith("data:") || BAD_IMAGE.test(url) || LANDSCAPE_TMDB.test(url)) continue;
+            poster = url;
           }
         }
+
+        // Fallback: og:image (filtered)
+        if (!poster) {
+          const ogMatch = data.match(/<meta[^>]*property="og:image"[^>]*content="([^"]+)"/i);
+          if (ogMatch && !ogMatch[1].startsWith("data:") && !BAD_IMAGE.test(ogMatch[1]) && !LANDSCAPE_TMDB.test(ogMatch[1])) {
+            poster = ogMatch[1];
+          }
+        }
+
+        // Last resort: first portrait-profile TMDB url anywhere
+        if (!poster) {
+          const t = data.match(/https:\/\/image\.tmdb\.org\/t\/p\/w(?:500|342|185|154)\/[^"'\s<>]+/);
+          if (t) poster = t[0];
+        }
+
         if (poster.startsWith("//")) poster = "https:" + poster;
 
         // Description
@@ -570,7 +582,7 @@ export default {
           if (g && !genres.includes(g)) genres.push(g); 
         }
 
-        // Languages (may be empty for movies if JS-rendered)
+        // Languages
         const languages = []; 
         const langRegex = /href="[^"]*\/category\/language\/[^"]*"[^>]*>([^<]+)<\/a>/gi;
         while ((match = langRegex.exec(data)) !== null) { 
@@ -578,9 +590,17 @@ export default {
           if (l && !languages.includes(l)) languages.push(l); 
         }
 
-        // Year — runtime-adjacent text first (theme prints "1h 37m" then "2015")
+        // ---------------- YEAR ----------------
+        // Visible text only (tags stripped) so SVG viewBox digits can't interfere.
+        const textOnly = data
+          .replace(/<script[\s\S]*?<\/script>/gi, " ")
+          .replace(/<style[\s\S]*?<\/style>/gi, " ")
+          .replace(/<[^>]+>/g, " ")
+          .replace(/&[a-z#0-9]+;/gi, " ");
+
         let year = null;
-        const runtimeYear = data.match(/(?:\d+\s*h(?:ours?)?(?:\s*\d+\s*m(?:in)?)?|\d+\s*m(?:in)?)[^0-9]{0,60}?\b((?:19|20)\d{2})\b/i);
+        // "24 min 2004" / "1h 37m 2015" — runtime chip followed by year chip
+        const runtimeYear = textOnly.match(/(?:\d+\s*h(?:rs?)?(?:\s*\d+\s*m(?:in)?)?|\d+\s*m(?:in)?)\s*((?:19|20)\d{2})\b/i);
         if (runtimeYear) {
           year = parseInt(runtimeYear[1]);
         }
@@ -597,23 +617,21 @@ export default {
             } catch (e) {}
           }
         }
-        // meta tags
+        // meta tag
         if (!year) {
-          const ym = data.match(/<meta[^>]*name="release[_-]?year"[^>]*content="(\d{4})"/i);
+          const ym = textOnly.match(/release\s*year\s*((?:19|20)\d{2})/i);
           if (ym) year = parseInt(ym[1]);
         }
-        // full-document scan, scripts/styles stripped, earliest year in 1950-2024 wins
+        // earliest plausible year in visible text
         if (!year) {
-          const clean = data.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "");
-          const years = [...clean.matchAll(/\b((?:19|20)\d{2})\b/g)]
+          const years = [...textOnly.matchAll(/\b((?:19|20)\d{2})\b/g)]
             .map(m => parseInt(m[1]))
             .filter(y => y >= 1950 && y <= 2024);
           if (years.length) year = Math.min(...years);
         }
 
-        // Status — for movies default to "Released", for series try patterns
+        // ---------------- STATUS ----------------
         let status = type === "movies" ? "Released" : "Unknown";
-        
         if (type === "series") {
           const statusPatterns = [
             /Status[^<]*<[^>]*>([^<]+)/i,
@@ -630,21 +648,18 @@ export default {
               }
             }
           }
-          // Keyword fallback
           if (status === "Unknown") {
-            if (/Ongoing|Airing|In\s+Production/i.test(data)) status = "Ongoing";
-            else if (/Completed|Finished|Ended/i.test(data)) status = "Completed";
+            if (/Ongoing|Airing|In\s+Production/i.test(textOnly)) status = "Ongoing";
+            else if (/Completed|Finished|Ended/i.test(textOnly)) status = "Completed";
           }
         }
 
-        // Episodes/seasons — for series, calculate totalEpisodes from season titles
+        // ---------------- SEASONS / EPISODE COUNT ----------------
         let seasons = [], totalEpisodes = 0;
         if (type === "series") {
           try { 
             const epData = await getEpisodesData(animeId, "all"); 
             seasons = epData.seasons; 
-            
-            // Calculate totalEpisodes from season titles (format: "Season X • Y-Z (N)")
             if (seasons.length > 0) {
               totalEpisodes = seasons.reduce((sum, s) => {
                 const countMatch = s.title.match(/\((\d+)\)/);
@@ -654,6 +669,11 @@ export default {
               totalEpisodes = epData.episodes.length;
             }
           } catch (e) {}
+          // Cross-check with visible "46 Episodes" chip
+          if (!totalEpisodes) {
+            const epChip = textOnly.match(/(\d+)\s*Episodes/i);
+            if (epChip) totalEpisodes = parseInt(epChip[1]);
+          }
         } else { 
           totalEpisodes = 1; 
         }
@@ -692,7 +712,6 @@ export default {
           failedSeasons = r.failedSeasons || [];
         } catch (e) { /* movie or broken series page */ }
 
-        // MOVIE FALLBACK: one synthetic "Full Movie" episode so the watch flow works
         if (!episodes.length) {
           let title = animeId.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase());
           try {
