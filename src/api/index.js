@@ -79,9 +79,9 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.16.0",
+          version: "3.17.0",
           endpoints: {
-            system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings"],
+            system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings", "/api/debug/poster"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
             charts: ["/api/popular", "/api/popular/films", "/api/popular/series"],
             browse: ["/api/series", "/api/movies", "/api/anime", "/api/cartoon", "/api/ongoing", "/api/completed"],
@@ -113,8 +113,8 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.16.0-edge",
-          endpointsCount: 30
+          version: "3.17.0-edge",
+          endpointsCount: 31
         });
       }
 
@@ -186,7 +186,7 @@ export default {
       }
 
       // ====================================================================
-      // DEBUG
+      // DEBUG: homepage headings
       // ====================================================================
       if (path === "/api/debug/home-headings") {
         const html = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
@@ -203,6 +203,25 @@ export default {
           if (text.length > 3 && text.length < 80) headings.push(text);
         }
         return jsonResponse({ success: true, data: [...new Set(headings)].slice(0, 50) });
+      }
+
+      // ====================================================================
+      // DEBUG: verbatim poster markup (diagnose poster extraction)
+      // ====================================================================
+      if (path === "/api/debug/poster") {
+        const id = params.get("id");
+        if (!id) return jsonResponse({ success: false, error: "id required" }, 400);
+        let html = "";
+        try { html = await fetchPage(`/series/${id}/`); } catch (e) {}
+        if (!isContentPage(html)) {
+          try { html = await fetchPage(`/movies/${id}/`); } catch (e) {}
+        }
+        if (!html) return jsonResponse({ success: false, error: "not found" }, 404);
+        const imgs = [...html.matchAll(/<img[^>]*>/gi)].map(m => m[0]).slice(0, 12);
+        const metas = [...html.matchAll(/<meta[^>]*(?:og:image|twitter:image)[^>]*>/gi)].map(m => m[0]);
+        const posterDivs = [...html.matchAll(/<div[^>]*class="[^"]*(?:poster|thumb|featured)[^"]*"[^>]*>[\s\S]{0,300}/gi)].map(m => m[0]).slice(0, 4);
+        const bgImages = [...html.matchAll(/background-image:\s*url\([^)]*\)/gi)].map(m => m[0]).slice(0, 4);
+        return jsonResponse({ success: true, data: { imgs, metas, posterDivs, bgImages } });
       }
 
       if (path === "/api/latest-episodes") {
@@ -462,7 +481,7 @@ export default {
       }
 
       // ====================================================================
-      // Anime / movie details — 404-safe, movie-aware, improved parsing v3.16.0
+      // Anime / movie details — 404-safe, movie-aware, v3.17.0 parsing
       // ====================================================================
       if (path === "/api/info") {
         const animeId = params.get("id") || params.get("slug");
@@ -500,49 +519,40 @@ export default {
                         || data.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
         const title = titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').trim() : "Unknown";
 
-        // Poster — prioritize TMDB URLs, filter out site icons/logos
+        // Poster — TMDB first, then every lazy-load attribute, then CSS background
         let poster = "";
-        
-        // 1. First pass: look for TMDB URLs (most reliable)
-        const tmdbMatch = data.match(/https:\/\/image\.tmdb\.org\/t\/p\/w\d+\/[^"'\s]+/);
+        const tmdbMatch = data.match(/https:\/\/image\.tmdb\.org\/t\/p\/w\d+\/[^"'\s<>]+/);
         if (tmdbMatch) {
           poster = tmdbMatch[0];
-        }
-        
-        // 2. Fallback: look for poster in specific containers, filter out site icons
-        if (!poster) {
+        } else {
           const posterPatterns = [
-            /<div[^>]*class="[^"]*(?:poster|thumb|featured)[^"]*"[^>]*>[\s\S]*?<img[^>]*(?:data-src|src)="([^"]+)"/i,
-            /<img[^>]*class="[^"]*(?:wp-post-image|poster|featured-image)[^"]*"[^>]*(?:data-src|src)="([^"]+)"/i,
+            // lazy-load attributes inside poster/thumb containers
+            /<div[^>]*class="[^"]*(?:poster|thumb|featured)[^"]*"[^>]*>[\s\S]{0,400}?<img[^>]*\b(?:data-lazy-src|data-original|data-src|data-cfsrc)="([^"]+)"/i,
+            /<img[^>]*class="[^"]*(?:wp-post-image|poster|lazyload|img-responsive)[^"]*"[^>]*\b(?:data-lazy-src|data-original|data-src|data-cfsrc)="([^"]+)"/i,
+            // CSS background-image on poster container
+            /class="[^"]*(?:poster|thumb|featured)[^"]*"[^>]*style="[^"]*background-image:\s*url\(['"]?([^'")]+)['"]?/i,
+            /style="[^"]*background-image:\s*url\(['"]?([^'")]+)['"]?[^"]*"[^>]*class="[^"]*(?:poster|thumb|featured)[^"]*"/i,
+            // plain src as last resort (skip data: placeholders)
+            /<div[^>]*class="[^"]*(?:poster|thumb|featured)[^"]*"[^>]*>[\s\S]{0,400}?<img[^>]*\bsrc="(?!data:)([^"]+)"/i,
           ];
           for (const pattern of posterPatterns) {
             const m = data.match(pattern);
             if (m) {
               const url = m[1];
-              // Skip data URIs, site icons, and logos
               if (url.startsWith("data:")) continue;
               if (/cropped-|icon\.png|logo\.png|favicon|AnimeSalticon/i.test(url)) continue;
-              // Accept if it's a TMDB URL or a unique content poster
-              if (url.includes("image.tmdb.org") || 
-                  (url.startsWith("http") && url.includes("/uploads/") && !url.includes("icon"))) {
-                poster = url;
-                break;
-              }
-            }
-          }
-        }
-        
-        // 3. Last resort: og:image (but skip if it's the site icon)
-        if (!poster) {
-          const ogMatch = data.match(/<meta[^>]*property="og:image"[^>]*content="([^"]+)"/i);
-          if (ogMatch) {
-            const url = ogMatch[1];
-            if (!/cropped-|icon\.png|logo\.png|favicon|AnimeSalticon/i.test(url)) {
               poster = url;
+              break;
+            }
+          }
+          // og:image fallback (icon-filtered)
+          if (!poster) {
+            const ogMatch = data.match(/<meta[^>]*property="og:image"[^>]*content="([^"]+)"/i);
+            if (ogMatch && !/cropped-|icon\.png|logo\.png|favicon|AnimeSalticon/i.test(ogMatch[1]) && !ogMatch[1].startsWith("data:")) {
+              poster = ogMatch[1];
             }
           }
         }
-        
         if (poster.startsWith("//")) poster = "https:" + poster;
 
         // Description
@@ -568,56 +578,37 @@ export default {
           if (l && !languages.includes(l)) languages.push(l); 
         }
 
-        // Year — prioritize schema.org JSON-LD, then strict content area search
+        // Year — runtime-adjacent text first (theme prints "1h 37m" then "2015")
         let year = null;
-        
-        // 1. Search schema.org JSON-LD (most reliable for structured data)
-        const jsonLdMatch = data.match(/<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/i);
-        if (jsonLdMatch) {
-          try {
-            const jsonLd = JSON.parse(jsonLdMatch[1]);
-            // Handle both single object and array
-            const items = Array.isArray(jsonLd) ? jsonLd : [jsonLd];
-            for (const item of items) {
-              const dateStr = item.datePublished || item.dateCreated || item.uploadDate;
-              if (dateStr) {
-                const y = parseInt(dateStr.slice(0, 4));
-                if (y >= 1950 && y <= 2024) {
-                  year = y;
-                  break;
-                }
-              }
-            }
-          } catch (e) {}
+        const runtimeYear = data.match(/(?:\d+\s*h(?:ours?)?(?:\s*\d+\s*m(?:in)?)?|\d+\s*m(?:in)?)[^0-9]{0,60}?\b((?:19|20)\d{2})\b/i);
+        if (runtimeYear) {
+          year = parseInt(runtimeYear[1]);
         }
-        
-        // 2. Check release year meta tags
+        // schema.org JSON-LD
         if (!year) {
-          const yearMetaMatch = data.match(/<meta[^>]*name="release[_-]?year"[^>]*content="(\d{4})"/i)
-                             || data.match(/<meta[^>]*itemprop="datePublished"[^>]*content="(\d{4})/i)
-                             || data.match(/<meta[^>]*property="video:release_date"[^>]*content="(\d{4})/i);
-          if (yearMetaMatch) {
-            const y = parseInt(yearMetaMatch[1]);
-            if (y >= 1950 && y <= 2024) year = y;
+          const jsonLdMatch = data.match(/<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/i);
+          if (jsonLdMatch) {
+            try {
+              const items = JSON.parse(jsonLdMatch[1]);
+              for (const item of (Array.isArray(items) ? items : [items])) {
+                const d = item.datePublished || item.dateCreated || item.uploadDate;
+                if (d) { const y = parseInt(d.slice(0, 4)); if (y >= 1950 && y <= 2026) { year = y; break; } }
+              }
+            } catch (e) {}
           }
         }
-        
-        // 3. Fallback: search ONLY the first 2000 chars of <main> content for years
+        // meta tags
         if (!year) {
-          const mainStart = data.indexOf('<main');
-          const mainEnd = data.indexOf('</main>');
-          const contentArea = mainStart > -1 && mainEnd > mainStart 
-            ? data.slice(mainStart, Math.min(mainEnd, mainStart + 2000)) 
-            : data.slice(0, 2000);
-          
-          // Match years 1950-2024 only (2025+ are likely CDN dates)
-          const yearMatches = [...contentArea.matchAll(/\b((?:19|20)\d{2})\b/g)]
+          const ym = data.match(/<meta[^>]*name="release[_-]?year"[^>]*content="(\d{4})"/i);
+          if (ym) year = parseInt(ym[1]);
+        }
+        // full-document scan, scripts/styles stripped, earliest year in 1950-2024 wins
+        if (!year) {
+          const clean = data.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "");
+          const years = [...clean.matchAll(/\b((?:19|20)\d{2})\b/g)]
             .map(m => parseInt(m[1]))
             .filter(y => y >= 1950 && y <= 2024);
-          
-          if (yearMatches.length > 0) {
-            year = Math.min(...yearMatches); // earliest year = release year
-          }
+          if (years.length) year = Math.min(...years);
         }
 
         // Status — for movies default to "Released", for series try patterns
@@ -639,7 +630,6 @@ export default {
               }
             }
           }
-          
           // Keyword fallback
           if (status === "Unknown") {
             if (/Ongoing|Airing|In\s+Production/i.test(data)) status = "Ongoing";
