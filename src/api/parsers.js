@@ -66,9 +66,8 @@ export function parseEpisodesFromHtml(html, seasonNum) {
 
 /**
  * Extract the embed iframe URL for a given server index from an episode page.
- * Handles nested wrapper divs by using a lookahead that stops at the NEXT
- * options container or a known section boundary, rather than the first </div>.
- * Falls back to picking the Nth iframe in document order.
+ * Handles nested wrapper divs via lookahead boundaries, then falls back to
+ * the Nth iframe in document order.
  */
 export function extractEmbedForIndex(html, index) {
   // Strategy 1: capture the options-N container with tolerant boundary detection
@@ -90,4 +89,20 @@ export function extractEmbedForIndex(html, index) {
     i++;
   }
   return "";
+}
+
+/**
+ * Extract a taxonomy list (genres / languages / countries / etc.)
+ * from any page's navigation links: /category/<tax>/<slug>/
+ */
+export function extractTaxonomy(html, tax) {
+  const results = [];
+  const regex = new RegExp(`href="[^"]*\\/category\\/${tax}\\/([^\\/"]+)\\/?"[^>]*>([^<]+)<`, "gi");
+  let m;
+  while ((m = regex.exec(html)) !== null) {
+    const slug = m[1];
+    const name = m[2].trim();
+    if (slug && name && !results.find(r => r.slug === slug)) results.push({ slug, name });
+  }
+  return results;
 }
