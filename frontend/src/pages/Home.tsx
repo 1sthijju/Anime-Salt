@@ -12,23 +12,18 @@ export default function Home() {
   const load = useCallback(() => {
     setError(null);
     setData(null);
-    api
-      .home()
+    api.home()
       .then(setData)
       .catch((e) => setError((e as Error).message));
   }, []);
 
-  useEffect(() => {
-    load();
-  }, [load]);
+  useEffect(() => { load(); }, [load]);
 
   if (error) {
     return (
       <div className="container-x py-32 text-center">
         <p className="text-sm text-red-400">Failed to load home feed: {error}</p>
-        <button className="btn-ghost mt-4" onClick={load}>
-          Retry
-        </button>
+        <button className="btn-ghost mt-4" onClick={load}>Retry</button>
       </div>
     );
   }
@@ -36,12 +31,9 @@ export default function Home() {
   return (
     <div className="pb-12">
       <Hero item={data?.mostWatchedSeries?.[0] ?? null} loading={!data} />
-
       {!data ? (
         <>
-          <RailSkeleton />
-          <RailSkeleton />
-          <RailSkeleton />
+          <RailSkeleton /><RailSkeleton /><RailSkeleton />
         </>
       ) : (
         <>
