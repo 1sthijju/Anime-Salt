@@ -60,7 +60,7 @@ export default {
           name: "AnimeSalt Edge API",
           version: "3.10.0",
           endpoints: {
-            system: ["/api/health", "/api/ajax", "/proxy/media"],
+            system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
             charts: ["/api/popular", "/api/popular/films", "/api/popular/series"],
             browse: ["/api/series", "/api/movies", "/api/anime", "/api/cartoon", "/api/ongoing", "/api/completed"],
@@ -134,7 +134,6 @@ export default {
         const latest = latestEpisodes.length ? latestEpisodes : extractAnimeList(homeData).slice(0, 20);
         const popular = [...mostWatchedSeries, ...mostWatchedFilms];
 
-        // Fallbacks (only fetched when the homepage section is missing/empty)
         const [ongoingFallback, completed, moviesFallback] = await Promise.all([
           onAirSeries.length
             ? Promise.resolve([])
@@ -159,7 +158,6 @@ export default {
         return jsonResponse({
           success: true,
           data: {
-            // Homepage sections (1:1 with animesalt.cx)
             latest,
             mostWatchedSeries,
             mostWatchedFilms,
@@ -169,7 +167,6 @@ export default {
             cartoonSeries,
             animeMovies: animeMovies.length ? animeMovies : moviesFallback,
             cartoonFilms,
-            // Legacy keys (frontend backwards-compat)
             popular,
             popularSeries: mostWatchedSeries.slice(0, 12),
             popularFilms: mostWatchedFilms.slice(0, 12),
@@ -180,13 +177,42 @@ export default {
         });
       }
 
+      // ====================================================================
+      // DEBUG: Discover homepage section headings
+      // ====================================================================
+      if (path === "/api/debug/home-headings") {
+        const html = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
+        const headings = [];
+        
+        // Extract all headings from various tag types
+        const regex = /<(h[1-6]|div|span)[^>]*class="[^"]*(?:title|heading|section|widget)[^"]*"[^>]*>([^<]+)<\/\1>/gi;
+        let match;
+        while ((match = regex.exec(html)) !== null) {
+          const text = (match[2] || '').trim();
+          if (text.length > 3 && text.length < 80) headings.push(text);
+        }
+        
+        // Also extract from plain h1-h6 tags
+        const plainRegex = /<h[1-6][^>]*>([^<]+)<\/h[1-6]>/gi;
+        while ((match = plainRegex.exec(html)) !== null) {
+          const text = (match[1] || '').trim();
+          if (text.length > 3 && text.length < 80) headings.push(text);
+        }
+        
+        return jsonResponse({ 
+          success: true, 
+          data: [...new Set(headings)].slice(0, 50),
+          note: "These are the actual heading texts found on the homepage. Update HOME_SECTION_TITLES in parsers.js to match these."
+        });
+      }
+
       if (path === "/api/latest-episodes") {
         const data = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
         return jsonResponse({ success: true, data: extractAnimeList(data).slice(0, 20) });
       }
 
       // ====================================================================
-      // Fresh Drops (homepage section first, then category fallbacks)
+      // Fresh Drops
       // ====================================================================
       if (path === "/api/fresh-drops") {
         const homeData = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
