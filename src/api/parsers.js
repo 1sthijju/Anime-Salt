@@ -87,11 +87,10 @@ export function extractPopularItems(html, targetType) {
 }
 
 // ---------------------------------------------------------------------------
-// Episode grid (WordPress AJAX fragment OR initial series-page HTML)
+// Episode grid (WordPress AJAX fragment returned by admin-ajax)
 //
-// - Title: multi-pattern extraction with cleanup; falls back to "Episode N"
-// - Thumbnail: inside the <a> first, then nearest <img> in an 800-char
-//   window BEFORE the link (sibling card layout used by animesalt).
+// - Thumbnail detection: inside the <a> first, then nearest <img> in an
+//   800-char window BEFORE the link (sibling card layout used by animesalt).
 // - Lazy-load aware: data-src, data-lazy-src, data-original, srcset,
 //   and CSS background-image.
 // - regionalDub flag: flips to false once the divider
@@ -149,28 +148,34 @@ export function parseEpisodesFromHtml(html, seasonNum) {
     const epNum = sxe ? parseInt(sxe[2], 10) : 0;
     if (epNum === 0) continue;
 
-    // ---------------- Enhanced title extraction ----------------
+    // Enhanced title extraction with multiple fallback patterns
     const linkHtml = match[2];
     let title = "";
+    
     const titlePatterns = [
       /class="[^"]*(?:entry-title|title|ep-title)[^"]*"[^>]*>([^<]+)/i,
       /<span[^>]*class="[^"]*title[^"]*"[^>]*>([^<]+)<\/span>/i,
       /<div[^>]*class="[^"]*title[^"]*"[^>]*>([^<]+)<\/div>/i,
-      />([^<]+)</i,
+      />([^<]+)<\/a>/i,  // fallback: any text before </a>
     ];
+    
     for (const pattern of titlePatterns) {
-      const tm = linkHtml.match(pattern);
-      if (tm && tm[1]) {
-        let t = tm[1].trim();
-        t = t.replace(/^\d+[\.\)]\s*/, "");        // "1. " / "1) "
-        t = t.replace(/\s*View\s*$/i, "");          // trailing "View"
-        t = t.replace(/^Episode\s+\d+\s*[:\-]?\s*/i, ""); // "Episode 5: "
-        if (t.length > 2) { title = t; break; }
+      const titleMatch = linkHtml.match(pattern);
+      if (titleMatch) {
+        title = titleMatch[1].trim();
+        // Clean up common patterns
+        title = title.replace(/^\d+[\.\)]\s*/, "");  // Remove "1. " or "1) "
+        title = title.replace(/\s*View\s*$/i, "");
+        title = title.replace(/Episode\s+\d+/i, "");
+        if (title.length > 2) break;
       }
     }
-    if (!title || title.length < 3) title = `Episode ${epNum}`;
+    
+    if (!title || title.length < 3) {
+      title = `Episode ${epNum}`;
+    }
 
-    // ---------------- Thumbnail: inside anchor → 800-char back window -------
+    // thumbnail: inside anchor → else nearest img in 800 chars before it
     let image = grabUrl(linkHtml);
     if (!image) {
       const windowStart = Math.max(0, match.index - 800);
@@ -219,13 +224,8 @@ export function extractEmbedForIndex(html, index) {
 
 // ---------------------------------------------------------------------------
 // Taxonomy link lists (genre / language / country / quality / season / ...)
-//
-// STRICT: only matches real <a> tags and captures inner text directly.
-// Guards against false positives:
-//  - rejects huge captures (script/style swallowed)
-//  - rejects navigation labels ("All", "View All", "Browse", ...)
-//  - requires the visible name to correlate with the URL slug
-//    (so href=/genre/action/ with text "All" is skipped, "Action" kept)
+// STRICT: only matches real <a> tags. Simplified filtering to avoid false
+// positives from <head> script/style blocks while allowing all valid genres.
 // ---------------------------------------------------------------------------
 export function extractTaxonomy(html, tax) {
   const results = [];
@@ -233,35 +233,23 @@ export function extractTaxonomy(html, tax) {
     `<a[^>]+href="([^"]*\\/${tax}\\/([^\\/"]+)\\/?)["'][^>]*>([\\s\\S]*?)</a>`,
     "gi"
   );
-  const blacklist = [
-    "all", "view all", "see all", "show all", "more", "browse",
-    "categories", "genres", "view", "see", "filter", "home",
-  ];
-
+  
   let m;
   while ((m = regex.exec(html)) !== null) {
     const fullUrl = m[1];
     const slug = m[2];
-
-    // Strip inner tags (<span>, <img>) and trim
     let name = m[3].replace(/<[^>]+>/g, "").trim();
-    if (!name) name = slug.replace(/-/g, " ").replace(/\b\w/g, l => l.toUpperCase());
-
-    // Safety: huge captured text = false positive (script/style capture)
-    if (name.length > 50) continue;
-    // Too short = likely an icon/arrow
-    if (name.length < 3) continue;
-
-    // Navigation labels
+    
+    // Skip if empty or too long (script/style capture)
+    if (!name || name.length > 50) continue;
+    
+    // Skip common navigation words
     const nameLower = name.toLowerCase();
-    if (blacklist.some(w => nameLower === w || nameLower.startsWith(w + " "))) continue;
-
-    // Slug-name correlation: at least one significant slug word must appear
-    // in the visible name (slug "action" + text "All" → skipped)
-    const significantSlugWords = slug.split("-").filter(w => w.length > 2);
-    if (significantSlugWords.length > 0) {
-      const hasMatch = significantSlugWords.some(w => nameLower.includes(w));
-      if (!hasMatch) continue;
+    if (nameLower === 'all' || nameLower === 'view all' || nameLower === 'see all') continue;
+    
+    // Use slug as fallback if name is too short
+    if (name.length < 2) {
+      name = slug.replace(/-/g, " ").replace(/\b\w/g, l => l.toUpperCase());
     }
 
     if (slug && name && !results.find(r => r.slug === slug)) {
