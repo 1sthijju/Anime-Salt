@@ -64,7 +64,7 @@ const LANDSCAPE_TMDB = /image\.tmdb\.org\/t\/p\/w(?:780|1280|1920|original)\//i;
 const PORTRAIT_TMDB = /image\.tmdb\.org\/t\/p\/w(?:500|342|185|154)\//i;
 const SITE_ASSET = /animesalt\.cx\/wp-content\/uploads|AnimeSalt|cropped-|icon\.png|logo\.png|favicon/i;
 const TMDB_HOST = "https://image.tmdb.org";
-const CACHE_TTL_STATUS = 21600; // 6h in SECONDS (Cache API max-age)
+const CACHE_TTL_STATUS = 21600; // 6h in SECONDS
 
 // ---------------------------------------------------------------------------
 // Worker entry
@@ -83,9 +83,9 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.30.0",
+          version: "3.31.0",
           endpoints: {
-            system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings", "/api/debug/poster"],
+            system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings", "/api/debug/poster", "/api/debug/home-timing"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
             charts: ["/api/popular", "/api/popular/films", "/api/popular/series"],
             browse: ["/api/series", "/api/movies", "/api/anime", "/api/cartoon", "/api/ongoing", "/api/completed"],
@@ -117,7 +117,7 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.30.0-edge",
+          version: "3.31.0-edge",
           endpointsCount: 31
         });
       }
@@ -135,11 +135,11 @@ export default {
       }
 
       // ====================================================================
-      // HOME — 1 cached html fetch + 4 cached list fetches (flat caches)
+      // HOME — cache the FINAL parsed payload (heavy work runs once per TTL)
       // ====================================================================
       if (path === "/api/home") {
-        try {
-          const raw = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
+        const payload = await cachedJSON("home:payload:v5", async () => {
+          const raw = await fetchPage("/");
           const homeData = raw
             .replace(/<script[\s\S]*?<\/script>/gi, " ")
             .replace(/<style[\s\S]*?<\/style>/gi, " ");
@@ -149,41 +149,38 @@ export default {
           const mostWatchedFilms = secs["Most-Watched Films"] || [];
 
           const [ongoing, completed, movies, freshDrops] = await Promise.all([
-            cachedJSON("list:ongoing:v4", async () => {
+            (async () => {
               try { return extractAnimeList(await fetchPage("/category/status/ongoing/")).slice(0, 18); } catch (e) { return []; }
-            }, CACHE_TTL),
-            cachedJSON("list:completed:v4", async () => {
+            })(),
+            (async () => {
               try { return extractAnimeList(await fetchPage("/category/status/completed/")).slice(0, 18); } catch (e) { return []; }
-            }, CACHE_TTL),
-            cachedJSON("list:movies:v4", async () => {
+            })(),
+            (async () => {
               for (const p of ["/movies/", "/category/type/movies/"]) {
                 try { const items = extractAnimeList(await fetchPage(p)); if (items.length) return items.slice(0, 18); } catch (e) { /* next */ }
               }
               return [];
-            }, CACHE_TTL),
-            cachedJSON("list:fresh:v4", async () => {
+            })(),
+            (async () => {
               for (const base of ["/new/", "/recent/", "/latest/"]) {
                 try { const items = extractAnimeList(await fetchPage(base)); if (items.length) return items.slice(0, 18); } catch (e) { /* next */ }
               }
               return [];
-            }, CACHE_TTL),
+            })(),
           ]);
 
           const latestEpisodes = extractAnimeList(homeData).slice(0, 20);
 
-          return jsonResponse({
-            success: true,
-            data: {
-              mostWatchedSeries, mostWatchedFilms, latest: latestEpisodes,
-              ongoing, completed, movies, freshDrops,
-              popular: [...mostWatchedSeries.slice(0, 12), ...mostWatchedFilms.slice(0, 12)],
-              popularSeries: mostWatchedSeries.slice(0, 12),
-              popularFilms: mostWatchedFilms.slice(0, 12),
-            },
-          });
-        } catch (e) {
-          return jsonResponse({ success: false, error: e.message }, 502);
-        }
+          return {
+            mostWatchedSeries, mostWatchedFilms, latest: latestEpisodes,
+            ongoing, completed, movies, freshDrops,
+            popular: [...mostWatchedSeries.slice(0, 12), ...mostWatchedFilms.slice(0, 12)],
+            popularSeries: mostWatchedSeries.slice(0, 12),
+            popularFilms: mostWatchedFilms.slice(0, 12),
+          };
+        }, CACHE_TTL);
+
+        return jsonResponse({ success: true, data: payload });
       }
 
       // ====================================================================
@@ -245,6 +242,32 @@ export default {
             backdropHints,
             dataAttributes: dataAttrs,
             cdnReferences: cdnRefs
+          },
+        });
+      }
+
+      // ====================================================================
+      // DEBUG: home payload timing
+      // ====================================================================
+      if (path === "/api/debug/home-timing") {
+        const t0 = Date.now();
+        const raw = await fetchPage("/");
+        const t1 = Date.now();
+        const homeData = raw
+          .replace(/<script[\s\S]*?<\/script>/gi, " ")
+          .replace(/<style[\s\S]*?<\/style>/gi, " ");
+        const t2 = Date.now();
+        const secs = extractHomeSections(homeData);
+        const t3 = Date.now();
+        return jsonResponse({
+          success: true,
+          data: {
+            fetchMs: t1 - t0,
+            stripMs: t2 - t1,
+            sectionsMs: t3 - t2,
+            totalMs: t3 - t0,
+            rawBytes: raw.length,
+            sections: Object.keys(secs),
           },
         });
       }
