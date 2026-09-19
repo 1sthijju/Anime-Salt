@@ -24,12 +24,10 @@ export function extractAnimeList(html) {
     if (seen.has(id)) continue; 
     seen.add(id);
     
-    // STRICT DIRECTION: Look AFTER the link for the title (up to 1500 chars)
     const afterText = html.substring(match.index, Math.min(html.length, match.index + 1500));
     const hMatchAfter = afterText.match(/<(?:h[1-4]|span|div|p)[^>]*class="[^"]*(?:title|entry-title|card-title)[^"]*"[^>]*>([^<]+)<\//i) ||
                         afterText.match(/<(?:h[1-4])[^>]*>\s*([^<]+)\s*<\//i);
     
-    // Look BEFORE the link (up to 500 chars back) if not found after
     const beforeText = html.substring(Math.max(0, match.index - 500), match.index);
     const hMatchBefore = beforeText.match(/<(?:h[1-4]|span|div|p)[^>]*class="[^"]*(?:title|entry-title|card-title)[^"]*"[^>]*>([^<]+)<\//i) ||
                          beforeText.match(/<(?:h[1-4])[^>]*>\s*([^<]+)\s*<\//i);
@@ -38,13 +36,15 @@ export function extractAnimeList(html) {
     if (hMatchAfter) title = hMatchAfter[1].trim();
     else if (hMatchBefore) title = hMatchBefore[1].trim();
     else {
-        // Fallback to alt/title attributes inside or immediately around the link
         const windowText = html.substring(Math.max(0, match.index - 200), match.index + match[0].length);
         const altMatch = windowText.match(/(?:alt|title)="([^"]+)"/i);
-        if (altMatch) title = altMatch[1].trim();
+        if (altMatch) {
+            title = altMatch[1].trim();
+            // Strip "Image " prefix often added by lazyload plugins
+            if (title.startsWith("Image ")) title = title.substring(6);
+        }
     }
     
-    // Image extraction: look in a 1000-char window around the link
     const imgWindow = html.substring(Math.max(0, match.index - 1000), Math.min(html.length, match.index + 1000));
     let image = "";
     const imgMatch = imgWindow.match(/<img[^>]+>/i);
@@ -103,18 +103,19 @@ export function extractHomeSections(html) {
   return sections;
 }
 
+// EXTRACTS ALL POTENTIAL NONCES TO BRUTE-FORCE WP AJAX
 export function extractPostData(html) {
   const postMatch = html.match(/postid-(\d+)/i) || 
                     html.match(/post-(\d+)/i) || 
                     html.match(/data-(?:post|id)="(\d+)"/i) ||
                     html.match(/"id":(\d+)/i);
-                    
-  const nonceMatch = html.match(/["']nonce["']\s*:\s*["']([a-z0-9]+)["']/i) || 
-                     html.match(/nonce\s*=\s*["']([a-z0-9]+)["']/i) ||
-                     html.match(/_wpnonce["'][^"']*["']([a-z0-9]+)/i) ||
-                     html.match(/security["']\s*:\s*["']([a-z0-9]+)["']/i);
-                     
-  return { postId: postMatch ? postMatch[1] : null, nonce: nonceMatch ? nonceMatch[1] : null };
+  const postId = postMatch ? postMatch[1] : null;
+  
+  const allNonces = [...html.matchAll(/["'](?:nonce|_wpnonce|security|ajax_nonce|select_nonce)["']\s*[:=]\s*["']([a-zA-Z0-9]{8,20})["']/gi)]
+                      .map(m => m[1])
+                      .filter((v, i, a) => a.indexOf(v) === i); // deduplicate
+                      
+  return { postId, nonces: allNonces };
 }
 
 export function extractPoster(html) {
