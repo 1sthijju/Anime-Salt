@@ -64,7 +64,7 @@ const LANDSCAPE_TMDB = /image\.tmdb\.org\/t\/p\/w(?:780|1280|1920|original)\//i;
 const PORTRAIT_TMDB = /image\.tmdb\.org\/t\/p\/w(?:500|342|185|154)\//i;
 const SITE_ASSET = /animesalt\.cx\/wp-content\/uploads|AnimeSalt|cropped-|icon\.png|logo\.png|favicon/i;
 const TMDB_HOST = "https://image.tmdb.org";
-const CACHE_TTL_STATUS = 6 * 60 * 60 * 1000; // 6h for status membership pages
+const CACHE_TTL_STATUS = 6 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Worker entry
@@ -83,7 +83,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.27.0",
+          version: "3.28.0",
           endpoints: {
             system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings", "/api/debug/poster"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
@@ -117,7 +117,7 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.27.0-edge",
+          version: "3.28.0-edge",
           endpointsCount: 31
         });
       }
@@ -135,50 +135,52 @@ export default {
       }
 
       // ====================================================================
-      // HOME
+      // HOME — parsed payload cached (heavy work runs once per TTL)
       // ====================================================================
       if (path === "/api/home") {
-        const homeData = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
-        const secs = extractHomeSections(homeData);
-        const mostWatchedSeries = secs["Most-Watched Series"] || [];
-        const mostWatchedFilms = secs["Most-Watched Films"] || [];
+        const payload = await cachedJSON("home:payload:v4", async () => {
+          const raw = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
+          // Strip scripts/styles FIRST: cuts parse size by 60-80%
+          const homeData = raw
+            .replace(/<script[\s\S]*?<\/script>/gi, " ")
+            .replace(/<style[\s\S]*?<\/style>/gi, " ");
 
-        const [latestEpisodes, ongoing, completed, movies, freshDrops] = await Promise.all([
-          Promise.resolve(extractAnimeList(homeData).slice(0, 20)),
-          cachedJSON("html:/category/status/ongoing/", () => fetchPage("/category/status/ongoing/"), CACHE_TTL_HOME)
-            .then(h => extractAnimeList(h).slice(0, 18)).catch(() => []),
-          cachedJSON("html:/category/status/completed/", () => fetchPage("/category/status/completed/"), CACHE_TTL_HOME)
-            .then(h => extractAnimeList(h).slice(0, 18)).catch(() => []),
-          (async () => {
-            for (const p of ["/movies/", "/category/type/movies/"]) {
-              try {
-                const h = await fetchPage(p);
-                const items = extractAnimeList(h);
-                if (items.length) return items.slice(0, 18);
-              } catch (e) { /* next */ }
-            }
-            return [];
-          })(),
-          (async () => {
-            for (const base of ["/new/", "/recent/", "/latest/"]) {
-              try {
-                const h = await fetchPage(base);
-                const items = extractAnimeList(h);
-                if (items.length) return items.slice(0, 18);
-              } catch (e) { /* next */ }
-            }
-            return [];
-          })(),
-        ]);
+          const secs = extractHomeSections(homeData);
+          const mostWatchedSeries = secs["Most-Watched Series"] || [];
+          const mostWatchedFilms = secs["Most-Watched Films"] || [];
 
-        return jsonResponse({
-          success: true,
-          data: {
-            mostWatchedSeries, mostWatchedFilms, latest: latestEpisodes, ongoing, completed, movies, freshDrops,
+          const [ongoing, completed, movies, freshDrops] = await Promise.all([
+            cachedJSON("list:ongoing:v2", async () => {
+              try { return extractAnimeList(await fetchPage("/category/status/ongoing/")).slice(0, 18); } catch (e) { return []; }
+            }, CACHE_TTL_HOME),
+            cachedJSON("list:completed:v2", async () => {
+              try { return extractAnimeList(await fetchPage("/category/status/completed/")).slice(0, 18); } catch (e) { return []; }
+            }, CACHE_TTL_HOME),
+            cachedJSON("list:movies:v2", async () => {
+              for (const p of ["/movies/", "/category/type/movies/"]) {
+                try { const items = extractAnimeList(await fetchPage(p)); if (items.length) return items.slice(0, 18); } catch (e) { /* next */ }
+              }
+              return [];
+            }, CACHE_TTL_HOME),
+            cachedJSON("list:fresh:v2", async () => {
+              for (const base of ["/new/", "/recent/", "/latest/"]) {
+                try { const items = extractAnimeList(await fetchPage(base)); if (items.length) return items.slice(0, 18); } catch (e) { /* next */ }
+              }
+              return [];
+            }, CACHE_TTL_HOME),
+          ]);
+
+          const latestEpisodes = extractAnimeList(homeData).slice(0, 20);
+          return {
+            mostWatchedSeries, mostWatchedFilms, latest: latestEpisodes,
+            ongoing, completed, movies, freshDrops,
             popular: [...mostWatchedSeries.slice(0, 12), ...mostWatchedFilms.slice(0, 12)],
-            popularSeries: mostWatchedSeries.slice(0, 12), popularFilms: mostWatchedFilms.slice(0, 12),
-          },
-        });
+            popularSeries: mostWatchedSeries.slice(0, 12),
+            popularFilms: mostWatchedFilms.slice(0, 12),
+          };
+        }, CACHE_TTL_HOME);
+
+        return jsonResponse({ success: true, data: payload });
       }
 
       // ====================================================================
@@ -244,9 +246,15 @@ export default {
         });
       }
 
+      // ====================================================================
+      // Latest episodes — cached parse
+      // ====================================================================
       if (path === "/api/latest-episodes") {
-        const data = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
-        return jsonResponse({ success: true, data: extractAnimeList(data).slice(0, 20) });
+        const items = await cachedJSON("list:latest:v2", async () => {
+          const raw = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
+          return extractAnimeList(raw.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ")).slice(0, 20);
+        }, CACHE_TTL_HOME);
+        return jsonResponse({ success: true, data: items });
       }
 
       // ====================================================================
@@ -270,47 +278,38 @@ export default {
       }
 
       // ====================================================================
-      // Popular charts
+      // Popular charts — shared cached parse
       // ====================================================================
-      if (path === "/api/popular") {
-        const type = params.get("type");
-        const data = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
-        let results = extractPopularItems(data, type);
-        if (results.length === 0) {
-          results = extractAnimeList(data).slice(0, 25).map((r, i) => ({ rank: i + 1, ...r }));
+      if (path === "/api/popular" || path === "/api/popular/films" || path === "/api/popular/series") {
+        const charts = await cachedJSON("charts:payload:v2", async () => {
+          const raw = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
+          const slim = raw.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ");
+          const secs = extractHomeSections(slim);
+          return {
+            series: secs["Most-Watched Series"] || [],
+            films: secs["Most-Watched Films"] || [],
+            all: extractAnimeList(slim).slice(0, 25),
+          };
+        }, CACHE_TTL_HOME);
+
+        if (path === "/api/popular/films") {
+          let results = charts.films;
+          if (!results.length) results = charts.all.filter(i => i.url && i.url.includes("/movies/")).map((r, i) => ({ rank: i + 1, ...r, type: "movie" }));
+          return jsonResponse({ success: true, data: results });
         }
-        results = results.map(item => ({
+        if (path === "/api/popular/series") {
+          let results = charts.series;
+          if (!results.length) results = charts.all.filter(i => i.type === "series").map((r, i) => ({ rank: i + 1, ...r }));
+          return jsonResponse({ success: true, data: results });
+        }
+        const type = params.get("type");
+        let results = type === "movie" ? charts.films : type === "series" ? charts.series : [...charts.series, ...charts.films];
+        if (!results.length) results = charts.all;
+        results = results.map((item, i) => ({
+          rank: item.rank ?? i + 1,
           ...item,
           type: item.url && item.url.includes("/movies/") ? "movie" : (item.type || "series"),
         }));
-        return jsonResponse({ success: true, data: results });
-      }
-
-      if (path === "/api/popular/films") {
-        const homeData = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
-        const secs = extractHomeSections(homeData);
-        let results = secs["Most-Watched Films"] || [];
-        if (!results.length) results = extractPopularItems(homeData, "movie");
-        if (!results.length) {
-          results = extractAnimeList(homeData)
-            .filter(item => item.url && item.url.includes("/movies/"))
-            .slice(0, 20)
-            .map((r, i) => ({ rank: i + 1, ...r, type: "movie" }));
-        }
-        return jsonResponse({ success: true, data: results });
-      }
-
-      if (path === "/api/popular/series") {
-        const homeData = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
-        const secs = extractHomeSections(homeData);
-        let results = secs["Most-Watched Series"] || [];
-        if (!results.length) results = extractPopularItems(homeData, "series");
-        if (!results.length) {
-          results = extractAnimeList(homeData)
-            .filter(item => item.type === "series")
-            .slice(0, 20)
-            .map((r, i) => ({ rank: i + 1, ...r }));
-        }
         return jsonResponse({ success: true, data: results });
       }
 
@@ -481,7 +480,7 @@ export default {
       }
 
       // ====================================================================
-      // Anime / movie details — v3.27.0 (Structure-Corrected Build)
+      // Anime / movie details — v3.28.0 (Structure-Corrected Build)
       // ====================================================================
       if (path === "/api/info") {
         const animeId = params.get("id") || params.get("slug");
