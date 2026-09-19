@@ -41,6 +41,8 @@ async function categoryPage(path, tax, params, altPrefixes = []) {
   return jsonResponse({ success: true, page, term, data: [] });
 }
 
+// Movies embed their player on /movies/<slug>/, series on /series/<slug>/,
+// episodes on /episode/<slug>/. Try all three for playback markup.
 async function getPlaybackHtml(slug) {
   const candidates = [`/episode/${slug}/`, `/movies/${slug}/`, `/series/${slug}/`];
   for (const p of candidates) {
@@ -52,6 +54,7 @@ async function getPlaybackHtml(slug) {
   return "";
 }
 
+// Reject 404/error pages; require at least one real-content marker
 function isContentPage(html) {
   if (!html) return false;
   if (/<title>[^<]*404/i.test(html)) return false;
@@ -64,7 +67,7 @@ const LANDSCAPE_TMDB = /image\.tmdb\.org\/t\/p\/w(?:780|1280|1920|original)\//i;
 const PORTRAIT_TMDB = /image\.tmdb\.org\/t\/p\/w(?:500|342|185|154)\//i;
 const SITE_ASSET = /animesalt\.cx\/wp-content\/uploads|AnimeSalt|cropped-|icon\.png|logo\.png|favicon/i;
 const TMDB_HOST = "https://image.tmdb.org";
-const CACHE_TTL_STATUS = 21600; // 6h in SECONDS
+const CACHE_TTL_STATUS = 21600; // 6h in SECONDS (Cache API max-age)
 
 // ---------------------------------------------------------------------------
 // Worker entry
@@ -83,7 +86,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.31.0",
+          version: "3.32.0",
           endpoints: {
             system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings", "/api/debug/poster", "/api/debug/home-timing"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
@@ -117,7 +120,7 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.31.0-edge",
+          version: "3.32.0-edge",
           endpointsCount: 31
         });
       }
@@ -247,7 +250,7 @@ export default {
       }
 
       // ====================================================================
-      // DEBUG: home payload timing
+      // DEBUG: home payload timing (CPU profiling)
       // ====================================================================
       if (path === "/api/debug/home-timing") {
         const t0 = Date.now();
@@ -272,6 +275,9 @@ export default {
         });
       }
 
+      // ====================================================================
+      // Latest episodes
+      // ====================================================================
       if (path === "/api/latest-episodes") {
         const items = await cachedJSON("list:latest:v2", async () => {
           const raw = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
@@ -301,7 +307,7 @@ export default {
       }
 
       // ====================================================================
-      // Popular charts
+      // Popular charts (shared cached parse)
       // ====================================================================
       if (path === "/api/popular" || path === "/api/popular/films" || path === "/api/popular/series") {
         const charts = await cachedJSON("charts:payload:v2", async () => {
@@ -609,21 +615,21 @@ export default {
                        || data.match(/<meta[^>]*name="description"[^>]*content="([^"]+)"/i);
         const description = descMatch ? descMatch[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim() : "";
 
-        // Genres
+        // Genres (matches both /category/genre/ and /genre/, strict <a> only)
         const genres = [];
-        const genreRegex = /href="[^"]*\/category\/genre\/[^"]*"[^>]*>([^<]+)<\/a>/gi;
+        const genreRegex = /<a[^>]+href="[^"]*\/(?:category\/)?genre\/[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
         let match;
         while ((match = genreRegex.exec(data)) !== null) {
-          const g = match[1].trim();
-          if (g && !genres.includes(g)) genres.push(g);
+          const g = match[1].replace(/<[^>]+>/g, "").trim();
+          if (g && g.length < 50 && !genres.includes(g)) genres.push(g);
         }
 
-        // Languages
+        // Languages (matches both /category/language/ and /language/, strict <a> only)
         const languages = [];
-        const langRegex = /href="[^"]*\/category\/language\/[^"]*"[^>]*>([^<]+)<\/a>/gi;
+        const langRegex = /<a[^>]+href="[^"]*\/(?:category\/)?language\/[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
         while ((match = langRegex.exec(data)) !== null) {
-          const l = match[1].trim();
-          if (l && !languages.includes(l)) languages.push(l);
+          const l = match[1].replace(/<[^>]+>/g, "").trim();
+          if (l && l.length < 50 && !languages.includes(l)) languages.push(l);
         }
 
         // Tag-stripped visible text
@@ -762,7 +768,7 @@ export default {
       }
 
       // ====================================================================
-      // Episodes
+      // Episodes (with MOVIE fallback)
       // ====================================================================
       if (path.startsWith("/api/episodes/")) {
         const animeId = path.split("/")[3];
