@@ -58,7 +58,6 @@ function rewriteHlsManifest(manifest, baseUrl, referer, audioLang, workerOrigin)
       let l = line.replace(/URI="([^"]+)"/g, (_m, uri) => {
         try { return `URI="${link(new URL(uri, baseUrl).toString())}"`; } catch { return _m; }
       });
-      // audio-track switching
       if (audioLang && l.startsWith("#EXT-X-MEDIA:TYPE=AUDIO")) {
         const lang = (l.match(/LANGUAGE="([^"]+)"/) || [])[1];
         const name = (l.match(/NAME="([^"]+)"/) || [])[1];
@@ -71,7 +70,6 @@ function rewriteHlsManifest(manifest, baseUrl, referer, audioLang, workerOrigin)
       continue;
     }
 
-    // bare URI line (variant playlist or segment)
     try { out.push(link(new URL(line.trim(), baseUrl).toString())); }
     catch { out.push(line); }
   }
@@ -83,6 +81,47 @@ const M3U8_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Cache-Control": "public, max-age=60",
 };
+
+// ---------------------------------------------------------------------------
+// Fetch upstream with a referer fallback chain.
+// Some CDNs referer-gate assets — on 403/404 we retry with alternatives.
+// ---------------------------------------------------------------------------
+async function fetchUpstream(targetUrl, referer, rangeHeader) {
+  const candidates = [];
+  const add = (r) => { if (typeof r === "string" && !candidates.includes(r)) candidates.push(r); };
+
+  // Priority: provided referer → its origin → target origin → known CDNs → no referer
+  add(referer || "");
+  try { if (referer) add(new URL(referer).origin + "/"); } catch {}
+  try { add(new URL(targetUrl).origin + "/"); } catch {}
+  add("https://as-cdn26.top/");
+  add("https://animesalt.cx/");
+  add(""); // no referer
+
+  let lastStatus = 0;
+  for (const r of candidates) {
+    const headers = new Headers();
+    headers.set("User-Agent", CHROME_HEADERS["User-Agent"]);
+    headers.set("Accept", "*/*");
+    if (r) {
+      headers.set("Referer", r);
+      try { headers.set("Origin", new URL(r).origin); } catch {}
+    }
+    if (rangeHeader) headers.set("Range", rangeHeader);
+
+    let res;
+    try {
+      res = await fetch(targetUrl, { headers, redirect: "follow", cf: { cacheTtl: 0 } });
+    } catch (e) { lastStatus = 0; continue; }
+
+    if (res.ok) return res;
+
+    lastStatus = res.status;
+    try { if (res.body) await res.body.cancel(); } catch {}
+    if (lastStatus !== 403 && lastStatus !== 404) break; // only retry auth-ish codes
+  }
+  return { ok: false, status: lastStatus };
+}
 
 // ---------------------------------------------------------------------------
 // Handler — sniffs the BODY, never trusts Content-Type / URL extension
@@ -98,34 +137,26 @@ export async function handleMediaProxy(request) {
   if (!referer) { try { referer = new URL(targetUrl).origin + "/"; } catch { referer = ""; } }
   const workerOrigin = url.origin;
 
-  const headers = new Headers();
-  headers.set("User-Agent", CHROME_HEADERS["User-Agent"]);
-  headers.set("Accept", "*/*");
-  if (referer) {
-    headers.set("Referer", referer);
-    try { headers.set("Origin", new URL(referer).origin); } catch {}
-  }
-  if (request.headers.has("Range")) headers.set("Range", request.headers.get("Range"));
-
-  let res;
-  try {
-    res = await fetch(targetUrl, { headers, redirect: "follow", cf: { cacheTtl: 0 } });
-  } catch (e) {
-    return new Response("Upstream fetch failed: " + e.message, { status: 502, headers: corsHeaders });
-  }
+  const res = await fetchUpstream(targetUrl, referer, request.headers.get("Range"));
   if (!res.ok) {
     return new Response("Upstream returned " + res.status, { status: 502, headers: corsHeaders });
   }
 
-  const ct = (res.headers.get("Content-Type") || "").toLowerCase();
+  const ct = ((res.headers && res.headers.get("Content-Type")) || "").toLowerCase();
 
-  // ---- forced subtitle conversion ----
+  // ---- forced subtitle conversion (SRT → VTT if needed) ----
   if (forceType === "text/vtt") {
     const text = await res.text();
     const vtt = text.trimStart().startsWith("WEBVTT")
       ? text
       : "WEBVTT\n\n" + text.replace(/\r\n/g, "\n");
-    return new Response(vtt, { headers: { "Content-Type": "text/vtt", "Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=3600" } });
+    return new Response(vtt, {
+      headers: {
+        "Content-Type": "text/vtt",
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "public, max-age=3600",
+      },
+    });
   }
 
   // ---- sniff first chunk: if body starts with #EXTM3U → rewrite it ----
@@ -144,7 +175,7 @@ export async function handleMediaProxy(request) {
     return new Response(rewritten, { headers: M3U8_HEADERS });
   }
 
-  // ---- binary passthrough (segments, keys, fonts, images) ----
+  // ---- binary passthrough (segments, keys, fonts, images, etc.) ----
   const stream = new ReadableStream({
     async start(c) { if (first.value) c.enqueue(first.value); },
     async pull(c) {
@@ -156,7 +187,7 @@ export async function handleMediaProxy(request) {
   rh.set("Access-Control-Allow-Origin", "*");
   rh.set("Content-Type", ct || "application/octet-stream");
   rh.set("Cache-Control", "public, max-age=3600");
-  if (res.headers.has("Content-Range")) rh.set("Content-Range", res.headers.get("Content-Range"));
-  if (res.headers.has("Content-Length")) rh.set("Content-Length", res.headers.get("Content-Length"));
+  if (res.headers && res.headers.has("Content-Range")) rh.set("Content-Range", res.headers.get("Content-Range"));
+  if (res.headers && res.headers.has("Content-Length")) rh.set("Content-Length", res.headers.get("Content-Length"));
   return new Response(stream, { status: res.status, headers: rh });
 }
