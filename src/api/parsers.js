@@ -187,9 +187,8 @@ export function extractTaxonomy(html, tax) {
 }
 
 // ===========================================================================
-// HOMEPAGE SECTION SPLITTER
-// Slices the homepage HTML at each known section heading and extracts
-// the cards that live between two headings.
+// HOMEPAGE SECTION SPLITTER (CPU-OPTIMIZED)
+// Linear scan: build script/style byte-ranges once, then O(matches) checks.
 // ===========================================================================
 export const HOME_SECTION_TITLES = [
   "Most-Watched Series",
@@ -209,19 +208,29 @@ function titleRegex(title) {
   return new RegExp(words.join("[^A-Za-z0-9]{0,3}"), "i");
 }
 
-function isInsideScriptOrStyle(html, idx) {
-  const before = html.slice(0, idx);
-  if (before.lastIndexOf("<script") > before.lastIndexOf("</script")) return true;
-  if (before.lastIndexOf("<style") > before.lastIndexOf("</style")) return true;
+// Precompute script/style byte-ranges ONCE (no per-match slicing)
+function scriptStyleRanges(html) {
+  const ranges = [];
+  const re = /<(?:script|style)\b[^>]*>[\s\S]*?<\/(?:script|style)>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) ranges.push([m.index, m.index + m[0].length]);
+  return ranges;
+}
+
+function isInsideRanges(ranges, idx) {
+  for (let i = 0; i < ranges.length; i++) {
+    if (idx >= ranges[i][0] && idx < ranges[i][1]) return true;
+    if (ranges[i][0] > idx) break;
+  }
   return false;
 }
 
 // First occurrence of the title that is a HEADING, not a nav/menu link
-function findSectionStart(html, title) {
+function findSectionStart(html, title, ranges) {
   const re = titleRegex(title);
   let m;
   while ((m = re.exec(html)) !== null) {
-    if (isInsideScriptOrStyle(html, m.index)) continue;
+    if (ranges && isInsideRanges(ranges, m.index)) continue;
     const back = html.lastIndexOf("<", m.index);
     if (back === -1 || m.index - back > 200) continue;
     const tagMatch = html.slice(back, back + 40).match(/^<\s*([a-zA-Z0-9]+)/);
@@ -233,9 +242,10 @@ function findSectionStart(html, title) {
 }
 
 export function extractHomeSections(html) {
+  const ranges = scriptStyleRanges(html);
   const positions = [];
   for (const title of HOME_SECTION_TITLES) {
-    const idx = findSectionStart(html, title);
+    const idx = findSectionStart(html, title, ranges);
     if (idx !== -1) positions.push({ title, idx });
   }
   positions.sort((a, b) => a.idx - b.idx);
