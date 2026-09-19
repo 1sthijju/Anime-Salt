@@ -87,10 +87,11 @@ export function extractPopularItems(html, targetType) {
 }
 
 // ---------------------------------------------------------------------------
-// Episode grid (WordPress AJAX fragment returned by admin-ajax)
+// Episode grid (WordPress AJAX fragment OR initial series-page HTML)
 //
-// - Thumbnail detection: inside the <a> first, then nearest <img> in an
-//   800-char window BEFORE the link (sibling card layout used by animesalt).
+// - Title: multi-pattern extraction with cleanup; falls back to "Episode N"
+// - Thumbnail: inside the <a> first, then nearest <img> in an 800-char
+//   window BEFORE the link (sibling card layout used by animesalt).
 // - Lazy-load aware: data-src, data-lazy-src, data-original, srcset,
 //   and CSS background-image.
 // - regionalDub flag: flips to false once the divider
@@ -99,7 +100,7 @@ export function extractPopularItems(html, targetType) {
 // ---------------------------------------------------------------------------
 export function parseEpisodesFromHtml(html, seasonNum) {
   const eps = [];
-  const DUB_DIVIDER = /aren['']t dubbed in regional languages/i;
+  const DUB_DIVIDER = /aren['’]t dubbed in regional languages/i;
   let regionalDub = true;
   let lastIdx = 0;
 
@@ -148,34 +149,28 @@ export function parseEpisodesFromHtml(html, seasonNum) {
     const epNum = sxe ? parseInt(sxe[2], 10) : 0;
     if (epNum === 0) continue;
 
-    // Enhanced title extraction with multiple fallback patterns
+    // ---------------- Enhanced title extraction ----------------
     const linkHtml = match[2];
     let title = "";
-    
     const titlePatterns = [
       /class="[^"]*(?:entry-title|title|ep-title)[^"]*"[^>]*>([^<]+)/i,
       /<span[^>]*class="[^"]*title[^"]*"[^>]*>([^<]+)<\/span>/i,
       /<div[^>]*class="[^"]*title[^"]*"[^>]*>([^<]+)<\/div>/i,
-      />([^<]+)<\/a>/i,  // fallback: any text before </a>
+      />([^<]+)</i,
     ];
-    
     for (const pattern of titlePatterns) {
-      const titleMatch = linkHtml.match(pattern);
-      if (titleMatch) {
-        title = titleMatch[1].trim();
-        // Clean up common patterns
-        title = title.replace(/^\d+[\.\)]\s*/, "");  // Remove "1. " or "1) "
-        title = title.replace(/\s*View\s*$/i, "");
-        title = title.replace(/Episode\s+\d+/i, "");
-        if (title.length > 2) break;
+      const tm = linkHtml.match(pattern);
+      if (tm && tm[1]) {
+        let t = tm[1].trim();
+        t = t.replace(/^\d+[\.\)]\s*/, "");        // "1. " / "1) "
+        t = t.replace(/\s*View\s*$/i, "");          // trailing "View"
+        t = t.replace(/^Episode\s+\d+\s*[:\-]?\s*/i, ""); // "Episode 5: "
+        if (t.length > 2) { title = t; break; }
       }
     }
-    
-    if (!title || title.length < 3) {
-      title = `Episode ${epNum}`;
-    }
+    if (!title || title.length < 3) title = `Episode ${epNum}`;
 
-    // thumbnail: inside anchor → else nearest img in 800 chars before it
+    // ---------------- Thumbnail: inside anchor → 800-char back window -------
     let image = grabUrl(linkHtml);
     if (!image) {
       const windowStart = Math.max(0, match.index - 800);
@@ -224,9 +219,13 @@ export function extractEmbedForIndex(html, index) {
 
 // ---------------------------------------------------------------------------
 // Taxonomy link lists (genre / language / country / quality / season / ...)
+//
 // STRICT: only matches real <a> tags and captures inner text directly.
-// (Old version used lastIndexOf(">")/indexOf("</a>") which swallowed whole
-//  <script>/<style> blocks from <head> — fixed.)
+// Guards against false positives:
+//  - rejects huge captures (script/style swallowed)
+//  - rejects navigation labels ("All", "View All", "Browse", ...)
+//  - requires the visible name to correlate with the URL slug
+//    (so href=/genre/action/ with text "All" is skipped, "Action" kept)
 // ---------------------------------------------------------------------------
 export function extractTaxonomy(html, tax) {
   const results = [];
@@ -234,10 +233,11 @@ export function extractTaxonomy(html, tax) {
     `<a[^>]+href="([^"]*\\/${tax}\\/([^\\/"]+)\\/?)["'][^>]*>([\\s\\S]*?)</a>`,
     "gi"
   );
-  
-  // Blacklist navigation/filter text
-  const blacklist = ['all', 'view all', 'see all', 'show all', 'more', 'browse', 'categories', 'genres', 'view', 'see', 'filter'];
-  
+  const blacklist = [
+    "all", "view all", "see all", "show all", "more", "browse",
+    "categories", "genres", "view", "see", "filter", "home",
+  ];
+
   let m;
   while ((m = regex.exec(html)) !== null) {
     const fullUrl = m[1];
@@ -247,25 +247,20 @@ export function extractTaxonomy(html, tax) {
     let name = m[3].replace(/<[^>]+>/g, "").trim();
     if (!name) name = slug.replace(/-/g, " ").replace(/\b\w/g, l => l.toUpperCase());
 
-    // Skip if name is too long (script/style capture)
+    // Safety: huge captured text = false positive (script/style capture)
     if (name.length > 50) continue;
-    
-    // Skip if name is too short (likely navigation)
+    // Too short = likely an icon/arrow
     if (name.length < 3) continue;
-    
-    // Skip if name contains blacklist words (navigation links)
+
+    // Navigation labels
     const nameLower = name.toLowerCase();
-    if (blacklist.some(word => nameLower === word || nameLower.startsWith(word + ' '))) continue;
-    
-    // Require name to match slug pattern (genre names should relate to their slug)
-    const slugWords = slug.split('-').map(w => w.toLowerCase());
-    const nameWords = nameLower.split(/\s+/);
-    
-    // At least one significant word from slug should appear in name
-    // (skip common words like "the", "a", etc.)
-    const significantSlugWords = slugWords.filter(w => w.length > 2);
+    if (blacklist.some(w => nameLower === w || nameLower.startsWith(w + " "))) continue;
+
+    // Slug-name correlation: at least one significant slug word must appear
+    // in the visible name (slug "action" + text "All" → skipped)
+    const significantSlugWords = slug.split("-").filter(w => w.length > 2);
     if (significantSlugWords.length > 0) {
-      const hasMatch = significantSlugWords.some(word => nameLower.includes(word));
+      const hasMatch = significantSlugWords.some(w => nameLower.includes(w));
       if (!hasMatch) continue;
     }
 
