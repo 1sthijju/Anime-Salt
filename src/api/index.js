@@ -64,7 +64,7 @@ const LANDSCAPE_TMDB = /image\.tmdb\.org\/t\/p\/w(?:780|1280|1920|original)\//i;
 const PORTRAIT_TMDB = /image\.tmdb\.org\/t\/p\/w(?:500|342|185|154)\//i;
 const SITE_ASSET = /animesalt\.cx\/wp-content\/uploads|AnimeSalt|cropped-|icon\.png|logo\.png|favicon/i;
 const TMDB_HOST = "https://image.tmdb.org";
-const CACHE_TTL_STATUS = 6 * 60 * 60 * 1000;
+const CACHE_TTL_STATUS = 21600; // 6h in SECONDS (Cache API max-age)
 
 // ---------------------------------------------------------------------------
 // Worker entry
@@ -83,7 +83,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.29.0",
+          version: "3.30.0",
           endpoints: {
             system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings", "/api/debug/poster"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
@@ -117,7 +117,7 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.29.0-edge",
+          version: "3.30.0-edge",
           endpointsCount: 31
         });
       }
@@ -135,51 +135,55 @@ export default {
       }
 
       // ====================================================================
-      // HOME — simple shape (no nested payload cache)
+      // HOME — 1 cached html fetch + 4 cached list fetches (flat caches)
       // ====================================================================
       if (path === "/api/home") {
-        const raw = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
-        const homeData = raw
-          .replace(/<script[\s\S]*?<\/script>/gi, " ")
-          .replace(/<style[\s\S]*?<\/style>/gi, " ");
+        try {
+          const raw = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
+          const homeData = raw
+            .replace(/<script[\s\S]*?<\/script>/gi, " ")
+            .replace(/<style[\s\S]*?<\/style>/gi, " ");
 
-        const secs = extractHomeSections(homeData);
-        const mostWatchedSeries = secs["Most-Watched Series"] || [];
-        const mostWatchedFilms = secs["Most-Watched Films"] || [];
+          const secs = extractHomeSections(homeData);
+          const mostWatchedSeries = secs["Most-Watched Series"] || [];
+          const mostWatchedFilms = secs["Most-Watched Films"] || [];
 
-        const [ongoing, completed, movies, freshDrops] = await Promise.all([
-          (async () => {
-            try { return extractAnimeList(await fetchPage("/category/status/ongoing/")).slice(0, 18); } catch (e) { return []; }
-          })(),
-          (async () => {
-            try { return extractAnimeList(await fetchPage("/category/status/completed/")).slice(0, 18); } catch (e) { return []; }
-          })(),
-          (async () => {
-            for (const p of ["/movies/", "/category/type/movies/"]) {
-              try { const items = extractAnimeList(await fetchPage(p)); if (items.length) return items.slice(0, 18); } catch (e) { /* next */ }
-            }
-            return [];
-          })(),
-          (async () => {
-            for (const base of ["/new/", "/recent/", "/latest/"]) {
-              try { const items = extractAnimeList(await fetchPage(base)); if (items.length) return items.slice(0, 18); } catch (e) { /* next */ }
-            }
-            return [];
-          })(),
-        ]);
+          const [ongoing, completed, movies, freshDrops] = await Promise.all([
+            cachedJSON("list:ongoing:v4", async () => {
+              try { return extractAnimeList(await fetchPage("/category/status/ongoing/")).slice(0, 18); } catch (e) { return []; }
+            }, CACHE_TTL),
+            cachedJSON("list:completed:v4", async () => {
+              try { return extractAnimeList(await fetchPage("/category/status/completed/")).slice(0, 18); } catch (e) { return []; }
+            }, CACHE_TTL),
+            cachedJSON("list:movies:v4", async () => {
+              for (const p of ["/movies/", "/category/type/movies/"]) {
+                try { const items = extractAnimeList(await fetchPage(p)); if (items.length) return items.slice(0, 18); } catch (e) { /* next */ }
+              }
+              return [];
+            }, CACHE_TTL),
+            cachedJSON("list:fresh:v4", async () => {
+              for (const base of ["/new/", "/recent/", "/latest/"]) {
+                try { const items = extractAnimeList(await fetchPage(base)); if (items.length) return items.slice(0, 18); } catch (e) { /* next */ }
+              }
+              return [];
+            }, CACHE_TTL),
+          ]);
 
-        const latestEpisodes = extractAnimeList(homeData).slice(0, 20);
+          const latestEpisodes = extractAnimeList(homeData).slice(0, 20);
 
-        return jsonResponse({
-          success: true,
-          data: {
-            mostWatchedSeries, mostWatchedFilms, latest: latestEpisodes,
-            ongoing, completed, movies, freshDrops,
-            popular: [...mostWatchedSeries.slice(0, 12), ...mostWatchedFilms.slice(0, 12)],
-            popularSeries: mostWatchedSeries.slice(0, 12),
-            popularFilms: mostWatchedFilms.slice(0, 12),
-          },
-        });
+          return jsonResponse({
+            success: true,
+            data: {
+              mostWatchedSeries, mostWatchedFilms, latest: latestEpisodes,
+              ongoing, completed, movies, freshDrops,
+              popular: [...mostWatchedSeries.slice(0, 12), ...mostWatchedFilms.slice(0, 12)],
+              popularSeries: mostWatchedSeries.slice(0, 12),
+              popularFilms: mostWatchedFilms.slice(0, 12),
+            },
+          });
+        } catch (e) {
+          return jsonResponse({ success: false, error: e.message }, 502);
+        }
       }
 
       // ====================================================================
@@ -886,7 +890,7 @@ export default {
               ...resolvedStream, subtitles, proxied_url: proxied,
               audio_languages: groups.audio, subtitle_languages: groups.subtitles,
               selected_audio: audio || null, serverIndex, selectedLanguage,
-              isIframe: false,
+              isIframe: !!resolvedStream.isIframe,
               referer: resolvedStream.host === "as-cdn26.top" ? "https://as-cdn26.top/" : "https://abyssplayer.com/",
             },
           });
