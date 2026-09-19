@@ -1,440 +1,224 @@
-// ---------------------------------------------------------------------------
-// AnimeSalt Edge API — HTML parsers
-// Pure functions: (html, ...) -> data. No side effects, no I/O.
-// ---------------------------------------------------------------------------
+// ==========================================================================
+// AnimeSalt API — Parser Module (v3.40.0)
+// Extracts structured data from upstream HTML
+// ==========================================================================
 
-// ---------------------------------------------------------------------------
-// Generic card grids (home, category, search pages)
-// Matches <article class="...post..."> blocks — the WordPress wrapper
-// animesalt uses for all catalog cards.
-// ---------------------------------------------------------------------------
-export function extractAnimeList(html) {
-  const results = [];
-  const articleRegex = /<article[^>]*class="[^"]*post[^"]*"[^>]*>([\s\S]*?)<\/article>/gi;
-  let match;
-  while ((match = articleRegex.exec(html)) !== null) {
-    const h = match[1];
-    const urlMatch = h.match(/href="([^"]+\/(?:series|movies|anime)\/[^"]+)"/i);
-    const url = urlMatch ? urlMatch[1] : "";
-    const slugMatch = url.match(/\/(?:series|movies|anime)\/([^/]+)\/?$/);
-    const id = slugMatch ? slugMatch[1] : "";
-    if (!id) continue;
+/**
+ * Parse catalog items (series/movies) from HTML
+ * Uses multiple pattern matching for robustness
+ */
+export function parseCatalogItems(html) {
+  const out = [];
+  
+  // Pattern 1: Standard article with data attributes
+  const pattern1 = /<article[^>]*>[\s\S]*?<a[^>]+href="(https:\/\/animesalt\.cx\/(?:series|movies)\/([^"\/]+)\/?)"[^>]*>[\s\S]*?<img[^>]+src="([^"]+)"[^>]*>[\s\S]*?<h[23][^>]*>([^<]+)<\/h[23]>/gi;
+  let m;
+  while ((m = pattern1.exec(html)) !== null) {
+    const [, url, slug, img, title] = m;
+    out.push({ id: slug, title: title.trim(), image: img, type: url.includes("/movies/") ? "movie" : "series", url });
+  }
+  
+  // Pattern 2: Simpler card structure
+  if (out.length === 0) {
+    const pattern2 = /<a[^>]+href="(https:\/\/animesalt\.cx\/(?:series|movies)\/([^"\/]+)\/?)"[^>]*class="[^"]*(?:card|item|poster)[^"]*"[^>]*>[\s\S]*?<img[^>]+src="([^"]+)"[^>]*>[\s\S]*?(?:<h[23][^>]*>([^<]+)<\/h[23]>|alt="([^"]+)")/gi;
+    while ((m = pattern2.exec(html)) !== null) {
+      const [, url, slug, img, title1, title2] = m;
+      const title = (title1 || title2 || "").trim();
+      if (title && !title.startsWith("View")) {
+        out.push({ id: slug, title, image: img, type: url.includes("/movies/") ? "movie" : "series", url });
+      }
+    }
+  }
+  
+  // Pattern 3: Extract from structured data (JSON-LD or data attributes)
+  if (out.length === 0) {
+    const pattern3 = /data-post-id="(\d+)"[^>]*data-slug="([^"]+)"[^>]*>[\s\S]*?<img[^>]+src="([^"]+)"[^>]*>[\s\S]*?<h[23][^>]*>([^<]+)<\/h[23]>/gi;
+    while ((m = pattern3.exec(html)) !== null) {
+      const [, , slug, img, title] = m;
+      out.push({ id: slug, title: title.trim(), image: img, type: "series", url: `https://animesalt.cx/series/${slug}/` });
+    }
+  }
+  
+  // Dedupe by id
+  const seen = new Set();
+  return out.filter(it => { if (seen.has(it.id)) return false; seen.add(it.id); return true; });
+}
 
-    const titleMatch =
-      h.match(/class="[^"]*(?:entry-title|title)[^"]*"[^>]*>([^<]+)/i) ||
-      h.match(/alt="([^"]+)"/i);
-    const title = titleMatch ? titleMatch[1].trim() : "";
+/**
+ * Parse featured/hero items from homepage
+ */
+export function parseFeatured(html) {
+  // Try multiple patterns for featured/hero content
+  const patterns = [
+    /<div[^>]*class="[^"]*(?:hero|featured|slider|spotlight)[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/gi,
+    /<section[^>]*class="[^"]*(?:hero|featured|spotlight)[^"]*"[^>]*>([\s\S]*?)<\/section>/gi,
+    /<div[^>]*id="[^"]*(?:hero|featured|slider)[^"]*"[^>]*>([\s\S]*?)<\/div>/gi,
+  ];
+  
+  for (const pattern of patterns) {
+    const items = [];
+    let m;
+    while ((m = pattern.exec(html)) !== null) {
+      const block = m[1];
+      const urlM = block.match(/href="(https:\/\/animesalt\.cx\/(series|movies)\/([^"\/]+)\/?)"/);
+      const imgM = block.match(/<img[^>]+src="([^"]+)"/);
+      const tiM = block.match(/<(?:h[123]|p)[^>]*>([^<]{3,100})<\/(?:h[123]|p)>/);
+      if (urlM && tiM) {
+        items.push({
+          id: urlM[3],
+          title: tiM[1].trim(),
+          image: imgM ? imgM[1] : "",
+          type: urlM[2] === "series" ? "series" : "movie",
+          url: urlM[1],
+        });
+      }
+    }
+    if (items.length > 0) return items;
+  }
+  
+  // Fallback: use parseCatalogItems
+  return parseCatalogItems(html).slice(0, 6);
+}
 
-    const imgMatch =
-      h.match(/\bdata-src="([^"]+)"/i) ||
-      h.match(/\bdata-lazy-src="([^"]+)"/i) ||
-      h.match(/\bdata-original="([^"]+)"/i) ||
-      h.match(/\bsrc="([^"]+)"/i);
-    let image = imgMatch ? imgMatch[1] : "";
-    if (image.startsWith("data:")) image = "";
-    if (image.startsWith("//")) image = "https:" + image;
+/**
+ * Parse latest updates from homepage
+ */
+export function parseLatest(html) {
+  return parseCatalogItems(html).slice(0, 24);
+}
 
-    results.push({
-      id,
-      title,
-      image,
-      type: url.includes("/movies/") ? "movie" : "series",
-      url,
+/**
+ * Pick a random item from catalog
+ */
+export function parseRandomItem(html) {
+  const items = parseCatalogItems(html);
+  return items.length ? items[Math.floor(Math.random() * items.length)] : null;
+}
+
+/**
+ * Parse info page for a series/movie
+ */
+export function parseInfoPage(html, id) {
+  const titleM = html.match(/<h1[^>]*class="[^"]*title[^"]*"[^>]*>([^<]+)<\/h1>/i) || html.match(/<h1[^>]*>([^<]+)<\/h1>/i);
+  const posterM = html.match(/<div[^>]*class="[^"]*poster[^"]*"[^>]*>[\s\S]*?<img[^>]+src="([^"]+)"/i);
+  const descM = html.match(/<div[^>]*class="[^"]*(?:description|wp-content|entry-content)[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+  
+  const genres = [...html.matchAll(/<a[^>]+href="[^"]*\/category\/genre\/([^"\/]+)[^"]*"[^>]*>([^<]+)<\/a>/gi)].map(m => m[2].trim());
+  const languages = [...html.matchAll(/<a[^>]+href="[^"]*\/category\/language\/([^"\/]+)[^"]*"[^>]*>([^<]+)<\/a>/gi)].map(m => m[2].trim());
+  
+  const seasonsRaw = [...html.matchAll(/<option[^>]+value="(\d+)"[^>]*>Season\s*(\d+)[\s\S]*?(\d+)\s*[-–]\s*(\d+)\s*\((\d+)\)/gi)];
+  const seasons = seasonsRaw.map(m => ({ num: +m[2], title: `Season ${m[2]} • ${m[3]}-${m[4]} (${m[5]})`, value: m[1] }));
+  
+  return {
+    id,
+    title: (titleM ? titleM[1] : id).trim(),
+    poster: posterM ? posterM[1] : "",
+    backdrop: "",
+    description: descM ? descM[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim() : "",
+    type: html.includes("/movies/") ? "movie" : "series",
+    totalEpisodes: seasons.reduce((sum, s) => sum + (parseInt(s.title.match(/\((\d+)\)/)?.[1] || 0, 10)), 0),
+    year: "",
+    status: "",
+    seasons,
+    genres,
+    languages,
+    runtime: "",
+    quickPlay: {
+      first: seasons[0] ? { season: seasons[0].num, episode: 1, slug: `${id}-${seasons[0].num}x1` } : null,
+      latestDub: seasons.length ? { season: seasons[seasons.length - 1].num, episode: 1, slug: `${id}-${seasons[seasons.length - 1].num}x1` } : null,
+      latestSub: null,
+    },
+  };
+}
+
+/**
+ * Parse streaming servers from episode page
+ */
+export function parseServers(html, epSlug) {
+  const servers = [];
+  const re = /<li[^>]*data-id="(\d+)"[^>]*>[\s\S]*?<a[^>]+href="([^"]+)"[^>]*>[\s\S]*?<span[^>]*>([^<]+)<\/span>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const [_, idxStr, embedUrl, name] = m;
+    servers.push({
+      index: parseInt(idxStr, 10),
+      serverName: name.trim(),
+      embedUrl,
+      isMultiLang: /multi-lang/i.test(name),
+      languages: [],
     });
   }
-  return results;
+  return servers;
 }
 
-// ---------------------------------------------------------------------------
-// Ranked chart blocks ("Most-Watched Series" / "Most-Watched Films")
-// ---------------------------------------------------------------------------
-export function extractPopularItems(html, targetType) {
-  const results = [];
-  const chartRegex = /<div[^>]*class="[^"]*chart-item[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/gi;
-  let match;
-  while ((match = chartRegex.exec(html)) !== null) {
-    const itemHtml = match[1];
-    const rankMatch = itemHtml.match(/class="[^"]*chart-number[^"]*"[^>]*>(\d+)/i);
-    const rank = rankMatch ? parseInt(rankMatch[1], 10) : null;
-
-    const linkMatch = itemHtml.match(/href="([^"]+\/(?:series|movies|anime)\/[^"]+)"/i);
-    const url = linkMatch ? linkMatch[1] : "";
-    const slugMatch = url.match(/\/(?:series|movies|anime)\/([^/]+)\/?$/);
-    const id = slugMatch ? slugMatch[1] : "";
-    if (!id) continue;
-
-    const type = url.includes("/movies/") ? "movie" : "series";
-    if (targetType && type !== targetType) continue;
-
-    const titleMatch =
-      itemHtml.match(/class="[^"]*chart-title[^"]*"[^>]*>([^<]+)/i) ||
-      itemHtml.match(/alt="([^"]+)"/i);
-    const title = titleMatch ? titleMatch[1].trim() : "";
-
-    const imgMatch =
-      itemHtml.match(/\bdata-src="([^"]+)"/i) ||
-      itemHtml.match(/\bdata-lazy-src="([^"]+)"/i) ||
-      itemHtml.match(/\bsrc="([^"]+)"/i);
-    let image = imgMatch ? imgMatch[1] : "";
-    if (image.startsWith("data:")) image = "";
-    if (image.startsWith("//")) image = "https:" + image;
-
-    if (!results.find(r => r.id === id)) {
-      results.push({ rank, id, title, image, type, url });
-    }
-  }
-  return results;
-}
-
-// ---------------------------------------------------------------------------
-// Episode grid (WordPress AJAX fragment returned by admin-ajax)
-// ---------------------------------------------------------------------------
-export function parseEpisodesFromHtml(html, seasonNum) {
-  const eps = [];
-  const DUB_DIVIDER = /aren['’]t dubbed in regional languages/i;
-  let regionalDub = true;
-  let lastIdx = 0;
-
-  const epRegex = /<a[^>]+href="([^"]+\/episode\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
-  let match;
-
-  const grabUrl = (fragment) => {
-    const tags = [...fragment.matchAll(/<img[^>]*>/gi)];
-    for (let i = tags.length - 1; i >= 0; i--) {
-      const tag = tags[i][0];
-      const lazy = tag.match(
-        /\b(?:data-lazy-src|data-original|data-src|data-cfsrc|data-bg|data-lazy|data-echo)="([^"]+)"/i
-      );
-      const srcset =
-        tag.match(/\bdata-srcset="([^"]+)"/i) || tag.match(/\bsrcset="([^"]+)"/i);
-      const plain = tag.match(/\bsrc="([^"]+)"/i);
-      let u = lazy
-        ? lazy[1]
-        : srcset
-        ? srcset[1].split(/[ ,]/)[0]
-        : plain && !plain[1].startsWith("data:")
-        ? plain[1]
-        : "";
-      if (u && !u.startsWith("data:")) return u;
-    }
-    const bg = fragment.match(
-      /background(?:-image)?:\s*(?:[^;'"()]*?,\s*)?url\(\s*['"]?([^'")]+)['"]?\s*\)/i
-    );
-    if (bg && !bg[1].startsWith("data:")) return bg[1];
-    return "";
-  };
-
-  while ((match = epRegex.exec(html)) !== null) {
-    const between = html.slice(lastIdx, match.index);
-    if (DUB_DIVIDER.test(between)) regionalDub = false;
-    lastIdx = match.index + match[0].length;
-
-    const url = match[1];
-    const slugMatch = url.match(/\/episode\/([^/]+)\/?$/);
-    const epSlug = slugMatch ? slugMatch[1] : "";
-    if (!epSlug) continue;
-
-    const sxe = epSlug.match(/(\d+)x(\d+)$/);
-    const sNum = sxe ? parseInt(sxe[1], 10) : seasonNum;
-    const epNum = sxe ? parseInt(sxe[2], 10) : 0;
-    if (epNum === 0) continue;
-
-    const linkHtml = match[2];
-    let title = "";
-    
-    const titlePatterns = [
-      /class="[^"]*(?:entry-title|title|ep-title)[^"]*"[^>]*>([^<]+)/i,
-      /<span[^>]*class="[^"]*title[^"]*"[^>]*>([^<]+)<\/span>/i,
-      /<div[^>]*class="[^"]*title[^"]*"[^>]*>([^<]+)<\/div>/i,
-      />([^<]+)<\/a>/i,
-    ];
-    
-    for (const pattern of titlePatterns) {
-      const titleMatch = linkHtml.match(pattern);
-      if (titleMatch) {
-        title = titleMatch[1].trim();
-        title = title.replace(/^\d+[\.\)]\s*/, "");
-        title = title.replace(/\s*View\s*$/i, "");
-        title = title.replace(/Episode\s+\d+/i, "");
-        if (title.length > 2) break;
-      }
-    }
-    
-    if (!title || title.length < 3) {
-      title = `Episode ${epNum}`;
-    }
-
-    let image = grabUrl(linkHtml);
-    if (!image) {
-      const windowStart = Math.max(0, match.index - 800);
-      image = grabUrl(html.slice(windowStart, match.index));
-    }
-    if (image.startsWith("//")) image = "https:" + image;
-
-    if (!eps.find(e => e.slug === epSlug)) {
-      eps.push({
-        num: epNum,
-        season: sNum,
-        title,
-        slug: epSlug,
-        url,
-        image: image || null,
-        regionalDub,
-      });
-    }
-  }
-  return eps;
-}
-
-// ---------------------------------------------------------------------------
-// Server iframe embed URL for a given server index
-// ---------------------------------------------------------------------------
-export function extractEmbedForIndex(html, index) {
-  const containerRegex = new RegExp(
-    `<div[^>]*id="options-${index}"[^>]*>([\\s\\S]*?)(?=<div[^>]*id="options-\\d+|<div[^>]*class="[^"]*(?:server-section|download|related)[^"]*"|</section>|<footer[^>]*>|$)`,
-    "i"
-  );
-  const containerMatch = html.match(containerRegex);
-  if (containerMatch) {
-    const iframeMatch = containerMatch[1].match(/<iframe[^>]*(?:src|data-src)="([^"]+)"/i);
-    if (iframeMatch && iframeMatch[1]) return iframeMatch[1];
-  }
-  const iframeRegex = /<iframe[^>]*(?:src|data-src)="([^"]+)"/gi;
-  let m, i = 0;
-  while ((m = iframeRegex.exec(html)) !== null) {
-    if (i === index) return m[1];
-    i++;
-  }
-  return "";
-}
-
-// ---------------------------------------------------------------------------
-// Taxonomy link lists (genre / language / country / quality / season / ...)
-// STRICT: only matches real <a> tags. Simplified filtering to avoid false
-// positives from <head> script/style blocks while allowing all valid genres.
-// ---------------------------------------------------------------------------
-export function extractTaxonomy(html, tax) {
-  const results = [];
-  const regex = new RegExp(
-    `<a[^>]+href="([^"]*\\/${tax}\\/([^\\/"]+)\\/?)["'][^>]*>([\\s\\S]*?)</a>`,
-    "gi"
-  );
-  
-  let m;
-  while ((m = regex.exec(html)) !== null) {
-    const fullUrl = m[1];
-    const slug = m[2];
-    let name = m[3].replace(/<[^>]+>/g, "").trim();
-    
-    if (!name || name.length > 50) continue;
-    
-    const nameLower = name.toLowerCase();
-    if (nameLower === 'all' || nameLower === 'view all' || nameLower === 'see all') continue;
-    
-    if (name.length < 2) {
-      name = slug.replace(/-/g, " ").replace(/\b\w/g, l => l.toUpperCase());
-    }
-
-    if (slug && name && !results.find(r => r.slug === slug)) {
-      results.push({ slug, name, url: fullUrl });
-    }
-  }
-  return results;
-}
-
-// ---------------------------------------------------------------------------
-// Extract all categories from sitemap or homepage
-// Handles both /category/taxonomy/term/ and /category/term/ patterns
-// Parses XML sitemap structure to extract <loc> URLs
-// ---------------------------------------------------------------------------
-export function extractAllCategories(html) {
-  const results = {
-    genres: [],
-    languages: [],
+/**
+ * Parse taxonomy (genres, languages, networks, franchises)
+ */
+export function parseTaxonomy(html) {
+  const parse = (pattern) => [...html.matchAll(pattern)].map(m => ({ slug: m[1], name: m[2].trim() }));
+  return {
+    genres: parse(/<a[^>]+href="[^"]*\/category\/genre\/([^"\/]+)[^"]*"[^>]*>([^<]+)<\/a>/gi),
+    languages: parse(/<a[^>]+href="[^"]*\/category\/language\/([^"\/]+)[^"]*"[^>]*>([^<]+)<\/a>/gi),
     types: [],
     statuses: [],
-    networks: [],
-    franchises: [],
-    topLevel: []
+    networks: parse(/<a[^>]+href="[^"]*\/category\/network\/([^"\/]+)[^"]*"[^>]*>([^<]+)<\/a>/gi),
+    franchises: parse(/<a[^>]+href="[^"]*\/category\/franchise\/([^"\/]+)[^"]*"[^>]*>([^<]+)<\/a>/gi),
+    topLevel: [],
   };
+}
 
-  // Check if this is XML sitemap (has <urlset> or <loc> tags)
-  const isXml = html.includes('<urlset') || html.includes('<loc>');
+/**
+ * Parse taxonomy list (for /api/genres endpoint)
+ */
+export function parseTaxonomyList(html, kind) {
+  const pattern = new RegExp(`<a[^>]+href="[^"]*\\/category\\/${kind}\\/([^"\\/]+)[^"]*"[^>]*>([^<]+)<\\/a>`, "gi");
+  return [...html.matchAll(pattern)].map(m => ({ slug: m[1], name: m[2].trim() }));
+}
+
+/**
+ * Parse most-watched lists from homepage
+ */
+export function parseMostWatched(html) {
+  const series = [];
+  const films = [];
   
-  if (isXml) {
-    // Parse XML sitemap - extract all <loc> tags
-    const locRegex = /<loc>(.*?)<\/loc>/gi;
-    let m;
+  // Pattern for numbered lists (1. Naruto, 2. Jujutsu Kaisen, etc.)
+  const listPattern = /<li[^>]*>\s*(\d+)\s*<[^>]*>([^<]+)<\/[^>]+>\s*<\/li>/gi;
+  let m;
+  
+  let inSeries = false;
+  let inFilms = false;
+  
+  const lines = html.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     
-    while ((m = locRegex.exec(html)) !== null) {
-      const url = m[1].trim();
-      
-      // Must be a category URL
-      if (!url.includes('/category/')) continue;
-      
-      // Extract path after /category/
-      const catMatch = url.match(/\/category\/(.+)/);
-      if (!catMatch) continue;
-      
-      const path = catMatch[1];
-      const parts = path.split('/').filter(p => p);
-      
-      if (parts.length === 2) {
-        // /category/taxonomy/term/ pattern
-        const taxonomy = parts[0];
-        const slug = parts[1];
-        const name = slug.replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-        
-        if (taxonomy === 'genre') {
-          results.genres.push({ slug, name, url });
-        } else if (taxonomy === 'language') {
-          results.languages.push({ slug, name, url });
-        } else if (taxonomy === 'type') {
-          results.types.push({ slug, name, url });
-        } else if (taxonomy === 'status') {
-          results.statuses.push({ slug, name, url });
-        } else if (taxonomy === 'network') {
-          results.networks.push({ slug, name, url });
-        } else if (taxonomy === 'franchise') {
-          results.franchises.push({ slug, name, url });
-        }
-      } else if (parts.length === 1) {
-        // /category/term/ pattern (top-level categories)
-        const slug = parts[0];
-        const name = slug.replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-        results.topLevel.push({ slug, name, url });
-      }
+    if (line.includes("Most-Watched Series")) {
+      inSeries = true;
+      inFilms = false;
+    } else if (line.includes("Most-Watched Films")) {
+      inFilms = true;
+      inSeries = false;
     }
-  } else {
-    // Parse HTML page - extract <a> tags with category links
-    const categoryRegex = /<a[^>]+href="([^"]*\/category\/([^"]+))["'][^>]*>([\s\S]*?)<\/a>/gi;
-    let m;
-
-    while ((m = categoryRegex.exec(html)) !== null) {
-      const url = m[1];
-      const path = m[2];
-      let name = m[3].replace(/<[^>]+>/g, "").trim();
-
-      if (!name || name.length > 50 || name.length < 2) continue;
-
-      const nameLower = name.toLowerCase();
-      if (nameLower === 'all' || nameLower === 'view all') continue;
-
-      const parts = path.split('/').filter(p => p);
-      
-      if (parts.length === 2) {
-        const taxonomy = parts[0];
-        const slug = parts[1].replace(/\/$/, '');
-        
-        if (taxonomy === 'genre') {
-          results.genres.push({ slug, name, url });
-        } else if (taxonomy === 'language') {
-          results.languages.push({ slug, name, url });
-        } else if (taxonomy === 'type') {
-          results.types.push({ slug, name, url });
-        } else if (taxonomy === 'status') {
-          results.statuses.push({ slug, name, url });
-        } else if (taxonomy === 'network') {
-          results.networks.push({ slug, name, url });
-        } else if (taxonomy === 'franchise') {
-          results.franchises.push({ slug, name, url });
-        }
-      } else if (parts.length === 1) {
-        const slug = parts[0].replace(/\/$/, '');
-        results.topLevel.push({ slug, name, url });
+    
+    if (inSeries || inFilms) {
+      const match = line.match(/^\s*(\d+)\s*<[^>]*>([^<]+)<\/[^>]+>/);
+      if (match) {
+        const [, rank, title] = match;
+        const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+        const item = {
+          rank: parseInt(rank, 10),
+          id: slug,
+          title: title.trim(),
+          image: "",
+          type: inSeries ? "series" : "movie",
+          url: `https://animesalt.cx/${inSeries ? 'series' : 'movies'}/${slug}/`,
+        };
+        if (inSeries) series.push(item);
+        else films.push(item);
       }
     }
   }
-
-  // Deduplicate
-  for (const key in results) {
-    results[key] = results[key].filter((item, index, self) =>
-      index === self.findIndex(t => t.slug === item.slug)
-    );
-  }
-
-  return results;
-}
-
-// ===========================================================================
-// HOMEPAGE SECTION SPLITTER (CPU-OPTIMIZED)
-// ===========================================================================
-export const HOME_SECTION_TITLES = [
-  "Most-Watched Series",
-  "Most-Watched Films",
-  "Fresh Drops",
-  "On-Air Series",
-  "New Anime Arrivals",
-  "Just In: Cartoon Series",
-  "Latest Anime Movies",
-  "Fresh Cartoon Films",
-  "Latest Episodes",
-];
-
-function titleRegex(title) {
-  const words = title.split(/[^A-Za-z0-9]+/).filter(Boolean);
-  return new RegExp(words.join("[^A-Za-z0-9]{0,3}"), "i");
-}
-
-function scriptStyleRanges(html) {
-  const ranges = [];
-  const re = /<(?:script|style)\b[^>]*>[\s\S]*?<\/(?:script|style)>/gi;
-  let m;
-  while ((m = re.exec(html)) !== null) {
-    ranges.push([m.index, m.index + m[0].length]);
-  }
-  return ranges;
-}
-
-function isInsideRanges(ranges, idx) {
-  for (let i = 0; i < ranges.length; i++) {
-    if (idx >= ranges[i][0] && idx < ranges[i][1]) return true;
-    if (ranges[i][0] > idx) break;
-  }
-  return false;
-}
-
-function findSectionStart(html, title, ranges) {
-  const re = titleRegex(title);
-  let m;
-  while ((m = re.exec(html)) !== null) {
-    if (ranges && isInsideRanges(ranges, m.index)) continue;
-    const back = html.lastIndexOf("<", m.index);
-    if (back === -1 || m.index - back > 200) continue;
-    const tagMatch = html.slice(back, back + 40).match(/^<\s*([a-zA-Z0-9]+)/);
-    const tag = tagMatch ? tagMatch[1].toLowerCase() : "";
-    if (tag === "a" || tag === "option" || tag === "script" || tag === "style") continue;
-    return m.index;
-  }
-  return -1;
-}
-
-export function extractHomeSections(html) {
-  const ranges = scriptStyleRanges(html);
-  const positions = [];
-  for (const title of HOME_SECTION_TITLES) {
-    const idx = findSectionStart(html, title, ranges);
-    if (idx !== -1) positions.push({ title, idx });
-  }
-  positions.sort((a, b) => a.idx - b.idx);
-
-  const sections = {};
-  for (let i = 0; i < positions.length; i++) {
-    const start = positions[i].idx;
-    const end = i + 1 < positions.length ? positions[i + 1].idx : html.length;
-    const slice = html.slice(start, end);
-
-    let items = extractPopularItems(slice);
-    if (!items.length) items = extractAnimeList(slice);
-
-    items = items
-      .map(it => ({
-        ...it,
-        type: it.url && it.url.includes("/movies/") ? "movie" : (it.type || "series"),
-      }))
-      .slice(0, 25);
-
-    sections[positions[i].title] = items;
-  }
-  return sections;
+  
+  return { series, films };
 }
