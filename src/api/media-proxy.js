@@ -1,8 +1,5 @@
 import { CHROME_HEADERS, corsHeaders } from "./config.js";
 
-// ---------------------------------------------------------------------------
-// Build a /proxy/media link
-// ---------------------------------------------------------------------------
 export function proxyMediaUrl(workerOrigin, url, params = {}) {
   const u = new URL("/proxy/media", workerOrigin);
   u.searchParams.set("url", url);
@@ -12,9 +9,6 @@ export function proxyMediaUrl(workerOrigin, url, params = {}) {
   return u.toString();
 }
 
-// ---------------------------------------------------------------------------
-// Parse #EXT-X-MEDIA audio/subtitle groups from a master playlist
-// ---------------------------------------------------------------------------
 export function parseHlsMediaGroups(manifest) {
   const audio = [];
   const subtitles = [];
@@ -32,9 +26,6 @@ export function parseHlsMediaGroups(manifest) {
   return { audio, subtitles };
 }
 
-// ---------------------------------------------------------------------------
-// Bidirectional language match (hin↔hindi, jpn↔japanese…)
-// ---------------------------------------------------------------------------
 function langMatches(trackValue, wanted) {
   const a = (trackValue || "").toLowerCase();
   const b = (wanted || "").toLowerCase();
@@ -42,9 +33,6 @@ function langMatches(trackValue, wanted) {
   return a === b || a.startsWith(b) || b.startsWith(a);
 }
 
-// ---------------------------------------------------------------------------
-// Rewrite EVERY url inside a manifest: URI="…" attrs + bare segment lines
-// ---------------------------------------------------------------------------
 function rewriteHlsManifest(manifest, baseUrl, referer, audioLang, workerOrigin) {
   const link = (abs) => proxyMediaUrl(workerOrigin, abs, { referer });
   const lines = manifest.split(/\r?\n/);
@@ -82,23 +70,11 @@ const M3U8_HEADERS = {
   "Cache-Control": "public, max-age=60",
 };
 
-// ---------------------------------------------------------------------------
-// Check if content looks like binary image data (JPEG, PNG, GIF, WebP)
-// ---------------------------------------------------------------------------
 function isBinaryImage(text) {
-  const signatures = [
-    "\u00FF\u00D8\u00FF",  // JPEG
-    "\u0089PNG",            // PNG
-    "GIF87a",               // GIF87
-    "GIF89a",               // GIF89
-    "RIFF",                 // WebP (RIFF header)
-  ];
+  const signatures = ["\u00FF\u00D8\u00FF", "\u0089PNG", "GIF87a", "GIF89a", "RIFF"];
   return signatures.some(sig => text.startsWith(sig));
 }
 
-// ---------------------------------------------------------------------------
-// Fetch upstream with a referer fallback chain.
-// ---------------------------------------------------------------------------
 async function fetchUpstream(targetUrl, referer, rangeHeader) {
   const candidates = [];
   const add = (r) => { if (typeof r === "string" && !candidates.includes(r)) candidates.push(r); };
@@ -124,9 +100,12 @@ async function fetchUpstream(targetUrl, referer, rangeHeader) {
     let res;
     try {
       res = await fetch(targetUrl, { headers, redirect: "follow", cf: { cacheTtl: 0 } });
-    } catch (e) { lastStatus = 0; continue; }
+    } catch (e) { 
+      lastStatus = 0; 
+      continue; 
+    }
 
-    if (res.ok) return res;
+    if (res.ok) return { ok: true, response: res };
 
     lastStatus = res.status;
     try { if (res.body) await res.body.cancel(); } catch {}
@@ -135,9 +114,6 @@ async function fetchUpstream(targetUrl, referer, rangeHeader) {
   return { ok: false, status: lastStatus };
 }
 
-// ---------------------------------------------------------------------------
-// Handler with comprehensive error handling
-// ---------------------------------------------------------------------------
 export async function handleMediaProxy(request) {
   try {
     const url = new URL(request.url);
@@ -154,23 +130,12 @@ export async function handleMediaProxy(request) {
     }
     const workerOrigin = url.origin;
 
-    const res = await fetchUpstream(targetUrl, referer, request.headers.get("Range"));
-    if (!res.ok) {
-      return new Response(`Upstream error: ${res.status || 'unknown'}`, {
-        status: 502,
-        headers: corsHeaders,
-      });
-    }
-
-    const ct = ((res.headers && res.headers.get("Content-Type")) || "").toLowerCase();
-
-    // ---- forced subtitle conversion (SRT → VTT if needed) ----
-    if (forceType === "text/vtt") {
-      const text = await res.text();
-      
-      // Validate: reject binary image data disguised as subtitles
-      if (isBinaryImage(text)) {
-        return new Response("WEBVTT\n\nInvalid subtitle file (binary image detected)", {
+    const result = await fetchUpstream(targetUrl, referer, request.headers.get("Range"));
+    
+    if (!result.ok) {
+      // Return empty VTT for subtitles when upstream fails
+      if (forceType === "text/vtt") {
+        return new Response("WEBVTT\n\n", {
           headers: {
             "Content-Type": "text/vtt",
             "Access-Control-Allow-Origin": "*",
@@ -178,20 +143,53 @@ export async function handleMediaProxy(request) {
           },
         });
       }
-      
-      const vtt = text.trimStart().startsWith("WEBVTT")
-        ? text
-        : "WEBVTT\n\n" + text.replace(/\r\n/g, "\n");
-      return new Response(vtt, {
-        headers: {
-          "Content-Type": "text/vtt",
-          "Access-Control-Allow-Origin": "*",
-          "Cache-Control": "public, max-age=3600",
-        },
+      return new Response(`Upstream error: ${result.status || 'unknown'}`, {
+        status: 502,
+        headers: corsHeaders,
       });
     }
 
-    // ---- sniff first chunk: if body starts with #EXTM3U → rewrite it ----
+    const res = result.response;
+    const ct = ((res.headers && res.headers.get("Content-Type")) || "").toLowerCase();
+
+    // ---- forced subtitle conversion ----
+    if (forceType === "text/vtt") {
+      try {
+        const text = await res.text();
+        
+        // Reject binary image data
+        if (isBinaryImage(text)) {
+          return new Response("WEBVTT\n\n", {
+            headers: {
+              "Content-Type": "text/vtt",
+              "Access-Control-Allow-Origin": "*",
+              "Cache-Control": "public, max-age=60",
+            },
+          });
+        }
+        
+        const vtt = text.trimStart().startsWith("WEBVTT")
+          ? text
+          : "WEBVTT\n\n" + text.replace(/\r\n/g, "\n");
+        return new Response(vtt, {
+          headers: {
+            "Content-Type": "text/vtt",
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "public, max-age=3600",
+          },
+        });
+      } catch (e) {
+        return new Response("WEBVTT\n\n", {
+          headers: {
+            "Content-Type": "text/vtt",
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "public, max-age=60",
+          },
+        });
+      }
+    }
+
+    // ---- HLS manifest rewriting ----
     const reader = res.body.getReader();
     const first = await reader.read();
     const headText = first.value ? new TextDecoder().decode(first.value.subarray(0, 64)) : "";
@@ -207,7 +205,7 @@ export async function handleMediaProxy(request) {
       return new Response(rewritten, { headers: M3U8_HEADERS });
     }
 
-    // ---- binary passthrough (segments, keys, fonts, images, etc.) ----
+    // ---- binary passthrough ----
     const stream = new ReadableStream({
       async start(c) { if (first.value) c.enqueue(first.value); },
       async pull(c) {
@@ -223,8 +221,7 @@ export async function handleMediaProxy(request) {
     if (res.headers && res.headers.has("Content-Length")) rh.set("Content-Length", res.headers.get("Content-Length"));
     return new Response(stream, { status: res.status, headers: rh });
   } catch (error) {
-    // Catch any unhandled exceptions and return a proper error response
-    console.error("Media proxy error:", error);
+    console.error("Media proxy error:", error.message, error.stack);
     return new Response(`Proxy error: ${error.message}`, {
       status: 500,
       headers: corsHeaders,
