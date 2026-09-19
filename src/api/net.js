@@ -34,7 +34,7 @@ export async function cachedJSON(key, fetcher, ttl, ctx) {
   return data;
 }
 
-// WordPress admin-ajax: POST must go to the REAL origin first.
+// WordPress admin-ajax: POST MUST go to the REAL origin first.
 // The scrape proxy only reliably serves GET; POSTing through it returns
 // HTML/404 and silently kills season loading.
 export async function siteAjax(params) {
@@ -48,6 +48,7 @@ export async function siteAjax(params) {
     "Sec-Fetch-Site": "same-origin",
   };
 
+  // CRITICAL: Try origin first, proxy second
   const attempts = [
     { url: new URL("/wp-admin/admin-ajax.php", ORIGIN_URL), referer: ORIGIN_URL + "/" },
     { url: new URL("/wp-admin/admin-ajax.php", BASE_URL),   referer: BASE_URL + "/" },
