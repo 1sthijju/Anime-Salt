@@ -2,49 +2,64 @@ export function stripScriptsStyles(html) {
   return html.replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, match => ' '.repeat(match.length));
 }
 
+export function normalizeUrl(url) {
+  if (!url) return "";
+  if (url.startsWith("//")) return "https:" + url;
+  return url;
+}
+
 export function extractAnimeList(html) {
   const cards = [];
   const seen = new Set();
-  // Matches ANY anchor tag linking to series or movies, regardless of wrapper tag
-  const linkRegex = /<a[^>]+href="([^"]+\/(?:series|movies)\/[^/]+\/?)"[^>]*>([\s\S]*?)<\/a>/gi;
+  
+  // Extremely permissive: finds ANY link to series or movies
+  const linkRegex = /href="([^"]*(?:\/series\/|\/movies\/)[^"]+)"/gi;
   let match;
   
   while ((match = linkRegex.exec(html)) !== null) {
     const url = match[1];
-    const content = match[2];
     const slugMatch = url.match(/(?:series|movies)\/([^/]+)/);
     if (!slugMatch) continue;
     const id = slugMatch[1];
     
-    if (seen.has(id)) continue; // Deduplicate cards
+    if (seen.has(id)) continue; // Deduplicate
     seen.add(id);
     
-    let title = content.replace(/<[^>]+>/g, '').trim();
+    // Look for title and image in a 1000-char window around the link
+    const startIdx = Math.max(0, match.index - 1000);
+    const endIdx = Math.min(html.length, match.index + 1000);
+    const windowText = html.substring(startIdx, endIdx);
+    
+    // Title extraction: looks for h2, h3, h4, or alt/title attributes
+    let title = "";
+    const hMatch = windowText.match(/<(?:h[2-4]|span)[^>]*>([^<]+)<\//i);
+    if (hMatch) title = hMatch[1].trim();
     if (!title) {
-      const titleAttr = match[0].match(/title="([^"]+)"/i);
-      if (titleAttr) title = titleAttr[1];
+      const altMatch = windowText.match(/(?:alt|title)="([^"]+)"/i);
+      if (altMatch) title = altMatch[1].trim();
     }
     
+    // Image extraction: looks for data-src or src in the window
     let image = "";
-    // Look for image inside the anchor, or just before it (within 500 chars)
-    const imgInside = content.match(/<img[^>]+>/i);
-    const beforeText = html.substring(Math.max(0, match.index - 500), match.index);
-    const imgBefore = beforeText.match(/<img[^>]+>/gi)?.pop();
-    
-    const imgMatch = imgInside || imgBefore;
+    const imgMatch = windowText.match(/<img[^>]+>/i);
     if (imgMatch) {
-      const imgTag = Array.isArray(imgMatch) ? imgMatch[0] : imgMatch;
+      const imgTag = imgMatch[0];
       const dataSrc = imgTag.match(/data-src="([^"]+)"/i);
       const src = imgTag.match(/\ssrc="([^"]+)"/i);
       let imgUrl = (dataSrc ? dataSrc[1] : (src ? src[1] : "")) || "";
       
       if (imgUrl && !imgUrl.startsWith("data:") && !/wp-content\/uploads\/.*(AnimeSalt|cropped-|icon\.png|logo\.png|favicon)/i.test(imgUrl)) {
-        if (imgUrl.startsWith("//")) imgUrl = "https:" + imgUrl; // Normalize protocol
-        image = imgUrl;
+        image = normalizeUrl(imgUrl);
       }
     }
     
-    cards.push({ id, title, image, type: url.includes("/movies/") ? "movies" : "series", url });
+    cards.push({ 
+      id, 
+      title: title || id, // Fallback to ID if title not found
+      image, 
+      type: url.includes("/movies/") ? "movies" : "series", 
+      url: normalizeUrl(url) 
+    });
   }
   return cards;
 }
@@ -60,10 +75,10 @@ export function extractHomeSections(html) {
   const sections = {};
   const map = { "Most-Watched Series": "mostWatchedSeries", "Most-Watched Films": "mostWatchedFilms", "Fresh Drops": "freshDrops", "On-Air Series": "ongoing", "New Anime Arrivals": "latest", "Just In: Cartoon Series": "popularSeries", "Latest Anime Movies": "movies", "Fresh Cartoon Films": "popularFilms", "Latest Episodes": "latestEpisodes" };
   
-  // Simple text-splitting approach: finds the exact heading text and splits the HTML
   const indices = [];
   for (const h of headings) {
-    const idx = cleanHtml.indexOf(h);
+    // Case-insensitive search for the heading text
+    const idx = cleanHtml.toLowerCase().indexOf(h.toLowerCase());
     if (idx !== -1) indices.push({ heading: h, index: idx + h.length });
   }
   indices.sort((a, b) => a.index - b.index);
@@ -84,11 +99,18 @@ export function extractHomeSections(html) {
 }
 
 export function extractPostData(html) {
-  // Permissive matching for WP post ID and nonce across classes, data attributes, and scripts
-  const postMatch = html.match(/postid-(\d+)/i) || html.match(/data-(?:post|id)="(\d+)"/i);
+  // Extremely permissive matching for WP post ID
+  const postMatch = html.match(/postid-(\d+)/i) || 
+                    html.match(/post-(\d+)/i) || 
+                    html.match(/data-(?:post|id)="(\d+)"/i) ||
+                    html.match(/"id":(\d+)/i);
+                    
+  // Permissive matching for nonce
   const nonceMatch = html.match(/["']nonce["']\s*:\s*["']([a-z0-9]+)["']/i) || 
                      html.match(/nonce\s*=\s*["']([a-z0-9]+)["']/i) ||
-                     html.match(/_wpnonce["'][^"']*["']([a-z0-9]+)/i);
+                     html.match(/_wpnonce["'][^"']*["']([a-z0-9]+)/i) ||
+                     html.match(/security["']\s*:\s*["']([a-z0-9]+)["']/i);
+                     
   return { postId: postMatch ? postMatch[1] : null, nonce: nonceMatch ? nonceMatch[1] : null };
 }
 
@@ -105,15 +127,13 @@ export function extractPoster(html) {
     let src = srcMatch[1];
     if (src.startsWith("data:") || /wp-content\/uploads\/.*(AnimeSalt|cropped-|icon\.png|logo\.png|favicon)/i.test(src)) continue;
     if (/image\.tmdb\.org\/t\/p\/(w154|w185|w342|w500)/i.test(src)) {
-      if (src.startsWith("//")) src = "https:" + src;
-      lastPortrait = src;
+      lastPortrait = normalizeUrl(src);
     }
   }
   return lastPortrait;
 }
 
 export function extractBackdrop(html) {
-  // Looks for landscape TMDB URLs in inline JSON, CSS backgrounds, or srcset
   const landscapeRegex = /(?:url\(|src=|srcset=|["'])(https?:\/\/image\.tmdb\.org\/t\/p\/(?:w780|w1280|w1920|original)\/[^"'\s)]+)/gi;
   let match;
   while ((match = landscapeRegex.exec(html)) !== null) {
