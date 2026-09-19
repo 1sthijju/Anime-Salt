@@ -1,4 +1,4 @@
-export async function decryptAsCdn26(embedUrl) {
+export async function resolveAsCdn26(embedUrl) {
   const res = await fetch(embedUrl, {
     headers: {
       "Referer": "https://as-cdn26.top/",
@@ -21,7 +21,7 @@ export async function decryptAsCdn26(embedUrl) {
   return { embedUrl, host: "as-cdn26.top", isIframe: true };
 }
 
-export async function decryptAbyss(embedUrl) {
+export async function resolveAbyss(embedUrl) {
   const res = await fetch(embedUrl);
   const html = await res.text();
   
@@ -33,4 +33,10 @@ export async function decryptAbyss(embedUrl) {
   if (mp4Match) return { direct_url: mp4Match[1], host: "abyss" };
   
   return { embedUrl, host: "abyss", isIframe: true };
+}
+
+export function normalizeAbyssUrl(url) {
+  if (!url) return "";
+  if (url.startsWith("//")) return "https:" + url;
+  return url;
 }
