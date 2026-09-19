@@ -73,12 +73,11 @@ function pickStreamFromJson(json) {
 }
 
 // ---------------------------------------------------------------------------
-// Extract referer from a URL (for subtitle CDN matching)
+// Get the origin referer for a URL (CDN just checks origin matches)
 // ---------------------------------------------------------------------------
-function getRefererForUrl(url) {
+function getOriginReferer(url) {
   try {
-    const u = new URL(url);
-    return u.origin + "/";
+    return new URL(url).origin + "/";
   } catch {
     return "";
   }
@@ -106,39 +105,33 @@ export async function resolveAsCdn26(embedUrl) {
     const cookies = playerRes.headers.get('set-cookie') || '';
     const playerHtml = await playerRes.text();
 
-    // Step 2: Extract subtitles with robust regex
+    // Step 2: Extract subtitles — use the subtitle URL's own origin as referer
+    // (the CDN just needs origin match, not the full player page URL)
     const subtitles = [];
     const pushSub = (label, url) => {
       if (!url || url.startsWith("data:")) return;
+      url = url.replace(/\\\//g, "/");   // unescape JSON slashes
       if (url.startsWith("//")) url = "https:" + url;
-      // Deduplicate by URL
       if (!subtitles.some(s => s.url === url)) {
-        subtitles.push({ 
-          label: label || "Sub", 
+        subtitles.push({
+          label: label || "Sub",
           url,
-          referer: getRefererForUrl(url)  // Use the CDN where subtitle lives
+          referer: getOriginReferer(url),   // match the CDN hosting the file
         });
       }
     };
 
-    // Try to extract from playerjsSubtitle var
     const subVarMatch = playerHtml.match(/var\s+playerjsSubtitle\s*=\s*["']([^"']*)["']/i);
     if (subVarMatch) {
-      const raw = subVarMatch[1];
-      
-      // Pattern 1: [Label]https://... or [Label] https://...
+      const raw = subVarMatch[1].replace(/\\\//g, "/");
+      // Pattern: [Label]https://... or [Label] https://...
       const pairRe = /\[([^\]]+)\]\s*(https?:\/\/[^"'\s,;]+)/g;
-      let pm;
-      let found = 0;
+      let pm, found = 0;
       while ((pm = pairRe.exec(raw)) !== null) {
         pushSub(pm[1].trim(), pm[2].trim());
         found++;
       }
-      
-      // Pattern 2: Just a raw URL without label
-      if (!found && raw.trim().startsWith("http")) {
-        pushSub("Default", raw.trim());
-      }
+      if (!found && raw.trim().startsWith("http")) pushSub("Default", raw.trim());
     }
 
     // Step 3: Call API to get stream URL
@@ -166,13 +159,13 @@ export async function resolveAsCdn26(embedUrl) {
         if (Array.isArray(jdata.tracks)) {
           for (const t of jdata.tracks) {
             if (t && (t.kind === "captions" || t.kind === "subtitles") && t.file) {
-              pushSub(t.label || t.language || "Sub", t.file);
+              pushSub(t.label || t.language || "Sub", String(t.file));
             }
           }
         }
         if (Array.isArray(jdata.subtitles)) {
           for (const t of jdata.subtitles) {
-            pushSub(t.label || t.language || "Sub", t.file || t.url);
+            pushSub(t.label || t.language || "Sub", String(t.file || t.url));
           }
         }
         
