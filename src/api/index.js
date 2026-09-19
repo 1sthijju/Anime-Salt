@@ -83,7 +83,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.26.0",
+          version: "3.27.0",
           endpoints: {
             system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings", "/api/debug/poster"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
@@ -117,7 +117,7 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.26.0-edge",
+          version: "3.27.0-edge",
           endpointsCount: 31
         });
       }
@@ -481,7 +481,7 @@ export default {
       }
 
       // ====================================================================
-      // Anime / movie details — v3.26.0 (Complete Page Parity)
+      // Anime / movie details — v3.27.0 (Structure-Corrected Build)
       // ====================================================================
       if (path === "/api/info") {
         const animeId = params.get("id") || params.get("slug");
@@ -686,42 +686,30 @@ export default {
           }
         }
 
-        // Seasons / episodes
+        // ---------------- SEASONS / EPISODES (STRUCTURE-CORRECTED) ----------------
         let seasons = [], totalEpisodes = 0;
         if (type === "series") {
-          try { 
+          try {
             const epData = await getEpisodesData(animeId, "all");
             
-            // Handle the actual response structure from episodes.js
-            const availableSeasons = epData.availableSeasons || [];
+            // episodes.js returns: { seasons: [...], episodes: [...], failedSeasons: [...] }
+            seasons = epData.seasons || [];
             
-            // Build seasons array from availableSeasons
-            if (availableSeasons.length > 0) {
-              seasons = availableSeasons.map(seasonNum => {
-                const seasonEpisodes = epData.groupedEpisodes?.[seasonNum] || [];
-                const firstEp = seasonEpisodes[0];
-                const lastEp = seasonEpisodes[seasonEpisodes.length - 1];
-                const count = seasonEpisodes.length;
-                
-                let title = `Season ${seasonNum}`;
-                if (firstEp && lastEp) {
-                  title += ` • ${firstEp.num}-${lastEp.num} (${count})`;
-                } else {
-                  title += ` (${count})`;
-                }
-                
-                return { num: seasonNum, title, value: String(seasonNum) };
-              });
-              
-              totalEpisodes = seasons.reduce((sum, s) => {
-                const countMatch = s.title.match(/\((\d+)\)/);
-                return sum + (countMatch ? parseInt(countMatch[1]) : 0);
-              }, 0);
+            // Group flat episodes array by season
+            const groupedEpisodes = {};
+            for (const ep of (epData.episodes || [])) {
+              if (!groupedEpisodes[ep.season]) groupedEpisodes[ep.season] = [];
+              groupedEpisodes[ep.season].push(ep);
             }
             
-            // Fallback: use totalEpisodes from response
-            if (!totalEpisodes && epData.totalEpisodes) {
-              totalEpisodes = epData.totalEpisodes;
+            // Calculate totalEpisodes from seasons metadata or sum of episodes
+            if (seasons.length > 0) {
+              totalEpisodes = seasons.reduce((sum, s) => {
+                const countMatch = s.title.match(/\((\d+)\)/);
+                return sum + (countMatch ? parseInt(countMatch[1], 10) : 0);
+              }, 0);
+            } else {
+              totalEpisodes = epData.episodes.length;
             }
             
             // Heuristic: 100+ episodes = ongoing (if status still unknown)
@@ -732,18 +720,28 @@ export default {
             console.error(`Episodes fetch failed for ${animeId}:`, e.message);
           }
           
-          // Last resort: extract from text chip
+          // Fallback: extract from text chips
           if (!totalEpisodes) {
             const epChip = textOnly.match(/(\d+)\s*Episodes/i);
-            if (epChip) totalEpisodes = parseInt(epChip[1]);
+            if (epChip) totalEpisodes = parseInt(epChip[1], 10);
           }
           
-          // Final heuristic: if we got 100+ episodes from text chip, assume ongoing
+          if (!seasons.length) {
+            const sChip = textOnly.match(/(\d+)\s*Seasons/i);
+            if (sChip) {
+              const n = parseInt(sChip[1], 10);
+              seasons = Array.from({ length: n }, (_, i) => ({
+                num: i + 1, title: `Season ${i + 1}`, value: String(i + 1)
+              }));
+            }
+          }
+          
+          // Final heuristic
           if (status === "Unknown" && totalEpisodes >= 100) {
             status = "Ongoing";
           }
-        } else { 
-          totalEpisodes = 1; 
+        } else {
+          totalEpisodes = 1;
         }
 
         return jsonResponse({ 
