@@ -22,6 +22,9 @@ function hexToBytes(hex) {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// AES Blob decryption (for players that hide config in encrypted JSON)
+// ---------------------------------------------------------------------------
 async function tryDecryptConfig(html) {
   const blobMatch =
     html.match(/(?:var|const|let)\s+\w*(?:encrypted|cipher|data|config)\w*\s*=\s*["']([A-Za-z0-9+\/=_-]{64,})["']/i) ||
@@ -70,6 +73,18 @@ function pickStreamFromJson(json) {
 }
 
 // ---------------------------------------------------------------------------
+// Extract referer from a URL (for subtitle CDN matching)
+// ---------------------------------------------------------------------------
+function getRefererForUrl(url) {
+  try {
+    const u = new URL(url);
+    return u.origin + "/";
+  } catch {
+    return "";
+  }
+}
+
+// ---------------------------------------------------------------------------
 // as-cdn26.top Decryptor (API-based + fallback to packed JS)
 // ---------------------------------------------------------------------------
 export async function resolveAsCdn26(embedUrl) {
@@ -91,15 +106,38 @@ export async function resolveAsCdn26(embedUrl) {
     const cookies = playerRes.headers.get('set-cookie') || '';
     const playerHtml = await playerRes.text();
 
-    // Step 2: Extract subtitles from player HTML
+    // Step 2: Extract subtitles with robust regex
     const subtitles = [];
-    const subMatch = playerHtml.match(/var\s+playerjsSubtitle\s*=\s*"(.*?)";/i);
-    if (subMatch) {
-      const rawSub = subMatch[1];
-      const subRegex = /\[([^\]]+)\](https?:\/\/[^"'\s,;]+)/g;
-      let sm;
-      while ((sm = subRegex.exec(rawSub)) !== null) {
-        subtitles.push({ label: sm[1], url: sm[2] });
+    const pushSub = (label, url) => {
+      if (!url || url.startsWith("data:")) return;
+      if (url.startsWith("//")) url = "https:" + url;
+      // Deduplicate by URL
+      if (!subtitles.some(s => s.url === url)) {
+        subtitles.push({ 
+          label: label || "Sub", 
+          url,
+          referer: getRefererForUrl(url)  // Use the CDN where subtitle lives
+        });
+      }
+    };
+
+    // Try to extract from playerjsSubtitle var
+    const subVarMatch = playerHtml.match(/var\s+playerjsSubtitle\s*=\s*["']([^"']*)["']/i);
+    if (subVarMatch) {
+      const raw = subVarMatch[1];
+      
+      // Pattern 1: [Label]https://... or [Label] https://...
+      const pairRe = /\[([^\]]+)\]\s*(https?:\/\/[^"'\s,;]+)/g;
+      let pm;
+      let found = 0;
+      while ((pm = pairRe.exec(raw)) !== null) {
+        pushSub(pm[1].trim(), pm[2].trim());
+        found++;
+      }
+      
+      // Pattern 2: Just a raw URL without label
+      if (!found && raw.trim().startsWith("http")) {
+        pushSub("Default", raw.trim());
       }
     }
 
@@ -123,6 +161,20 @@ export async function resolveAsCdn26(embedUrl) {
     if (apiRes.ok) {
       try {
         const jdata = await apiRes.json();
+        
+        // Extract subtitles/tracks from API JSON
+        if (Array.isArray(jdata.tracks)) {
+          for (const t of jdata.tracks) {
+            if (t && (t.kind === "captions" || t.kind === "subtitles") && t.file) {
+              pushSub(t.label || t.language || "Sub", t.file);
+            }
+          }
+        }
+        if (Array.isArray(jdata.subtitles)) {
+          for (const t of jdata.subtitles) {
+            pushSub(t.label || t.language || "Sub", t.file || t.url);
+          }
+        }
         
         // The API returns the decrypted URL directly
         if (jdata.videoSource || jdata.securedLink) {
