@@ -1,581 +1,591 @@
 // ==========================================================================
-// AnimeSalt Cloudflare Worker — main entrypoint (v3.38.0)
-// Modular /home, semaphore-gated concurrency, stale-while-revalidate cache
+// AnimeSalt Cloudflare Worker — SINGLE FILE (v3.39.0)
+// Everything inlined: no imports needed, guaranteed to build
 // ==========================================================================
 
-import { resolveAsCdn26, resolveAbyss } from "./api/decryptors.js";
-import { handleMediaProxy } from "./api/media-proxy.js";
-import { getEpisodesData } from "./api/episodes.js";
-import { CHROME_HEADERS, UPSTREAM, corsHeaders } from "./api/config.js";
-
 // --------------------------------------------------------------------------
-// Constants
+// Config
 // --------------------------------------------------------------------------
-const CACHE_TTL = {
-  hero:      60 * 60,       // 1 hour
-  section:   30 * 60,       // 30 min
-  catalog:   6 * 3600,      // 6 hours
-  info:      30 * 60,       // 30 min
-  episodes:  30 * 60,       // 30 min
-  servers:   5 * 60,        // 5 min (tokens expire faster)
-  taxonomy:  24 * 3600,     // 24 hours
-  random:    10 * 60,       // 10 min
-  health:    5 * 60,        // 5 min
-  stream:    0,             // never cache (tokenized)
+const UPSTREAM = "https://animesalt-proxy.v1nx.workers.dev";
+const CHROME_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+};
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Max-Age": "86400",
 };
 
 // --------------------------------------------------------------------------
-// Semaphore — caps concurrent upstream fetches to avoid CPU spikes
+// Semaphore — cap parallel upstream fetches
 // --------------------------------------------------------------------------
 function semaphore(max) {
-  let active = 0;
-  const queue = [];
-  return function gate(fn) {
-    return new Promise((resolve, reject) => {
-      const run = async () => {
-        active++;
-        try { resolve(await fn()); }
-        catch (e) { reject(e); }
-        finally {
-          active--;
-          if (queue.length) queue.shift()();
-        }
-      };
-      if (active < max) run();
-      else queue.push(run);
-    });
-  };
+  let active = 0, queue = [];
+  return (fn) => new Promise((resolve, reject) => {
+    const run = async () => {
+      active++;
+      try { resolve(await fn()); } catch (e) { reject(e); }
+      finally { active--; if (queue.length) queue.shift()(); }
+    };
+    active < max ? run() : queue.push(run);
+  });
 }
-const upstreamGate = semaphore(6);  // max 6 parallel upstream fetches per request
+const gate = semaphore(6);
 
 // --------------------------------------------------------------------------
-// Upstream fetch helper — timeout + retry + semaphore-gated
+// Fetch helpers
 // --------------------------------------------------------------------------
-async function fetchUpstream(path, { timeoutMs = 8000, retries = 2 } = {}) {
+async function fetchUpstream(path, opts = {}) {
   const url = UPSTREAM + path;
-  const headers = {
-    ...CHROME_HEADERS,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-  };
-
+  const { timeoutMs = 10000, retries = 2 } = opts;
   let lastErr;
-  for (let attempt = 0; attempt <= retries; attempt++) {
+  for (let i = 0; i <= retries; i++) {
     try {
-      const controller = new AbortController();
-      const t = setTimeout(() => controller.abort(), timeoutMs);
-      const res = await upstreamGate(() =>
-        fetch(url, { headers, redirect: "follow", signal: controller.signal })
-      );
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), timeoutMs);
+      const res = await gate(() => fetch(url, { headers: CHROME_HEADERS, redirect: "follow", signal: ctrl.signal }));
       clearTimeout(t);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.text();
     } catch (e) {
       lastErr = e;
-      if (attempt < retries) await new Promise(r => setTimeout(r, 400 * (attempt + 1)));
+      if (i < retries) await new Promise(r => setTimeout(r, 400 * (i + 1)));
     }
   }
   throw lastErr || new Error("Upstream unreachable");
 }
 
 // --------------------------------------------------------------------------
-// JSON response helpers
+// JSON helpers
 // --------------------------------------------------------------------------
-function json(body, status = 200, extraHeaders = {}) {
+function json(body, status = 200, extra = {}) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: {
-      "Content-Type": "application/json",
-      "Cache-Control": "public, s-maxage=60",
-      "Access-Control-Allow-Origin": "*",
-      ...extraHeaders,
-    },
+    headers: { "Content-Type": "application/json", "Cache-Control": "public, s-maxage=60", "Access-Control-Allow-Origin": "*", ...extra },
   });
 }
-function jsonSuccess(data, extraHeaders = {}) {
-  return json({ success: true, data }, 200, extraHeaders);
-}
-function jsonError(message, status = 500) {
-  return json({ success: false, error: message }, status);
-}
+const jsonSuccess = (data, extra = {}) => json({ success: true, data }, 200, extra);
+const jsonError = (msg, status = 500) => json({ success: false, error: msg }, status);
 
 // --------------------------------------------------------------------------
-// KV/Cache wrapper with stale-while-revalidate
+// Cache wrapper (stale-while-revalidate)
 // --------------------------------------------------------------------------
-async function cached(key, ttlSeconds, compute, ctx) {
+async function cached(key, ttl, compute, ctx) {
   const cache = caches.default;
   const url = new URL(`https://__cache/${encodeURIComponent(key)}`);
   let res = await cache.match(url);
-
   if (res) {
-    // Return stale hit immediately; refresh in background
-    if (ctx && ctx.waitUntil) {
-      ctx.waitUntil(refreshInBackground(url, key, ttlSeconds, compute));
-    }
+    if (ctx && ctx.waitUntil) ctx.waitUntil((async () => {
+      try {
+        const body = await compute();
+        const payload = typeof body === "string" ? body : JSON.stringify(body);
+        await cache.put(url, new Response(payload, {
+          headers: { "Content-Type": "application/json", "Cache-Control": `public, s-maxage=${ttl}, stale-while-revalidate=${ttl * 4}`, "Access-Control-Allow-Origin": "*" },
+        }));
+      } catch {}
+    })());
     return res;
   }
-
-  // Cache miss: compute, cache, return
   const body = await compute();
   const payload = typeof body === "string" ? body : JSON.stringify(body);
   res = new Response(payload, {
-    headers: {
-      "Content-Type": typeof body === "string" ? "text/plain; charset=utf-8" : "application/json",
-      "Cache-Control": `public, s-maxage=${ttlSeconds}, stale-while-revalidate=${ttlSeconds * 4}`,
-      "Access-Control-Allow-Origin": "*",
-    },
+    headers: { "Content-Type": "application/json", "Cache-Control": `public, s-maxage=${ttl}, stale-while-revalidate=${ttl * 4}`, "Access-Control-Allow-Origin": "*" },
   });
-  try { await cache.put(url, res.clone()); } catch { /* ignore quota errors */ }
+  try { await cache.put(url, res.clone()); } catch {}
   return res;
 }
 
-async function refreshInBackground(url, key, ttlSeconds, compute) {
-  try {
-    const body = await compute();
-    const payload = typeof body === "string" ? body : JSON.stringify(body);
-    const res = new Response(payload, {
-      headers: {
-        "Content-Type": typeof body === "string" ? "text/plain; charset=utf-8" : "application/json",
-        "Cache-Control": `public, s-maxage=${ttlSeconds}, stale-while-revalidate=${ttlSeconds * 4}`,
-        "Access-Control-Allow-Origin": "*",
-      },
+// ==========================================================================
+// PARSERS — extract structured data from upstream HTML
+// ==========================================================================
+function parseCatalogItems(html) {
+  const out = [];
+  // Pattern: article.card or div.item inside main listings
+  const regex = /<article[^>]*>[\s\S]*?<a[^>]+href="(https:\/\/animesalt\.cx\/(series|movies|episode)\/([^"\/]+)\/?)"[\s\S]*?<img[^>]+src="([^"]+)"[\s\S]*?(?:<h[23][^>]*>([^<]+)<\/h[23]>|alt="([^"]+)")[\s\S]*?<\/article>/gi;
+  let m;
+  while ((m = regex.exec(html)) !== null) {
+    const [, url, kind, slug, img, title1, title2] = m;
+    const title = (title1 || title2 || "").replace(/<[^>]+>/g, "").replace(/^Image\s+/i, "").trim();
+    if (!slug || !title) continue;
+    out.push({
+      id: slug,
+      title,
+      image: img,
+      type: kind === "series" ? "series" : kind === "movies" ? "movie" : "episode",
+      url,
     });
-    const cache = caches.default;
-    await cache.put(url, res);
-  } catch (e) {
-    console.error("Background refresh failed for", key, e.message);
   }
+  // Dedupe by id
+  const seen = new Set();
+  return out.filter(it => { if (seen.has(it.id)) return false; seen.add(it.id); return true; });
 }
 
-// --------------------------------------------------------------------------
-// /api/health
-// --------------------------------------------------------------------------
-async function handleHealth(ctx) {
-  return cached("health", CACHE_TTL.health, async () => {
-    const start = Date.now();
-    let online = false;
-    let error = null;
-    try {
-      const res = await fetch(UPSTREAM + "/", { headers: CHROME_HEADERS, cf: { cacheTtl: 0 } });
-      online = res.ok || res.status < 500;
-    } catch (e) { error = e.message; }
-    return {
-      success: true,
-      status: online ? "healthy" : "degraded",
-      timestamp: new Date().toISOString(),
-      upstream: {
-        source: UPSTREAM,
-        online,
-        latencyMs: Date.now() - start,
-        error,
-      },
-      version: "3.38.0-modular",
-      endpointsCount: 33,
-    };
-  }, ctx);
+function parseFeatured(html) {
+  const items = [];
+  const re = /<div[^>]*class="[^"]*(?:hero|featured|slider|spotlight)[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>\s*<\/section>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const block = m[1];
+    const urlM = block.match(/href="(https:\/\/animesalt\.cx\/(series|movies)\/([^"\/]+)\/?)"/);
+    const imgM = block.match(/<img[^>]+src="([^"]+)"/);
+    const tiM = block.match(/<(?:h[123]|p)[^>]*>([^<]{3,100})<\/(?:h[123]|p)>/);
+    if (urlM && tiM) {
+      items.push({
+        id: urlM[3], title: tiM[1].replace(/^Image\s+/i, "").trim(), image: imgM ? imgM[1] : "",
+        type: urlM[2] === "series" ? "series" : "movie", url: urlM[1],
+      });
+    }
+  }
+  return items.length ? items : parseCatalogItems(html).slice(0, 6);
 }
 
-// --------------------------------------------------------------------------
-// /api/home/hero — lightweight critical path
-// --------------------------------------------------------------------------
-async function handleHomeHero(ctx) {
-  return cached("home:hero", CACHE_TTL.hero, async () => {
-    const html = await fetchUpstream("/");
-    const featured = parseFeatured(html).slice(0, 6);
-    const ticker = parseLatest(html).slice(0, 14).map(it => ({
-      title: it.title,
-      sub: it.epLabel || it.sub || "new drop",
+function parseLatest(html) { return parseCatalogItems(html).slice(0, 24); }
+
+function parseRandomItem(html) {
+  const items = parseCatalogItems(html);
+  return items.length ? items[Math.floor(Math.random() * items.length)] : null;
+}
+
+function parseInfoPage(html, id) {
+  const titleM = html.match(/<h1[^>]*class="[^"]*title[^"]*"[^>]*>([^<]+)<\/h1>/i) || html.match(/<h1[^>]*>([^<]+)<\/h1>/i);
+  const posterM = html.match(/<div[^>]*class="[^"]*poster[^"]*"[^>]*>[\s\S]*?<img[^>]+src="([^"]+)"/i);
+  const descM = html.match(/<div[^>]*class="[^"]*(?:description|wp-content)[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+  const meta = {};
+  const metaPairs = [...html.matchAll(/<span[^>]*class="[^"]*(?:meta|info|label)[^"]*"[^>]*>([^<]+)<\/span>[\s\S]*?<span[^>]*>([^<]+)<\/span>/gi)];
+  metaPairs.forEach(([, k, v]) => { meta[(k || "").trim().toLowerCase()] = (v || "").trim(); });
+
+  const genres = [...html.matchAll(/<a[^>]+href="[^"]*\/category\/genre\/([^"\/]+)[^"]*"[^>]*>([^<]+)<\/a>/gi)].map(m => ({ slug: m[1], name: m[2].trim() }));
+  const languages = [...html.matchAll(/<a[^>]+href="[^"]*\/category\/language\/([^"\/]+)[^"]*"[^>]*>([^<]+)<\/a>/gi)].map(m => m[2].trim());
+  const seasonsRaw = [...html.matchAll(/<option[^>]+value="(\d+)"[^>]*>Season\s*(\d+)[\s\S]*?(\d+)\s*[-–]\s*(\d+)\s*\((\d+)\)/gi)];
+  const seasons = seasonsRaw.map(m => ({ num: +m[2], title: `Season ${m[2]} • ${m[3]}-${m[4]} (${m[5]})`, value: m[1] }));
+
+  return {
+    id,
+    title: (titleM ? titleM[1] : id).replace(/^Image\s+/i, "").trim(),
+    poster: posterM ? posterM[1] : "",
+    backdrop: "",
+    description: descM ? descM[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim() : "",
+    type: html.includes("/movies/") ? "movie" : "series",
+    totalEpisodes: seasons.reduce((sum, s) => sum + (parseInt(s.title.match(/\((\d+)\)/)?.[1] || 0, 10)), 0),
+    year: meta.year || "",
+    status: meta.status || "",
+    seasons,
+    genres: genres.map(g => g.name),
+    languages,
+    runtime: meta.runtime || meta.duration || "",
+    quickPlay: {
+      first: seasons[0] ? { season: seasons[0].num, episode: 1, slug: `${id}-${seasons[0].num}x1` } : null,
+      latestDub: seasons.length ? { season: seasons[seasons.length - 1].num, episode: 1, slug: `${id}-${seasons[seasons.length - 1].num}x1` } : null,
+      latestSub: null,
+    },
+  };
+}
+
+function parseServers(html, epSlug) {
+  const servers = [];
+  const re = /<li[^>]*data-id="(\d+)"[^>]*>[\s\S]*?<a[^>]+href="([^"]+)"[^>]*>[\s\S]*?<span[^>]*>([^<]+)<\/span>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const [_, idxStr, embedUrl, name] = m;
+    const index = parseInt(idxStr, 10);
+    const isMultiLang = /multi-lang/i.test(name) || /multi-lang/i.test(embedUrl);
+    servers.push({
+      index,
+      serverName: name.trim().replace(/^Image\s+/i, ""),
+      embedUrl,
+      isMultiLang,
+      languages: [],
+    });
+  }
+  // If regex missed them, try simpler pattern
+  if (!servers.length) {
+    const simple = [...html.matchAll(/href="(https:\/\/(?:as-cdn|animesalt|short\.icu)[^"]+)"[^>]*>([^<]{3,60})<\/a/gi)];
+    simple.forEach(([_, url, name], i) => servers.push({
+      index: i,
+      serverName: name.trim().replace(/^Image\s+/i, ""),
+      embedUrl: url,
+      isMultiLang: false,
+      languages: [],
     }));
-    return { featured, tickerItems: ticker };
+  }
+  return servers;
+}
+
+function parseTaxonomy(html) {
+  const parse = (pattern) => [...html.matchAll(pattern)].map(m => ({ slug: m[1], name: m[2].trim(), url: m.input ? `https://animesalt.cx/category/${m[0].match(/href="([^"]+)"/)?.[1] || ""}` : "" }));
+  return {
+    genres: parse(/<a[^>]+href="[^"]*\/category\/genre\/([^"\/]+)[^"]*"[^>]*>([^<]+)<\/a>/gi),
+    languages: parse(/<a[^>]+href="[^"]*\/category\/language\/([^"\/]+)[^"]*"[^>]*>([^<]+)<\/a>/gi),
+    types: parse(/<a[^>]+href="[^"]*\/category\/type\/([^"\/]+)[^"]*"[^>]*>([^<]+)<\/a>/gi),
+    statuses: parse(/<a[^>]+href="[^"]*\/category\/status\/([^"\/]+)[^"]*"[^>]*>([^<]+)<\/a>/gi),
+    networks: parse(/<a[^>]+href="[^"]*\/category\/network\/([^"\/]+)[^"]*"[^>]*>([^<]+)<\/a>/gi),
+    franchises: parse(/<a[^>]+href="[^"]*\/category\/franchise\/([^"\/]+)[^"]*"[^>]*>([^<]+)<\/a>/gi),
+    topLevel: parse(/<a[^>]+href="https:\/\/animesalt\.cx\/category\/([^"\/]+)\/"[^>]*>([^<]+)<\/a>/gi).filter(t => !["genre", "language", "type", "status", "network", "franchise"].includes(t.slug)),
+  };
+}
+
+// ==========================================================================
+// DECRYPTORS
+// ==========================================================================
+async function resolveAsCdn26(embedUrl) {
+  try {
+    const idMatch = embedUrl.match(/\/video\/([a-f0-9]+)/);
+    if (!idMatch) return { embedUrl, isIframe: true };
+    const videoId = idMatch[1];
+    const playerRes = await fetch(embedUrl, { headers: { ...CHROME_HEADERS, Referer: "https://as-cdn26.top/" } });
+    const cookies = playerRes.headers.get("set-cookie") || "";
+    const playerHtml = await playerRes.text();
+
+    const subtitles = [];
+    const pushSub = (label, url) => {
+      if (!url) return;
+      url = url.replace(/\\\//g, "/");
+      if (url.startsWith("//")) url = "https:" + url;
+      try {
+        subtitles.push({ label: label || "Sub", url, referer: new URL(url).origin + "/" });
+      } catch {}
+    };
+    const subVar = playerHtml.match(/var\s+playerjsSubtitle\s*=\s*["']([^"']*)["']/i);
+    if (subVar) {
+      const raw = subVar[1].replace(/\\\//g, "/");
+      const re = /\[([^\]]+)\]\s*(https?:\/\/[^"'\s,;]+)/g;
+      let pm;
+      while ((pm = re.exec(raw)) !== null) pushSub(pm[1].trim(), pm[2].trim());
+    }
+
+    const apiUrl = `https://as-cdn26.top/player/index.php?data=${videoId}&do=getVideo`;
+    const apiRes = await fetch(apiUrl, {
+      method: "POST",
+      headers: { ...CHROME_HEADERS, "Content-Type": "application/x-www-form-urlencoded", "X-Requested-With": "XMLHttpRequest", Referer: embedUrl, Cookie: cookies },
+      body: `hash=${videoId}&r=`,
+    });
+    if (apiRes.ok) {
+      try {
+        const j = await apiRes.json();
+        (j.tracks || []).forEach(t => (t.kind === "captions" || t.kind === "subtitles") && t.file && pushSub(t.label || t.language, t.file));
+        (j.subtitles || []).forEach(t => t.file && pushSub(t.label, t.file));
+        if (j.videoSource || j.securedLink) {
+          return { direct_hls: j.videoSource || j.securedLink, qualities: [], subtitles, poster: j.videoImage || null, isIframe: false };
+        }
+      } catch {}
+    }
+    const m3u8 = playerHtml.match(/(https?:\/\/[^"'\s<>\\]+\.m3u8[^"'\s<>\\]*)/i);
+    if (m3u8) return { direct_hls: m3u8[1], qualities: [], subtitles, isIframe: false };
+    return { embedUrl, isIframe: true };
+  } catch { return { embedUrl, isIframe: true }; }
+}
+
+async function resolveAbyss(embedUrl) {
+  try {
+    const res = await fetch(embedUrl, { headers: CHROME_HEADERS, redirect: "follow" });
+    if (!res.ok) return { embedUrl, isIframe: true };
+    const html = await res.text();
+    const m3u8 = html.match(/(https?:\/\/[^"'\s<>\\]+\.m3u8[^"'\s<>\\]*)/i);
+    if (m3u8) return { direct_hls: m3u8[1], qualities: [], subtitles: [], isIframe: false };
+    return { embedUrl, isIframe: true };
+  } catch { return { embedUrl, isIframe: true }; }
+}
+
+// ==========================================================================
+// MEDIA PROXY
+// ==========================================================================
+function proxyMediaUrl(workerOrigin, url, params = {}) {
+  const u = new URL("/proxy/media", workerOrigin);
+  u.searchParams.set("url", url);
+  for (const [k, v] of Object.entries(params)) if (v) u.searchParams.set(k, v);
+  return u.toString();
+}
+
+async function handleMediaProxy(request) {
+  const url = new URL(request.url);
+  const targetUrl = url.searchParams.get("url");
+  let referer = url.searchParams.get("referer");
+  const forceType = url.searchParams.get("force");
+  const audioLang = url.searchParams.get("audio");
+  if (!targetUrl) return new Response("Missing url", { status: 400, headers: corsHeaders });
+  if (!referer) { try { referer = new URL(targetUrl).origin + "/"; } catch { referer = ""; } }
+
+  const candidates = [referer, "", targetUrl.match(/https?:\/\/[^/]+/)?.[0] + "/", "https://as-cdn26.top/"].filter(Boolean);
+  let res, lastStatus;
+  for (const r of candidates) {
+    const h = new Headers({ "User-Agent": CHROME_HEADERS["User-Agent"], "Accept": "*/*" });
+    if (r) { h.set("Referer", r); try { h.set("Origin", new URL(r).origin); } catch {} }
+    const rng = request.headers.get("Range");
+    if (rng) h.set("Range", rng);
+    try { res = await fetch(targetUrl, { headers: h, redirect: "follow" }); } catch { continue; }
+    if (res.ok) break;
+    lastStatus = res.status;
+    try { if (res.body) await res.body.cancel(); } catch {}
+    if (lastStatus !== 403 && lastStatus !== 404) break;
+  }
+  if (!res || !res.ok) {
+    if (forceType === "text/vtt") return new Response("WEBVTT\n\n", { headers: { "Content-Type": "text/vtt", "Access-Control-Allow-Origin": "*" } });
+    return new Response(`Upstream error: ${lastStatus || "unknown"}`, { status: 502, headers: corsHeaders });
+  }
+
+  const ct = (res.headers.get("Content-Type") || "").toLowerCase();
+  if (forceType === "text/vtt") {
+    const text = await res.text();
+    const isImage = /^\u00FF\u00D8\u00FF|\u0089PNG|GIF8|RIFF/.test(text);
+    if (isImage) return new Response("WEBVTT\n\n", { headers: { "Content-Type": "text/vtt", "Access-Control-Allow-Origin": "*" } });
+    const vtt = text.trimStart().startsWith("WEBVTT") ? text : "WEBVTT\n\n" + text.replace(/\r\n/g, "\n");
+    return new Response(vtt, { headers: { "Content-Type": "text/vtt", "Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=3600" } });
+  }
+
+  const reader = res.body.getReader();
+  const first = await reader.read();
+  const headText = first.value ? new TextDecoder().decode(first.value.subarray(0, 64)) : "";
+  if (!first.done && headText.trimStart().startsWith("#EXTM3U")) {
+    let text = new TextDecoder().decode(first.value);
+    while (true) { const r = await reader.read(); if (r.done) break; text += new TextDecoder().decode(r.value); }
+    const lines = text.split(/\r?\n/);
+    const out = lines.map(line => {
+      if (!line.startsWith("#")) { try { return proxyMediaUrl(url.origin, new URL(line.trim(), targetUrl).toString(), { referer }); } catch { return line; } }
+      return line.replace(/URI="([^"]+)"/g, (_, uri) => { try { return `URI="${proxyMediaUrl(url.origin, new URL(uri, targetUrl).toString(), { referer })}"`; } catch { return `URI="${uri}"`; } });
+    });
+    return new Response(out.join("\n"), { headers: { "Content-Type": "application/vnd.apple.mpegurl", "Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=60" } });
+  }
+  const stream = new ReadableStream({
+    async start(c) { if (first.value) c.enqueue(first.value); },
+    async pull(c) { const r = await reader.read(); r.done ? c.close() : c.enqueue(r.value); },
+  });
+  const rh = new Headers({ "Access-Control-Allow-Origin": "*", "Content-Type": ct || "application/octet-stream", "Cache-Control": "public, max-age=3600" });
+  ["Content-Range", "Content-Length"].forEach(h => res.headers.has(h) && rh.set(h, res.headers.get(h)));
+  return new Response(stream, { status: res.status, headers: rh });
+}
+
+// ==========================================================================
+// EPISODES (with season synthesis fallback)
+// ==========================================================================
+async function getEpisodesData(animeId, requestedSeason) {
+  const html = await fetchUpstream(`/series/${animeId}/`);
+  const postIdM = html.match(/postid-(\d+)/i) || html.match(/data-post="(\d+)"/i);
+  const postId = postIdM ? postIdM[1] : null;
+  const nonceM = html.match(/"nonce"\s*:\s*"([a-z0-9]+)"/i) || html.match(/ajax_nonce\s*=\s*"([a-z0-9]+)"/i);
+  const nonce = nonceM ? nonceM[1] : "";
+
+  const seasons = [];
+  const selectM = html.match(/<select[^>]*class="[^"]*sel-temp[^"]*"[^>]*>([\s\S]*?)<\/select>/i);
+  if (selectM) {
+    const re = /<option[^>]*value="([^"]*)"[^>]*>([\s\S]*?)<\/option>/gi;
+    let m;
+    while ((m = re.exec(selectM[1])) !== null) {
+      const sNum = parseInt((m[2].match(/Season\s*(\d+)/i) || m[1].match(/^(\d+)$/))?.[1], 10);
+      if (sNum > 0 && !seasons.find(s => s.num === sNum)) seasons.push({ num: sNum, title: m[2].replace(/<[^>]+>/g, "").trim(), value: m[1] });
+    }
+  }
+  if (!seasons.length) {
+    const re = /<(?:button|li|a)[^>]*data-season="(\d+)"[^>]*>([\s\S]*?)<\/(?:button|li|a)>/gi;
+    let m;
+    while ((m = re.exec(html)) !== null) {
+      const sNum = parseInt(m[1], 10);
+      if (sNum > 0 && !seasons.find(s => s.num === sNum)) seasons.push({ num: sNum, title: m[2].replace(/<[^>]+>/g, "").trim(), value: m[1] });
+    }
+  }
+
+  const targets = requestedSeason === "all" ? seasons : seasons.filter(s => s.num === requestedSeason);
+  const settled = await Promise.all(targets.map(async (s) => {
+    let eps = [];
+    try {
+      if (!postId) throw new Error("no post id");
+      const base = { action: "action_select_temp", temp: s.value || String(s.num), season: s.value || String(s.num), post: postId };
+      if (nonce) base.nonce = nonce;
+      const body = new URLSearchParams(base).toString();
+      const fragRes = await fetch(`${UPSTREAM}/wp-admin/admin-ajax.php`, {
+        method: "POST", headers: { ...CHROME_HEADERS, "Content-Type": "application/x-www-form-urlencoded", "X-Requested-With": "XMLHttpRequest" }, body,
+      });
+      const frag = await fragRes.text();
+      if (frag.includes("/episode/")) {
+        const re = /<a[^>]+href="(https:\/\/animesalt\.cx\/episode\/([^"\/]+)\/?)"[^>]*>[\s\S]*?(?:E(?:pisode)?\s*(\d+)|<h[23][^>]*>([^<]+)<\/h[23]>|alt="([^"]+)")/gi;
+        let m;
+        while ((m = re.exec(frag)) !== null) {
+          const num = parseInt(m[3], 10) || parseInt((m[4] || m[5]).match(/\d+/)?.[0], 10) || 0;
+          if (num > 0) eps.push({ num, season: s.num, title: `Episode ${num}`, slug: m[2], url: m[1], image: null, regionalDub: true });
+        }
+      }
+    } catch {}
+
+    if (!eps.length) {
+      const range = (s.title.match(/(\d+)\s*[-–]\s*(\d+)/));
+      if (range) {
+        for (let e = +range[1]; e <= +range[2]; e++) {
+          eps.push({ num: e, season: s.num, title: `Episode ${e}`, slug: `${animeId}-${s.num}x${e}`, url: `https://animesalt.cx/episode/${animeId}-${s.num}x${e}/`, image: postId ? `https://img.animesalt.cx/image/${postId}/${s.num}/${e}.webp` : null, regionalDub: true, synthesized: true });
+        }
+      }
+    }
+    return { num: s.num, eps, failed: !eps.length };
+  }));
+
+  const episodes = [];
+  const failedSeasons = [];
+  for (const r of settled) { r.eps.length ? episodes.push(...r.eps) : failedSeasons.push(r.num); }
+  episodes.sort((a, b) => a.season - b.season || a.num - b.num);
+  return { seasons, episodes, failedSeasons };
+}
+
+// ==========================================================================
+// ROUTE HANDLERS
+// ==========================================================================
+async function handleHealth(ctx) {
+  return cached("health", 300, async () => {
+    const start = Date.now();
+    let online = false, error = null;
+    try { const r = await fetch(UPSTREAM + "/", { headers: CHROME_HEADERS }); online = r.status < 500; } catch (e) { error = e.message; }
+    return { success: true, status: online ? "healthy" : "degraded", timestamp: new Date().toISOString(), upstream: { source: UPSTREAM, online, latencyMs: Date.now() - start, error }, version: "3.39.0-single" };
   }, ctx);
 }
 
-// --------------------------------------------------------------------------
-// /api/home/<section> — each section is independent
-// --------------------------------------------------------------------------
+async function handleHomeHero(ctx) {
+  return cached("home:hero", 3600, async () => {
+    const html = await fetchUpstream("/");
+    return { featured: parseFeatured(html).slice(0, 6), tickerItems: parseLatest(html).slice(0, 14).map(it => ({ title: it.title, sub: "new drop" })) };
+  }, ctx);
+}
+
 const SECTION_FETCHERS = {
-  "latest":                () => fetchCatalogSection("/latest"),
-  "most-watched-series":   () => fetchCatalogSection("/most-watched/series"),
-  "most-watched-films":    () => fetchCatalogSection("/most-watched/films"),
-  "fresh-drops":           () => fetchCatalogSection("/fresh-drops"),
-  "ongoing":               () => fetchCatalogSection("/status/ongoing"),
-  "completed":             () => fetchCatalogSection("/status/completed"),
-  "movies":                () => fetchCatalogSection("/movies"),
+  "latest": () => fetchUpstream("/").then(parseCatalogItems).then(d => d.slice(0, 24)),
+  "most-watched-series": () => fetchUpstream("/most-watched/").then(h => parseCatalogItems(h).filter(i => i.type === "series").slice(0, 24)),
+  "most-watched-films": () => fetchUpstream("/most-watched/").then(h => parseCatalogItems(h).filter(i => i.type === "movie").slice(0, 24)),
+  "fresh-drops": () => fetchUpstream("/fresh-drops/").then(parseCatalogItems),
+  "ongoing": () => fetchUpstream("/status/ongoing/").then(parseCatalogItems),
+  "completed": () => fetchUpstream("/status/completed/").then(parseCatalogItems),
+  "movies": () => fetchUpstream("/movies/").then(parseCatalogItems),
 };
 
 async function handleHomeSection(section, ctx) {
   const fetcher = SECTION_FETCHERS[section];
   if (!fetcher) return jsonError(`Unknown section: ${section}`, 404);
-
-  const key = `home:section:${section}`;
-  return cached(key, CACHE_TTL.section, async () => {
-    try {
-      return await fetcher();
-    } catch (e) {
-      // Return empty rather than 500 — client shows section-level error
-      console.warn(`section ${section} failed:`, e.message);
-      return [];
-    }
+  return cached(`home:section:${section}`, 1800, async () => {
+    try { return await fetcher(); } catch (e) { return []; }
   }, ctx);
 }
 
-async function fetchCatalogSection(path) {
-  const html = await fetchUpstream(path);
-  return parseCatalogItems(html);
-}
-
-// --------------------------------------------------------------------------
-// /api/random — lightweight, no full-catalog scan
-// --------------------------------------------------------------------------
 async function handleRandom(ctx) {
-  return cached("random", CACHE_TTL.random, async () => {
-    // Use upstream sitemap or /random endpoint — never fetch full catalog
-    try {
-      const html = await fetchUpstream("/random");
-      const item = parseRandomItem(html);
-      if (item && item.id) return item;
-    } catch {}
-    // Fallback: pick from cached catalog if available
-    const cache = caches.default;
-    const existing = await cache.match(new URL("https://__cache/home:section:movies"));
-    if (existing) {
-      try {
-        const j = await existing.json();
-        const items = Array.isArray(j) ? j : (j && j.data) || [];
-        if (items.length) return items[Math.floor(Math.random() * items.length)];
-      } catch {}
-    }
-    throw new Error("No random source available");
+  return cached("random", 600, async () => {
+    const html = await fetchUpstream("/");
+    const items = parseCatalogItems(html);
+    return items.length ? items[Math.floor(Math.random() * items.length)] : null;
   }, ctx);
 }
 
-// --------------------------------------------------------------------------
-// Catalog endpoints: /api/series, /api/movies, /api/anime, /api/cartoon,
-//                    /api/ongoing, /api/completed, /api/fresh-drops
-// --------------------------------------------------------------------------
 async function handleCatalog(kind, ctx, url) {
   const page = Number(url.searchParams.get("page") || 1);
-  const key = `cat:${kind}:p${page}`;
-  return cached(key, CACHE_TTL.catalog, async () => {
-    try {
-      const html = await fetchUpstream(`/${kind}?page=${page}`);
-      return { page, data: parseCatalogItems(html) };
-    } catch (e) {
-      return { page, data: [], error: e.message };
-    }
+  return cached(`cat:${kind}:p${page}`, 21600, async () => {
+    try { return { page, data: parseCatalogItems(await fetchUpstream(`/${kind}/${page > 1 ? `page/${page}/` : ""}`)) }; }
+    catch (e) { return { page, data: [], error: e.message }; }
   }, ctx);
 }
 
-// --------------------------------------------------------------------------
-// Taxonomy endpoints: /api/genre/<slug>, /api/language/<slug>, etc.
-// --------------------------------------------------------------------------
-const TAXONOMY_KINDS = ["genre", "language", "country", "type", "year", "network", "franchise", "status"];
 async function handleTaxonomy(kind, slug, ctx, url) {
   const page = Number(url.searchParams.get("page") || 1);
-  const key = `tax:${kind}:${slug}:p${page}`;
-  return cached(key, CACHE_TTL.taxonomy, async () => {
-    try {
-      const html = await fetchUpstream(`/category/${kind}/${slug}?page=${page}`);
-      return { page, [kind]: slug, data: parseCatalogItems(html) };
-    } catch (e) {
-      return { page, [kind]: slug, data: [], error: e.message };
-    }
+  return cached(`tax:${kind}:${slug}:p${page}`, 86400, async () => {
+    try { return { page, [kind]: slug, data: parseCatalogItems(await fetchUpstream(`/category/${kind}/${slug}/${page > 1 ? `page/${page}/` : ""}`)) }; }
+    catch (e) { return { page, [kind]: slug, data: [], error: e.message }; }
   }, ctx);
 }
 
-// --------------------------------------------------------------------------
-// /api/search?keyword=<kw>&page=<n>
-// --------------------------------------------------------------------------
 async function handleSearch(ctx, url) {
   const keyword = url.searchParams.get("keyword");
   const page = Number(url.searchParams.get("page") || 1);
   if (!keyword) return jsonError("Missing keyword", 400);
-  const key = `search:${keyword.toLowerCase()}:p${page}`;
-  return cached(key, CACHE_TTL.catalog, async () => {
-    const html = await fetchUpstream(`/?s=${encodeURIComponent(keyword)}&page=${page}`);
-    return { page, data: parseCatalogItems(html) };
+  return cached(`search:${keyword.toLowerCase()}:p${page}`, 300, async () => {
+    return { page, data: parseCatalogItems(await fetchUpstream(`/?s=${encodeURIComponent(keyword)}${page > 1 ? `&paged=${page}` : ""}`)) };
   }, ctx);
 }
 
-// --------------------------------------------------------------------------
-// /api/info?id=<id>
-// --------------------------------------------------------------------------
 async function handleInfo(ctx, url) {
   const id = url.searchParams.get("id");
   if (!id) return jsonError("Missing id", 400);
-  const key = `info:${id}`;
-  return cached(key, CACHE_TTL.info, async () => {
-    const html = await fetchUpstream(`/series/${id}/`);
-    return parseInfoPage(html, id);
-  }, ctx);
+  return cached(`info:${id}`, 1800, async () => parseInfoPage(await fetchUpstream(`/series/${id}/`), id), ctx);
 }
 
-// --------------------------------------------------------------------------
-// /api/episodes/<id>?season=<n|all>
-// --------------------------------------------------------------------------
 async function handleEpisodes(id, ctx, url) {
   const season = url.searchParams.get("season") || "all";
-  const key = `eps:${id}:s${season}`;
-  return cached(key, CACHE_TTL.episodes, async () => {
+  return cached(`eps:${id}:s${season}`, 1800, async () => {
     const r = await getEpisodesData(id, season === "all" ? "all" : Number(season));
-    return {
-      animeId: id,
-      requestedSeason: season === "all" ? null : Number(season),
-      availableSeasons: r.seasons.map(s => s.num),
-      totalEpisodes: r.episodes.length,
-      failedSeasons: r.failedSeasons || [],
-      groupedEpisodes: groupBySeason(r.episodes),
-    };
+    const g = {};
+    for (const e of r.episodes) (g[String(e.season)] = g[String(e.season)] || []).push(e);
+    for (const s of Object.keys(g)) g[s].sort((a, b) => a.num - b.num);
+    return { animeId: id, requestedSeason: season === "all" ? null : Number(season), availableSeasons: r.seasons.map(s => s.num), totalEpisodes: r.episodes.length, failedSeasons: r.failedSeasons, groupedEpisodes: g };
   }, ctx);
 }
 
-// --------------------------------------------------------------------------
-// /api/servers?ep=<slug>
-// --------------------------------------------------------------------------
 async function handleServers(ctx, url) {
   const ep = url.searchParams.get("ep");
   if (!ep) return jsonError("Missing ep", 400);
-  const key = `srv:${ep}`;
-  return cached(key, CACHE_TTL.servers, async () => {
-    const html = await fetchUpstream(`/episode/${ep}/`);
-    return parseServers(html, ep);
-  }, ctx);
+  return cached(`srv:${ep}`, 300, async () => parseServers(await fetchUpstream(`/episode/${ep}/`), ep), ctx);
 }
 
-// --------------------------------------------------------------------------
-// /api/stream?ep=<slug>&server=<n>&lang=<l>&audio=<a>
-// --------------------------------------------------------------------------
 async function handleStream(ctx, url) {
   const ep = url.searchParams.get("ep");
   const serverIdx = Number(url.searchParams.get("server") || 0);
   const lang = url.searchParams.get("lang");
   const audio = url.searchParams.get("audio");
   if (!ep) return jsonError("Missing ep", 400);
-
-  // NEVER cache stream responses — they contain time-limited tokens
-  const serversRes = await handleServers(ctx, url);
-  const servers = (await serversRes.clone().json()).data || [];
+  const srvRes = await handleServers(ctx, url);
+  const servers = (await srvRes.clone().json()).data || [];
   const server = servers[serverIdx];
   if (!server) return jsonError("Server not found", 404);
-
-  const embedUrl = server.isMultiLang && lang
-    ? (server.languages.find(l => l.language.toLowerCase() === lang.toLowerCase()) || {}).link
-    : server.embedUrl;
-
-  let resolved;
-  if (server.isMultiLang && lang) {
-    resolved = await resolveAbyss(embedUrl);
-  } else if (/as-cdn/i.test(server.embedUrl)) {
-    resolved = await resolveAsCdn26(server.embedUrl);
-  } else {
-    resolved = await resolveAbyss(server.embedUrl);
-  }
-
-  const workerOrigin = url.origin;
-  const result = buildStreamResponse(resolved, server, { audio, lang, workerOrigin, serverIndex: serverIdx });
-  return jsonSuccess(result, { "Cache-Control": "no-store" });
-}
-
-// --------------------------------------------------------------------------
-// /api/discover — all taxonomy at once
-// --------------------------------------------------------------------------
-async function handleDiscover(ctx) {
-  return cached("discover", CACHE_TTL.taxonomy, async () => {
-    const html = await fetchUpstream("/");
-    return parseTaxonomy(html);
-  }, ctx);
-}
-
-async function handleGenres(ctx) {
-  return cached("genres", CACHE_TTL.taxonomy, async () => {
-    const html = await fetchUpstream("/category/genre/");
-    const items = parseTaxonomyList(html, "genre");
-    return items;
-  }, ctx);
-}
-
-// --------------------------------------------------------------------------
-// /proxy/media — delegate to media-proxy module
-// --------------------------------------------------------------------------
-
-// --------------------------------------------------------------------------
-// Parser stubs (full implementations live in src/api/parsers.js)
-// --------------------------------------------------------------------------
-// These delegate to the parsers module. Inlined here as fallbacks for any
-// that haven't been wired yet — replace with real imports.
-
-function parseFeatured(html) {
-  // Delegates to parsers.js
-  const { parseFeatured } = require("./api/parsers.js");
-  return parseFeatured(html);
-}
-function parseLatest(html) {
-  const { parseLatest } = require("./api/parsers.js");
-  return parseLatest(html);
-}
-function parseCatalogItems(html) {
-  const { parseCatalogItems } = require("./api/parsers.js");
-  return parseCatalogItems(html);
-}
-function parseRandomItem(html) {
-  const { parseRandomItem } = require("./api/parsers.js");
-  return parseRandomItem(html);
-}
-function parseInfoPage(html, id) {
-  const { parseInfoPage } = require("./api/parsers.js");
-  return parseInfoPage(html, id);
-}
-function parseServers(html, ep) {
-  const { parseServers } = require("./api/parsers.js");
-  return parseServers(html, ep);
-}
-function parseTaxonomy(html) {
-  const { parseTaxonomy } = require("./api/parsers.js");
-  return parseTaxonomy(html);
-}
-function parseTaxonomyList(html, kind) {
-  const { parseTaxonomyList } = require("./api/parsers.js");
-  return parseTaxonomyList(html, kind);
-}
-
-function groupBySeason(eps) {
-  const g = {};
-  for (const e of eps) {
-    const s = String(e.season || 1);
-    (g[s] = g[s] || []).push(e);
-  }
-  for (const s of Object.keys(g)) g[s].sort((a, b) => a.num - b.num);
-  return g;
-}
-
-function buildStreamResponse(resolved, server, { audio, lang, workerOrigin, serverIndex }) {
-  const { proxyMediaUrl } = require("./api/media-proxy.js");
-  const result = {
-    host: server.serverName || `Server ${serverIndex + 1}`,
-    serverIndex,
-    selectedLanguage: lang || null,
-    selected_audio: audio || null,
-  };
-
-  if (resolved.isIframe) {
-    return { ...result, isIframe: true, embedUrl: resolved.embedUrl };
-  }
-
-  const hlsUrl = resolved.direct_hls || resolved.direct_url;
-  if (!hlsUrl) return { ...result, isIframe: true, embedUrl: server.embedUrl, error: "No playable URL" };
-
+  const embedUrl = server.isMultiLang && lang ? (server.languages.find(l => l.language.toLowerCase() === lang.toLowerCase()) || {}).link || server.embedUrl : server.embedUrl;
+  const resolved = /as-cdn/i.test(embedUrl) ? await resolveAsCdn26(embedUrl) : await resolveAbyss(embedUrl);
+  const result = { host: server.serverName, serverIndex: serverIdx, selectedLanguage: lang || null, selected_audio: audio || null };
+  if (resolved.isIframe) return jsonSuccess({ ...result, isIframe: true, embedUrl: resolved.embedUrl }, { "Cache-Control": "no-store" });
+  const hlsUrl = resolved.direct_hls;
+  if (!hlsUrl) return jsonSuccess({ ...result, isIframe: true, embedUrl: server.embedUrl, error: "No playable URL" }, { "Cache-Control": "no-store" });
   const referer = resolved.referer || new URL(hlsUrl).origin + "/";
-  result.proxied_url = proxyMediaUrl(workerOrigin, hlsUrl, { referer, audio });
+  result.proxied_url = proxyMediaUrl(url.origin, hlsUrl, { referer, audio });
   result.direct_hls = hlsUrl;
   result.referer = referer;
   result.qualities = resolved.qualities || [];
   result.poster = resolved.poster || null;
   result.isIframe = false;
-
-  // Subtitles — proxied through /proxy/media with force=text/vtt
-  result.subtitles = (resolved.subtitles || []).map(s => ({
-    label: s.label || "Sub",
-    url: proxyMediaUrl(workerOrigin, s.url, {
-      referer: s.referer || referer,
-      force: "text/vtt",
-    }),
-  }));
-
-  // Audio/subtitle languages from the master playlist (when proxied)
+  result.subtitles = (resolved.subtitles || []).map(s => ({ label: s.label || "Sub", url: proxyMediaUrl(url.origin, s.url, { referer: s.referer || referer, force: "text/vtt" }) }));
   result.audio_languages = resolved.audio_languages || [];
   result.subtitle_languages = resolved.subtitle_languages || [];
-
-  return result;
+  return jsonSuccess(result, { "Cache-Control": "no-store" });
 }
 
-// --------------------------------------------------------------------------
+async function handleDiscover(ctx) {
+  return cached("discover", 86400, async () => parseTaxonomy(await fetchUpstream("/")), ctx);
+}
+
+// ==========================================================================
 // MAIN ROUTER
-// --------------------------------------------------------------------------
+// ==========================================================================
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
-
-    // CORS preflight
-    if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders });
-    }
-
+    if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
     try {
-      // ----- Health -----
       if (path === "/api/health") return await handleHealth(ctx);
-
-      // ----- Modular Home -----
       if (path === "/api/home/hero") return await handleHomeHero(ctx);
-      if (path.startsWith("/api/home/")) {
-        const section = path.replace("/api/home/", "");
-        return await handleHomeSection(section, ctx);
-      }
-      // Legacy /api/home → redirect client to modular endpoints
-      if (path === "/api/home") {
-        return jsonSuccess({
-          _deprecated: "Use /api/home/hero + /api/home/<section> in parallel",
-          sections: Object.keys(SECTION_FETCHERS),
-        });
-      }
-
-      // ----- Random -----
+      if (path.startsWith("/api/home/")) return await handleHomeSection(path.replace("/api/home/", ""), ctx);
+      if (path === "/api/home") return jsonSuccess({ _deprecated: "Use /api/home/hero + /api/home/<section> in parallel", sections: Object.keys(SECTION_FETCHERS) });
       if (path === "/api/random") return await handleRandom(ctx);
-
-      // ----- Catalog -----
-      if (path === "/api/series")    return await handleCatalog("series", ctx, url);
-      if (path === "/api/movies")    return await handleCatalog("movies", ctx, url);
-      if (path === "/api/anime")     return await handleCatalog("anime", ctx, url);
-      if (path === "/api/cartoon")   return await handleCatalog("cartoon", ctx, url);
-      if (path === "/api/ongoing")   return await handleCatalog("ongoing", ctx, url);
-      if (path === "/api/completed") return await handleCatalog("completed", ctx, url);
-      if (path === "/api/fresh-drops") return await handleCatalog("fresh-drops", ctx, url);
-
-      // ----- Popular -----
-      if (path === "/api/popular")           return await handleCatalog("popular", ctx, url);
-      if (path === "/api/popular/series")    return await handleCatalog("popular/series", ctx, url);
-      if (path === "/api/popular/films")     return await handleCatalog("popular/films", ctx, url);
-
-      // ----- Taxonomy -----
+      for (const k of ["series", "movies", "anime", "cartoon", "ongoing", "completed", "fresh-drops", "popular", "popular/series", "popular/films"]) {
+        if (path === `/api/${k}`) return await handleCatalog(k, ctx, url);
+      }
       if (path === "/api/discover") return await handleDiscover(ctx);
-      if (path === "/api/genres")   return jsonSuccess(await handleGenres(ctx));
-      for (const kind of TAXONOMY_KINDS) {
+      if (path === "/api/genres") return jsonSuccess(parseTaxonomy(await fetchUpstream("/")).genres);
+      for (const kind of ["genre", "language", "country", "type", "year", "network", "franchise", "status"]) {
         const m = path.match(new RegExp(`^/api/${kind}/([^/]+)$`));
         if (m) return await handleTaxonomy(kind, m[1], ctx, url);
       }
-
-      // ----- Search -----
       if (path === "/api/search") return await handleSearch(ctx, url);
-
-      // ----- Info / Episodes -----
       if (path === "/api/info") return await handleInfo(ctx, url);
-      if (path.startsWith("/api/episodes/")) {
-        const id = decodeURIComponent(path.replace("/api/episodes/", ""));
-        return await handleEpisodes(id, ctx, url);
-      }
-
-      // ----- Streaming -----
+      if (path.startsWith("/api/episodes/")) return await handleEpisodes(decodeURIComponent(path.replace("/api/episodes/", "")), ctx, url);
       if (path === "/api/servers") return await handleServers(ctx, url);
-      if (path === "/api/stream")  return await handleStream(ctx, url);
-
-      // ----- Media proxy -----
+      if (path === "/api/stream") return await handleStream(ctx, url);
       if (path === "/proxy/media") return await handleMediaProxy(request);
-
-      // ----- Root / 404 -----
       if (path === "/" || path === "") {
-        return new Response(
-          `AnimeSalt API v3.38.0-modular\n` +
-          `\n` +
-          `Modular home: /api/home/hero, /api/home/<section>\n` +
-          `Sections: ${Object.keys(SECTION_FETCHERS).join(", ")}\n` +
-          `Health: /api/health\n` +
-          `Docs: see README\n`,
-          { headers: { "Content-Type": "text/plain; charset=utf-8" } }
-        );
+        return new Response(`AnimeSalt API v3.39.0\n\nModular home: /api/home/hero, /api/home/<section>\nSections: ${Object.keys(SECTION_FETCHERS).join(", ")}\n`, { headers: { "Content-Type": "text/plain" } });
       }
-
       return jsonError("Not found", 404);
     } catch (e) {
-      console.error("Router error:", e);
       return jsonError(e.message || "Internal error", 500);
     }
   },
