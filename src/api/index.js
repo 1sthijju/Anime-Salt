@@ -9,7 +9,7 @@ import { decryptAsCdn26, decryptAbyss } from './decryptors.js';
 import { handleMediaProxy } from './media-proxy.js';
 
 async function getStatusMembership(id, ctx) {
-  const ongoing = await cachedJSON("status_ongoing_v3", async () => {
+  const ongoing = await cachedJSON("status_ongoing_v4", async () => {
     let slugs = [];
     for (let p = 1; p <= 3; p++) {
       try {
@@ -21,7 +21,7 @@ async function getStatusMembership(id, ctx) {
   }, CACHE_TTL, ctx);
   if (ongoing.includes(id)) return "Ongoing";
   
-  const completed = await cachedJSON("status_completed_v3", async () => {
+  const completed = await cachedJSON("status_completed_v4", async () => {
     let slugs = [];
     for (let p = 1; p <= 3; p++) {
       try {
@@ -43,7 +43,7 @@ export default {
     const path = url.pathname;
     
     try {
-      if (path === "/") return jsonResponse({ name: "AnimeSalt Edge API", version: "1.4.0", upstream_proxy: BASE_URL });
+      if (path === "/") return jsonResponse({ name: "AnimeSalt Edge API", version: "1.5.0", upstream_proxy: BASE_URL });
       
       if (path === "/api/health") {
         const start = Date.now();
@@ -56,13 +56,13 @@ export default {
       }
       
       if (path === "/api/home") {
-        const data = await cachedJSON("home_html_v3", async () => extractHomeSections(await fetchPage("/")), CACHE_TTL_HOME, ctx);
+        const data = await cachedJSON("home_html_v4", async () => extractHomeSections(await fetchPage("/")), CACHE_TTL_HOME, ctx);
         return jsonResponse({ success: true, data });
       }
       
       if (path === "/api/search") {
         const kw = url.searchParams.get("keyword") || "", page = url.searchParams.get("page") || "1";
-        const html = await cachedJSON(`search_v3_${kw}_${page}`, async () => fetchPage("/", { s: kw, paged: page }), CACHE_TTL, ctx);
+        const html = await cachedJSON(`search_v4_${kw}_${page}`, async () => fetchPage("/", { s: kw, paged: page }), CACHE_TTL, ctx);
         return jsonResponse({ success: true, page: parseInt(page), data: extractAnimeList(stripScriptsStyles(html)) });
       }
       
@@ -72,7 +72,7 @@ export default {
         
         let dataObj;
         try {
-          dataObj = await cachedJSON(`info_v3_${id}`, async () => getSeriesHtml(id), CACHE_TTL, ctx);
+          dataObj = await cachedJSON(`info_v4_${id}`, async () => getSeriesHtml(id), CACHE_TTL, ctx);
         } catch(e) {
           if (e.message === "Not Found") return jsonResponse({ error: "Not Found" }, 404);
           throw e;
@@ -145,7 +145,7 @@ export default {
         
         let dataObj;
         try {
-          dataObj = await cachedJSON(`info_v3_${id}`, async () => getSeriesHtml(id), CACHE_TTL, ctx);
+          dataObj = await cachedJSON(`info_v4_${id}`, async () => getSeriesHtml(id), CACHE_TTL, ctx);
         } catch(e) {
           if (e.message === "Not Found") return jsonResponse({ error: "Not Found" }, 404);
           throw e;
@@ -160,11 +160,11 @@ export default {
           return jsonResponse({ success: true, data: { animeId: id, requestedSeason: 1, availableSeasons: [1], totalEpisodes: 1, failedSeasons: [], groupedEpisodes: { "1": [{ num: 1, season: 1, title, slug: id, url: `/movies/${id}/`, image: poster, regionalDub: true }] }, isMovie: true } });
         }
         
-        const { postId, nonce } = extractPostData(html);
-        if (!postId || !nonce) return jsonResponse({ success: true, data: { animeId: id, requestedSeason: parseInt(season), availableSeasons: [], totalEpisodes: 0, failedSeasons: [parseInt(season)], groupedEpisodes: {} } });
+        const { postId, nonces } = extractPostData(html);
+        if (!postId || !nonces || nonces.length === 0) return jsonResponse({ success: true, data: { animeId: id, requestedSeason: parseInt(season), availableSeasons: [], totalEpisodes: 0, failedSeasons: [parseInt(season)], groupedEpisodes: {} } });
         
         const seasonNum = parseInt(season);
-        const episodes = await fetchSeasonEpisodes(postId, nonce, seasonNum);
+        const episodes = await fetchSeasonEpisodes(postId, nonces, seasonNum);
         return jsonResponse({ success: true, data: { animeId: id, requestedSeason: seasonNum, availableSeasons: [seasonNum], totalEpisodes: episodes.length, failedSeasons: [], groupedEpisodes: { [seasonNum]: episodes } } });
       }
 
@@ -174,32 +174,40 @@ export default {
         let html = "";
         for (const prefix of ["episode", "movies", "series"]) {
           try {
-            const text = await cachedJSON(`play_v3_${prefix}_${ep}`, async () => fetchPage(`/${prefix}/${ep}/`), CACHE_TTL, ctx);
+            const text = await cachedJSON(`play_v4_${prefix}_${ep}`, async () => fetchPage(`/${prefix}/${ep}/`), CACHE_TTL, ctx);
             if (!text.includes("404 Not Found")) { html = text; break; }
           } catch(e) {}
         }
         if (!html) return jsonResponse({ data: [] });
 
         const servers = [];
-        const serverBtns = [...html.matchAll(/<div[^>]*class="server-btn"[^>]*onclick="changeServer\((\d+)\)"[^>]*>([\s\S]*?)<\/div>/gi)];
+        // Fixed regex to match "server-btn active"
+        const serverBtns = [...html.matchAll(/<div[^>]*class="[^"]*server-btn[^"]*"[^>]*onclick="changeServer\((\d+)\)"[^>]*>([\s\S]*?)<\/div>/gi)];
+        
         for (const btn of serverBtns) {
-          const index = parseInt(btn[1]); const serverName = btn[2].replace(/<[^>]+>/g, '').trim();
-          const optionRegex = new RegExp(`<div[^>]*id="options-${index}"[^>]*>([\\s\\S]*?)<\\/div>`, "i");
-          const optMatch = html.match(optionRegex);
-          if (!optMatch) continue;
-          const iframeMatch = optMatch[1].match(/<iframe[^>]+(?:src|data-src)="([^"]+)"/i);
-          if (!iframeMatch) continue;
+          const index = parseInt(btn[1]); 
+          const serverName = btn[2].replace(/<[^>]+>/g, '').trim();
           
-          let embedUrl = iframeMatch[1]; if (embedUrl.startsWith("//")) embedUrl = "https:" + embedUrl;
-          let isMultiLang = false, languages = [];
-          const multiLangMatch = embedUrl.match(/multi-lang-plyr\/player\.php\?data=([^&]+)/i);
-          if (multiLangMatch) {
-            try {
-              const parsed = JSON.parse(atob(multiLangMatch[1])); isMultiLang = true;
-              languages = parsed.map(l => ({ language: l.language || l.lang || "Unknown", link: l.link.startsWith("//") ? "https:" + l.link : l.link }));
-            } catch(e) {}
+          // Chunk-based substring search to bypass nested div traps
+          const optIdx = html.indexOf(`id="options-${index}"`);
+          if (optIdx !== -1) {
+            const optChunk = html.substring(optIdx, optIdx + 2000);
+            const iframeMatch = optChunk.match(/<iframe[^>]+(?:src|data-src)="([^"]+)"/i);
+            
+            if (iframeMatch) {
+              let embedUrl = iframeMatch[1]; 
+              if (embedUrl.startsWith("//")) embedUrl = "https:" + embedUrl;
+              let isMultiLang = false, languages = [];
+              const multiLangMatch = embedUrl.match(/multi-lang-plyr\/player\.php\?data=([^&]+)/i);
+              if (multiLangMatch) {
+                try {
+                  const parsed = JSON.parse(atob(multiLangMatch[1])); isMultiLang = true;
+                  languages = parsed.map(l => ({ language: l.language || l.lang || "Unknown", link: l.link.startsWith("//") ? "https:" + l.link : l.link }));
+                } catch(e) {}
+              }
+              servers.push({ index, serverName, embedUrl, isMultiLang, languages });
+            }
           }
-          servers.push({ index, serverName, embedUrl, isMultiLang, languages });
         }
         return jsonResponse({ success: true, data: servers });
       }
@@ -209,19 +217,20 @@ export default {
         let html = "";
         for (const prefix of ["episode", "movies", "series"]) {
           try {
-            const text = await cachedJSON(`play_v3_${prefix}_${ep}`, async () => fetchPage(`/${prefix}/${ep}/`), CACHE_TTL, ctx);
+            const text = await cachedJSON(`play_v4_${prefix}_${ep}`, async () => fetchPage(`/${prefix}/${ep}/`), CACHE_TTL, ctx);
             if (!text.includes("404 Not Found")) { html = text; break; }
           } catch(e) {}
         }
         
         let embedUrl = "";
-        const serverBtns = [...html.matchAll(/<div[^>]*class="server-btn"[^>]*onclick="changeServer\((\d+)\)"[^>]*>([\s\S]*?)<\/div>/gi)];
+        const serverBtns = [...html.matchAll(/<div[^>]*class="[^"]*server-btn[^"]*"[^>]*onclick="changeServer\((\d+)\)"[^>]*>([\s\S]*?)<\/div>/gi)];
+        
         for (const btn of serverBtns) {
           if (parseInt(btn[1]) === serverIdx) {
-            const optionRegex = new RegExp(`<div[^>]*id="options-${serverIdx}"[^>]*>([\\s\\S]*?)<\\/div>`, "i");
-            const optMatch = html.match(optionRegex);
-            if (optMatch) {
-              const iframeMatch = optMatch[1].match(/<iframe[^>]+(?:src|data-src)="([^"]+)"/i);
+            const optIdx = html.indexOf(`id="options-${serverIdx}"`);
+            if (optIdx !== -1) {
+              const optChunk = html.substring(optIdx, optIdx + 2000);
+              const iframeMatch = optChunk.match(/<iframe[^>]+(?:src|data-src)="([^"]+)"/i);
               if (iframeMatch) { embedUrl = iframeMatch[1]; if (embedUrl.startsWith("//")) embedUrl = "https:" + embedUrl; }
             }
           }
@@ -268,32 +277,8 @@ export default {
         const id = url.searchParams.get("id") || "one-piece";
         try {
           const { html } = await getSeriesHtml(id);
-          const { postId, nonce } = extractPostData(html);
-          return jsonResponse({ postId, nonce, html_length: html.length });
-        } catch(e) {
-          return jsonResponse({ error: e.message });
-        }
-      }
-      
-      if (path === "/api/debug/ajax-response") {
-        const id = url.searchParams.get("id") || "one-piece";
-        const season = url.searchParams.get("season") || "1";
-        try {
-          const { html } = await getSeriesHtml(id);
-          const { postId, nonce } = extractPostData(html);
-          if (!postId || !nonce) return jsonResponse({ error: "Missing post/nonce", postId, nonce });
-          
-          const params = { action: "action_select_temp", temp: 0, season: season, post: postId, nonce: nonce };
-          let responseText = await siteAjax(params);
-          let parsedJson = null;
-          try { parsedJson = JSON.parse(responseText); } catch(e) {}
-          
-          return jsonResponse({ 
-              raw_response_length: responseText.length, 
-              raw_response_snippet: responseText.substring(0, 500),
-              is_json: parsedJson !== null,
-              parsed_json_keys: parsedJson ? Object.keys(parsedJson) : null
-          });
+          const { postId, nonces } = extractPostData(html);
+          return jsonResponse({ postId, nonces, html_length: html.length });
         } catch(e) {
           return jsonResponse({ error: e.message });
         }
@@ -302,7 +287,7 @@ export default {
       if (path === "/proxy/media") return handleMediaProxy(request);
       
       if (path.startsWith("/api/genre/") || path.startsWith("/api/type/") || path.startsWith("/api/category/")) {
-        const html = await cachedJSON(`cat_v3_${path}`, async () => fetchPage(path), CACHE_TTL, ctx);
+        const html = await cachedJSON(`cat_v4_${path}`, async () => fetchPage(path), CACHE_TTL, ctx);
         return jsonResponse({ success: true, data: extractAnimeList(stripScriptsStyles(html)) });
       }
       
