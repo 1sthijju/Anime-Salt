@@ -1,63 +1,85 @@
-import { BASE_URL, PROXY_BASE, CHROME_HEADERS, AJAX_HEADERS, CACHE_TTL, CACHE_TTL_HOME } from "./config.js";
+import { BASE_URL, CHROME_HEADERS } from './config.js';
 
-export async function fetchPage(path, params) {
-  let fullUrl = path.startsWith("http") ? path : `${BASE_URL}${path}`;
-  if (params) {
-    const urlObj = new URL(fullUrl);
-    for (const [k, v] of Object.entries(params)) { if (v) urlObj.searchParams.set(k, v); }
-    fullUrl = urlObj.toString();
+const cache = caches.default;
+
+export async function fetchPage(path, query = {}) {
+  const url = new URL(path, BASE_URL);
+  for (const [k, v] of Object.entries(query)) {
+    url.searchParams.append(k, v);
   }
-  let res = await fetch(fullUrl, { headers: CHROME_HEADERS });
-  let text = await res.text();
-  const challenged = !res.ok || text.includes("Just a moment...") || text.includes("cf-browser-verification");
-  if (challenged) {
-    const u = new URL(fullUrl);
-    if (u.hostname.endsWith("animesalt.cx")) {
-      res = await fetch(`${PROXY_BASE}${u.pathname}${u.search}`, { headers: CHROME_HEADERS });
-      text = await res.text();
-    }
+  
+  const req = new Request(url.toString(), {
+    method: "GET",
+    headers: CHROME_HEADERS,
+    cf: { cacheTtl: 0 } 
+  });
+  
+  const res = await fetch(req, { redirect: "follow" });
+  if (!res.ok && res.status !== 404) {
+    throw new Error(`Upstream HTTP ${res.status}`);
+  }
+  
+  const text = await res.text();
+  if (text.includes("cf-challenge") || text.includes("Just a moment...")) {
+    throw new Error("Cloudflare Challenge detected");
   }
   return text;
 }
 
-export async function fetchAjax(path) {
-  const res = await fetch(`${PROXY_BASE}${path}`, { headers: AJAX_HEADERS });
-  return await res.text();
-}
-
-export async function cachedJSON(cacheKey, producer, ttl = CACHE_TTL) {
-  const cache = caches.default;
-  const key = new Request(`https://edge-cache.internal/${encodeURIComponent(cacheKey)}`);
-  try {
-    const hit = await cache.match(key);
-    if (hit) return await hit.json();
-  } catch (e) {}
-  const data = await producer();
-  try {
-    const resp = new Response(JSON.stringify(data), {
-      headers: { "Content-Type": "application/json", "Cache-Control": `public, max-age=${ttl}` },
-    });
-    await cache.put(key, resp.clone());
-  } catch (e) {}
+export async function cachedJSON(key, fetcher, ttl) {
+  const cacheUrl = new URL(`/_cache/${key}`, BASE_URL);
+  const cacheReq = new Request(cacheUrl, { headers: { "Cache-Control": "no-cache" } });
+  
+  let response = await cache.match(cacheReq);
+  if (response) {
+    return response.json();
+  }
+  
+  const data = await fetcher();
+  const jsonText = JSON.stringify(data);
+  const cacheRes = new Response(jsonText, {
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": `public, max-age=${ttl}`
+    }
+  });
+  
+  await cache.put(cacheReq, cacheRes.clone());
   return data;
 }
 
-export async function getSiteConfig() {
-  return await cachedJSON("site:config", async () => {
-    const html = await fetchPage("/");
-    const nonceMatch = html.match(/"nonce"\s*:\s*"([a-z0-9]+)"/i);
-    return { nonce: nonceMatch ? nonceMatch[1] : "" };
-  }, CACHE_TTL_HOME);
-}
-
 export async function siteAjax(params) {
-  const cfg = await getSiteConfig();
-  const qs = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) qs.set(k, String(v));
-  if (cfg.nonce && !qs.has("nonce")) qs.set("nonce", cfg.nonce);
-  return await fetchAjax(`/wp-admin/admin-ajax.php?${qs.toString()}`);
+  const url = new URL("/wp-admin/admin-ajax.php", BASE_URL);
+  const body = new URLSearchParams(params).toString();
+  
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      ...CHROME_HEADERS,
+      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      "Referer": BASE_URL, // Routes referer through the proxy
+      "X-Requested-With": "XMLHttpRequest"
+    },
+    body,
+    cf: { cacheTtl: 0 }
+  });
+  
+  if (!res.ok) throw new Error(`AJAX HTTP ${res.status}`);
+  return res.text();
 }
 
-export async function getSeriesHtml(animeId) {
-  return await cachedJSON(`html:series:${animeId}`, () => fetchPage(`/series/${animeId}/`));
+export async function getSeriesHtml(id) {
+  try {
+    const html = await fetchPage(`/series/${id}/`);
+    if (html.includes("404 Not Found")) {
+      const movieHtml = await fetchPage(`/movies/${id}/`);
+      if (movieHtml.includes("404 Not Found")) throw new Error("Not Found");
+      return { html: movieHtml, type: "movies" };
+    }
+    return { html, type: "series" };
+  } catch (e) {
+    const movieHtml = await fetchPage(`/movies/${id}/`);
+    if (movieHtml.includes("404 Not Found")) throw new Error("Not Found");
+    return { html: movieHtml, type: "movies" };
+  }
 }
