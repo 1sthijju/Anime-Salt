@@ -83,20 +83,32 @@ const M3U8_HEADERS = {
 };
 
 // ---------------------------------------------------------------------------
+// Check if content looks like binary image data (JPEG, PNG, GIF, WebP)
+// ---------------------------------------------------------------------------
+function isBinaryImage(text) {
+  const signatures = [
+    "\u00FF\u00D8\u00FF",  // JPEG
+    "\u0089PNG",            // PNG
+    "GIF87a",               // GIF87
+    "GIF89a",               // GIF89
+    "RIFF",                 // WebP (RIFF header)
+  ];
+  return signatures.some(sig => text.startsWith(sig));
+}
+
+// ---------------------------------------------------------------------------
 // Fetch upstream with a referer fallback chain.
-// Some CDNs referer-gate assets — on 403/404 we retry with alternatives.
 // ---------------------------------------------------------------------------
 async function fetchUpstream(targetUrl, referer, rangeHeader) {
   const candidates = [];
   const add = (r) => { if (typeof r === "string" && !candidates.includes(r)) candidates.push(r); };
 
-  // Priority: provided referer → its origin → target origin → known CDNs → no referer
   add(referer || "");
   try { if (referer) add(new URL(referer).origin + "/"); } catch {}
   try { add(new URL(targetUrl).origin + "/"); } catch {}
   add("https://as-cdn26.top/");
   add("https://animesalt.cx/");
-  add(""); // no referer
+  add("");
 
   let lastStatus = 0;
   for (const r of candidates) {
@@ -118,76 +130,104 @@ async function fetchUpstream(targetUrl, referer, rangeHeader) {
 
     lastStatus = res.status;
     try { if (res.body) await res.body.cancel(); } catch {}
-    if (lastStatus !== 403 && lastStatus !== 404) break; // only retry auth-ish codes
+    if (lastStatus !== 403 && lastStatus !== 404) break;
   }
   return { ok: false, status: lastStatus };
 }
 
 // ---------------------------------------------------------------------------
-// Handler — sniffs the BODY, never trusts Content-Type / URL extension
+// Handler with comprehensive error handling
 // ---------------------------------------------------------------------------
 export async function handleMediaProxy(request) {
-  const url = new URL(request.url);
-  const targetUrl = url.searchParams.get("url");
-  let referer = url.searchParams.get("referer");
-  const forceType = url.searchParams.get("force");
-  const audioLang = url.searchParams.get("audio");
+  try {
+    const url = new URL(request.url);
+    const targetUrl = url.searchParams.get("url");
+    let referer = url.searchParams.get("referer");
+    const forceType = url.searchParams.get("force");
+    const audioLang = url.searchParams.get("audio");
 
-  if (!targetUrl) return new Response("Missing url", { status: 400, headers: corsHeaders });
-  if (!referer) { try { referer = new URL(targetUrl).origin + "/"; } catch { referer = ""; } }
-  const workerOrigin = url.origin;
+    if (!targetUrl) {
+      return new Response("Missing url parameter", { status: 400, headers: corsHeaders });
+    }
+    if (!referer) {
+      try { referer = new URL(targetUrl).origin + "/"; } catch { referer = ""; }
+    }
+    const workerOrigin = url.origin;
 
-  const res = await fetchUpstream(targetUrl, referer, request.headers.get("Range"));
-  if (!res.ok) {
-    return new Response("Upstream returned " + res.status, { status: 502, headers: corsHeaders });
-  }
+    const res = await fetchUpstream(targetUrl, referer, request.headers.get("Range"));
+    if (!res.ok) {
+      return new Response(`Upstream error: ${res.status || 'unknown'}`, {
+        status: 502,
+        headers: corsHeaders,
+      });
+    }
 
-  const ct = ((res.headers && res.headers.get("Content-Type")) || "").toLowerCase();
+    const ct = ((res.headers && res.headers.get("Content-Type")) || "").toLowerCase();
 
-  // ---- forced subtitle conversion (SRT → VTT if needed) ----
-  if (forceType === "text/vtt") {
-    const text = await res.text();
-    const vtt = text.trimStart().startsWith("WEBVTT")
-      ? text
-      : "WEBVTT\n\n" + text.replace(/\r\n/g, "\n");
-    return new Response(vtt, {
-      headers: {
-        "Content-Type": "text/vtt",
-        "Access-Control-Allow-Origin": "*",
-        "Cache-Control": "public, max-age=3600",
+    // ---- forced subtitle conversion (SRT → VTT if needed) ----
+    if (forceType === "text/vtt") {
+      const text = await res.text();
+      
+      // Validate: reject binary image data disguised as subtitles
+      if (isBinaryImage(text)) {
+        return new Response("WEBVTT\n\nInvalid subtitle file (binary image detected)", {
+          headers: {
+            "Content-Type": "text/vtt",
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "public, max-age=60",
+          },
+        });
+      }
+      
+      const vtt = text.trimStart().startsWith("WEBVTT")
+        ? text
+        : "WEBVTT\n\n" + text.replace(/\r\n/g, "\n");
+      return new Response(vtt, {
+        headers: {
+          "Content-Type": "text/vtt",
+          "Access-Control-Allow-Origin": "*",
+          "Cache-Control": "public, max-age=3600",
+        },
+      });
+    }
+
+    // ---- sniff first chunk: if body starts with #EXTM3U → rewrite it ----
+    const reader = res.body.getReader();
+    const first = await reader.read();
+    const headText = first.value ? new TextDecoder().decode(first.value.subarray(0, 64)) : "";
+
+    if (!first.done && headText.trimStart().startsWith("#EXTM3U")) {
+      let text = new TextDecoder().decode(first.value);
+      for (;;) {
+        const r = await reader.read();
+        if (r.done) break;
+        text += new TextDecoder().decode(r.value);
+      }
+      const rewritten = rewriteHlsManifest(text, targetUrl, referer, audioLang, workerOrigin);
+      return new Response(rewritten, { headers: M3U8_HEADERS });
+    }
+
+    // ---- binary passthrough (segments, keys, fonts, images, etc.) ----
+    const stream = new ReadableStream({
+      async start(c) { if (first.value) c.enqueue(first.value); },
+      async pull(c) {
+        const r = await reader.read();
+        if (r.done) c.close(); else c.enqueue(r.value);
       },
     });
+    const rh = new Headers();
+    rh.set("Access-Control-Allow-Origin", "*");
+    rh.set("Content-Type", ct || "application/octet-stream");
+    rh.set("Cache-Control", "public, max-age=3600");
+    if (res.headers && res.headers.has("Content-Range")) rh.set("Content-Range", res.headers.get("Content-Range"));
+    if (res.headers && res.headers.has("Content-Length")) rh.set("Content-Length", res.headers.get("Content-Length"));
+    return new Response(stream, { status: res.status, headers: rh });
+  } catch (error) {
+    // Catch any unhandled exceptions and return a proper error response
+    console.error("Media proxy error:", error);
+    return new Response(`Proxy error: ${error.message}`, {
+      status: 500,
+      headers: corsHeaders,
+    });
   }
-
-  // ---- sniff first chunk: if body starts with #EXTM3U → rewrite it ----
-  const reader = res.body.getReader();
-  const first = await reader.read();
-  const headText = first.value ? new TextDecoder().decode(first.value.subarray(0, 64)) : "";
-
-  if (!first.done && headText.trimStart().startsWith("#EXTM3U")) {
-    let text = new TextDecoder().decode(first.value);
-    for (;;) {
-      const r = await reader.read();
-      if (r.done) break;
-      text += new TextDecoder().decode(r.value);
-    }
-    const rewritten = rewriteHlsManifest(text, targetUrl, referer, audioLang, workerOrigin);
-    return new Response(rewritten, { headers: M3U8_HEADERS });
-  }
-
-  // ---- binary passthrough (segments, keys, fonts, images, etc.) ----
-  const stream = new ReadableStream({
-    async start(c) { if (first.value) c.enqueue(first.value); },
-    async pull(c) {
-      const r = await reader.read();
-      if (r.done) c.close(); else c.enqueue(r.value);
-    },
-  });
-  const rh = new Headers();
-  rh.set("Access-Control-Allow-Origin", "*");
-  rh.set("Content-Type", ct || "application/octet-stream");
-  rh.set("Cache-Control", "public, max-age=3600");
-  if (res.headers && res.headers.has("Content-Range")) rh.set("Content-Range", res.headers.get("Content-Range"));
-  if (res.headers && res.headers.has("Content-Length")) rh.set("Content-Length", res.headers.get("Content-Length"));
-  return new Response(stream, { status: res.status, headers: rh });
 }
