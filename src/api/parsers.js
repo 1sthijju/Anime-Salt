@@ -4,35 +4,42 @@ export function stripScriptsStyles(html) {
 
 export function extractAnimeList(html) {
   const cards = [];
-  const articleRegex = /<article[^>]*>([\s\S]*?)<\/article>/gi;
+  const seen = new Set();
+  // Matches ANY anchor tag linking to series or movies, regardless of wrapper tag
+  const linkRegex = /<a[^>]+href="([^"]+\/(?:series|movies)\/[^/]+\/?)"[^>]*>([\s\S]*?)<\/a>/gi;
   let match;
   
-  while ((match = articleRegex.exec(html)) !== null) {
-    const content = match[1];
-    const linkMatch = content.match(/<a[^>]+href="([^"]+)"/i);
-    if (!linkMatch) continue;
+  while ((match = linkRegex.exec(html)) !== null) {
+    const url = match[1];
+    const content = match[2];
+    const slugMatch = url.match(/(?:series|movies)\/([^/]+)/);
+    if (!slugMatch) continue;
+    const id = slugMatch[1];
     
-    const url = linkMatch[1];
-    const slugMatch = url.match(/(?:series|movies|episode)\/([^/]+)\//i);
-    const id = slugMatch ? slugMatch[1] : url;
+    if (seen.has(id)) continue; // Deduplicate cards
+    seen.add(id);
     
-    // Robust title extraction: gets text content of entry-title or title class
-    let title = "";
-    const titleMatch = content.match(/class="[^"]*(?:entry-title|title)[^"]*"[^>]*>([\s\S]*?)<\/[^>]+>/i) ||
-                       content.match(/<a[^>]+title="([^"]+)"/i) ||
-                       content.match(/<img[^>]+alt="([^"]+)"/i);
-    if (titleMatch) title = titleMatch[1].replace(/<[^>]+>/g, '').trim();
+    let title = content.replace(/<[^>]+>/g, '').trim();
+    if (!title) {
+      const titleAttr = match[0].match(/title="([^"]+)"/i);
+      if (titleAttr) title = titleAttr[1];
+    }
     
-    const imgMatch = content.match(/<img[^>]+>/i);
     let image = "";
+    // Look for image inside the anchor, or just before it (within 500 chars)
+    const imgInside = content.match(/<img[^>]+>/i);
+    const beforeText = html.substring(Math.max(0, match.index - 500), match.index);
+    const imgBefore = beforeText.match(/<img[^>]+>/gi)?.pop();
+    
+    const imgMatch = imgInside || imgBefore;
     if (imgMatch) {
-      const imgTag = imgMatch[0];
+      const imgTag = Array.isArray(imgMatch) ? imgMatch[0] : imgMatch;
       const dataSrc = imgTag.match(/data-src="([^"]+)"/i);
       const src = imgTag.match(/\ssrc="([^"]+)"/i);
-      const imgUrl = (dataSrc ? dataSrc[1] : (src ? src[1] : "")) || "";
+      let imgUrl = (dataSrc ? dataSrc[1] : (src ? src[1] : "")) || "";
       
-      if (imgUrl && !imgUrl.startsWith("data:") && 
-          !/wp-content\/uploads\/.*(AnimeSalt|cropped-|icon\.png|logo\.png|favicon)/i.test(imgUrl)) {
+      if (imgUrl && !imgUrl.startsWith("data:") && !/wp-content\/uploads\/.*(AnimeSalt|cropped-|icon\.png|logo\.png|favicon)/i.test(imgUrl)) {
+        if (imgUrl.startsWith("//")) imgUrl = "https:" + imgUrl; // Normalize protocol
         image = imgUrl;
       }
     }
@@ -44,42 +51,26 @@ export function extractAnimeList(html) {
 
 export function extractHomeSections(html) {
   const cleanHtml = stripScriptsStyles(html);
-  const headings = ["Most-Watched Series", "Most-Watched Films", "Fresh Drops", "On-Air Series", "New Anime Arrivals", "Just In: Cartoon Series", "Latest Anime Movies", "Fresh Cartoon Films", "Latest Episodes"];
-  const indices = [];
+  const headings = [
+    "Most-Watched Series", "Most-Watched Films", "Fresh Drops", "On-Air Series",
+    "New Anime Arrivals", "Just In: Cartoon Series", "Latest Anime Movies", 
+    "Fresh Cartoon Films", "Latest Episodes"
+  ];
   
-  // Backward-DOM-Walk: Finds text node, then walks back to find valid enclosing tag
-  for (const h of headings) {
-    let searchIdx = 0;
-    while (true) {
-      const textIdx = cleanHtml.indexOf(h, searchIdx);
-      if (textIdx === -1) break;
-      
-      let tagStart = cleanHtml.lastIndexOf('<', textIdx);
-      if (tagStart !== -1) {
-        const tagMatch = cleanHtml.substring(tagStart, textIdx).match(/<([a-z0-9]+)[^>]*>$/i);
-        if (tagMatch) {
-          const tagName = tagMatch[1].toLowerCase();
-          if (!['script', 'style', 'option', 'a'].includes(tagName)) {
-            const endTag = `</${tagName}>`;
-            let tagEnd = cleanHtml.indexOf(endTag, textIdx);
-            if (tagEnd !== -1) {
-               tagEnd += endTag.length;
-               indices.push({ heading: h, start: tagEnd, index: tagStart });
-            }
-          }
-        }
-      }
-      searchIdx = textIdx + h.length;
-    }
-  }
-  
-  indices.sort((a, b) => a.index - b.index);
   const sections = {};
   const map = { "Most-Watched Series": "mostWatchedSeries", "Most-Watched Films": "mostWatchedFilms", "Fresh Drops": "freshDrops", "On-Air Series": "ongoing", "New Anime Arrivals": "latest", "Just In: Cartoon Series": "popularSeries", "Latest Anime Movies": "movies", "Fresh Cartoon Films": "popularFilms", "Latest Episodes": "latestEpisodes" };
   
+  // Simple text-splitting approach: finds the exact heading text and splits the HTML
+  const indices = [];
+  for (const h of headings) {
+    const idx = cleanHtml.indexOf(h);
+    if (idx !== -1) indices.push({ heading: h, index: idx + h.length });
+  }
+  indices.sort((a, b) => a.index - b.index);
+  
   for (let i = 0; i < indices.length; i++) {
-    const start = indices[i].start;
-    const end = i + 1 < indices.length ? indices[i+1].index : cleanHtml.length;
+    const start = indices[i].index;
+    const end = i + 1 < indices.length ? indices[i+1].index - indices[i+1].heading.length : cleanHtml.length;
     const sectionHtml = cleanHtml.substring(start, end);
     const cards = extractAnimeList(sectionHtml);
     
@@ -93,8 +84,11 @@ export function extractHomeSections(html) {
 }
 
 export function extractPostData(html) {
-  const postMatch = html.match(/class="[^"]*postid-(\d+)[^"]*"/i) || html.match(/data-post="(\d+)"/i);
-  const nonceMatch = html.match(/"nonce":"([^"]+)"/i) || html.match(/var\s+nonce\s*=\s*["']([^"']+)["']/i) || html.match(/name="nonce"\s+value="([^"]+)"/i);
+  // Permissive matching for WP post ID and nonce across classes, data attributes, and scripts
+  const postMatch = html.match(/postid-(\d+)/i) || html.match(/data-(?:post|id)="(\d+)"/i);
+  const nonceMatch = html.match(/["']nonce["']\s*:\s*["']([a-z0-9]+)["']/i) || 
+                     html.match(/nonce\s*=\s*["']([a-z0-9]+)["']/i) ||
+                     html.match(/_wpnonce["'][^"']*["']([a-z0-9]+)/i);
   return { postId: postMatch ? postMatch[1] : null, nonce: nonceMatch ? nonceMatch[1] : null };
 }
 
@@ -110,13 +104,17 @@ export function extractPoster(html) {
     if (!srcMatch) continue;
     let src = srcMatch[1];
     if (src.startsWith("data:") || /wp-content\/uploads\/.*(AnimeSalt|cropped-|icon\.png|logo\.png|favicon)/i.test(src)) continue;
-    if (/image\.tmdb\.org\/t\/p\/(w154|w185|w342|w500)/i.test(src)) lastPortrait = src;
+    if (/image\.tmdb\.org\/t\/p\/(w154|w185|w342|w500)/i.test(src)) {
+      if (src.startsWith("//")) src = "https:" + src;
+      lastPortrait = src;
+    }
   }
   return lastPortrait;
 }
 
 export function extractBackdrop(html) {
-  const landscapeRegex = /(https?:\/\/image\.tmdb\.org\/t\/p\/(w780|w1280|w1920|original)\/[^"'\s]+)/gi;
+  // Looks for landscape TMDB URLs in inline JSON, CSS backgrounds, or srcset
+  const landscapeRegex = /(?:url\(|src=|srcset=|["'])(https?:\/\/image\.tmdb\.org\/t\/p\/(?:w780|w1280|w1920|original)\/[^"'\s)]+)/gi;
   let match;
   while ((match = landscapeRegex.exec(html)) !== null) {
     let url = match[1].replace(/\\\//g, '/'); 
@@ -127,11 +125,11 @@ export function extractBackdrop(html) {
 
 export function extractQuickPlay(text) {
   const qp = {};
-  const first = text.match(/First\s+S(\d+)E(\d+)/i);
+  const first = text.match(/First\s*S?(\d+)E(\d+)/i);
   if (first) qp.first = { season: parseInt(first[1]), episode: parseInt(first[2]), slug: "" };
-  const dub = text.match(/Latest\s+Dub\s+S(\d+)E(\d+)/i);
+  const dub = text.match(/Latest\s+Dub\s*S?(\d+)E(\d+)/i);
   if (dub) qp.latestDub = { season: parseInt(dub[1]), episode: parseInt(dub[2]), slug: "" };
-  const sub = text.match(/Latest\s+Sub\s+S(\d+)E(\d+)/i);
+  const sub = text.match(/Latest\s+Sub\s*S?(\d+)E(\d+)/i);
   if (sub) qp.latestSub = { season: parseInt(sub[1]), episode: parseInt(sub[2]), slug: "" };
   return qp;
 }
