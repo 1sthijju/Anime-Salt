@@ -5,12 +5,25 @@ export async function fetchSeasonEpisodes(postId, nonce, season, temp = 0) {
   
   try {
     let html = await siteAjax(params);
-    // Strict check for WordPress "0" failure response
+    
+    // Handle JSON responses from WP AJAX (some themes wrap HTML in JSON)
+    try {
+      const json = JSON.parse(html);
+      if (json.html) html = json.html;
+      else if (json.data) html = json.data;
+    } catch(e) {}
+    
     if (!html || html.trim() === "0") {
       params.action = "action_select_season"; 
       html = await siteAjax(params);
+      try {
+        const json = JSON.parse(html);
+        if (json.html) html = json.html;
+        else if (json.data) html = json.data;
+      } catch(e) {}
     }
-    if (html.trim() === "0") return [];
+    
+    if (!html || html.trim() === "0") return [];
     return parseEpisodesFromFragment(html);
   } catch (e) {
     return [];
@@ -46,7 +59,10 @@ export function parseEpisodesFromFragment(html) {
     let image = "";
     if (imgMatch) {
       let imgUrl = imgMatch[1];
-      if (imgUrl && !imgUrl.startsWith("data:") && !/wp-content\/uploads\/.*(AnimeSalt|cropped-|icon\.png|logo\.png|favicon)/i.test(imgUrl)) image = imgUrl;
+      if (imgUrl && !imgUrl.startsWith("data:") && !/wp-content\/uploads\/.*(AnimeSalt|cropped-|icon\.png|logo\.png|favicon)/i.test(imgUrl)) {
+        if (imgUrl.startsWith("//")) imgUrl = "https:" + imgUrl;
+        image = imgUrl;
+      }
     }
     
     episodes.push({ num, season, title, slug, url, image, regionalDub: match.index > dividerIndex ? false : true });
