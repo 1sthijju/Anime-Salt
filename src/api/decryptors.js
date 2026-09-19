@@ -22,30 +22,6 @@ function hexToBytes(hex) {
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// Pure JS Dean Edwards p,a,c,k,e,d unpacker (No eval() needed for Workers)
-// ---------------------------------------------------------------------------
-function baseEncode(num, base) {
-  const chars = '0123456789abcdefghijklmnopqrstuvwxyz';
-  if (num < base) {
-    return num > 35 ? String.fromCharCode(num + 29) : chars[num];
-  }
-  return baseEncode(Math.floor(num / base), base) + ((num % base) > 35 ? String.fromCharCode((num % base) + 29) : chars[num % base]);
-}
-
-function unpackJs(p, a, c, k) {
-  while (c--) {
-    if (k[c]) {
-      const regex = new RegExp('\\b' + baseEncode(c, a) + '\\b', 'g');
-      p = p.replace(regex, k[c]);
-    }
-  }
-  return p;
-}
-
-// ---------------------------------------------------------------------------
-// AES Blob decryption (for players that hide config in encrypted JSON)
-// ---------------------------------------------------------------------------
 async function tryDecryptConfig(html) {
   const blobMatch =
     html.match(/(?:var|const|let)\s+\w*(?:encrypted|cipher|data|config)\w*\s*=\s*["']([A-Za-z0-9+\/=_-]{64,})["']/i) ||
@@ -74,7 +50,7 @@ async function tryDecryptConfig(html) {
 function pickStreamFromJson(json) {
   if (!json) return null;
   const sources = json.source || json.sources || json.streams || json.qualities || null;
-  let direct_hls = json.file || json.url || json.source_file || null;
+  let direct_hls = json.file || json.url || json.source_file || json.videoSource || json.securedLink || null;
   const qualities = [];
   if (Array.isArray(sources)) {
     for (const s of sources) {
@@ -94,25 +70,30 @@ function pickStreamFromJson(json) {
 }
 
 // ---------------------------------------------------------------------------
-// as-cdn26.top Decryptor (Handles Plaintext, Packed JS, and AES blobs)
+// as-cdn26.top Decryptor (API-based + fallback to packed JS)
 // ---------------------------------------------------------------------------
 export async function resolveAsCdn26(embedUrl) {
   try {
-    const res = await fetch(embedUrl, {
-      headers: {
-        "Referer": "https://as-cdn26.top/",
-        "Origin": "https://as-cdn26.top",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      },
-    });
-    if (!res.ok) return { embedUrl, host: "as-cdn26.top", isIframe: true };
-    const html = await res.text();
+    // Extract video ID from URL
+    const idMatch = embedUrl.match(/\/video\/([a-f0-9]+)/);
+    if (!idMatch) return { embedUrl, host: "as-cdn26.top", isIframe: true };
+    const videoId = idMatch[1];
 
-    // 1. Extract global subtitles (often defined outside the packed JS)
-    // Format: var playerjsSubtitle = "[English]https://as-cdn30.top/p/...";
+    const headers = {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Referer": "https://as-cdn26.top/",
+      "Origin": "https://as-cdn26.top",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    };
+
+    // Step 1: Fetch player page to get cookies
+    const playerRes = await fetch(embedUrl, { headers });
+    const cookies = playerRes.headers.get('set-cookie') || '';
+    const playerHtml = await playerRes.text();
+
+    // Step 2: Extract subtitles from player HTML
     const subtitles = [];
-    const subMatch = html.match(/var\s+playerjsSubtitle\s*=\s*"(.*?)";/i);
+    const subMatch = playerHtml.match(/var\s+playerjsSubtitle\s*=\s*"(.*?)";/i);
     if (subMatch) {
       const rawSub = subMatch[1];
       const subRegex = /\[([^\]]+)\](https?:\/\/[^"'\s,;]+)/g;
@@ -120,47 +101,53 @@ export async function resolveAsCdn26(embedUrl) {
       while ((sm = subRegex.exec(rawSub)) !== null) {
         subtitles.push({ label: sm[1], url: sm[2] });
       }
-      // Fallback if it's just a raw URL without the [Lang] tag
-      if (subtitles.length === 0 && rawSub.startsWith("http")) {
-        subtitles.push({ label: "Default", url: rawSub });
+    }
+
+    // Step 3: Call API to get stream URL
+    const apiUrl = `https://as-cdn26.top/player/index.php?data=${videoId}&do=getVideo`;
+    const apiHeaders = {
+      ...headers,
+      "Content-Type": "application/x-www-form-urlencoded",
+      "X-Requested-With": "XMLHttpRequest",
+      "Referer": embedUrl,
+      "Cookie": cookies
+    };
+    const body = `hash=${videoId}&r=`;
+
+    const apiRes = await fetch(apiUrl, {
+      method: "POST",
+      headers: apiHeaders,
+      body: body
+    });
+
+    if (apiRes.ok) {
+      try {
+        const jdata = await apiRes.json();
+        
+        // The API returns the decrypted URL directly
+        if (jdata.videoSource || jdata.securedLink) {
+          return {
+            direct_hls: jdata.videoSource || jdata.securedLink,
+            qualities: [],
+            subtitles,
+            poster: jdata.videoImage || null,
+            host: "as-cdn26.top",
+            isIframe: false
+          };
+        }
+      } catch (e) {
+        console.warn("API JSON parse failed:", e.message);
       }
     }
 
-    // 2. Plaintext m3u8 scan
-    const plainM3u8 = html.match(/(https?:\/\/[^"'\s<>\\]+\.m3u8[^"'\s<>\\]*)/i);
+    // Step 4: Fallback - try plaintext m3u8 scan
+    const plainM3u8 = playerHtml.match(/(https?:\/\/[^"'\s<>\\]+\.m3u8[^"'\s<>\\]*)/i);
     if (plainM3u8) {
       return { direct_hls: plainM3u8[1], qualities: [], subtitles, host: "as-cdn26.top" };
     }
 
-    // 3. Packed JS unpacking (p,a,c,k,e,d)
-    // Safely handles escaped quotes inside the single-quoted strings
-    const packedMatch = html.match(/eval\(function\(p,a,c,k,e,d\)\{[\s\S]*?\}\s*\(\s*'((?:\\.|[^'\\])*)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'((?:\\.|[^'\\])*)'\.split\('\|'\)/);
-    if (packedMatch) {
-      try {
-        const p = packedMatch[1].replace(/\\'/g, "'"); // unescape quotes
-        const a = parseInt(packedMatch[2], 10);
-        const c = parseInt(packedMatch[3], 10);
-        const k = packedMatch[4].replace(/\\'/g, "'").split('|');
-        
-        const unpacked = unpackJs(p, a, c, k);
-        
-        // Search the unpacked code for the hidden .m3u8 URL
-        const m3u8InUnpacked = unpacked.match(/(https?:\/\/[^"'\s<>\\]+\.m3u8[^"'\s<>\\]*)/i);
-        if (m3u8InUnpacked) {
-          return {
-            direct_hls: m3u8InUnpacked[1],
-            qualities: [],
-            subtitles,
-            host: "as-cdn26.top"
-          };
-        }
-      } catch (e) {
-        console.warn("Failed to unpack JS:", e.message);
-      }
-    }
-
-    // 4. Encrypted config blob (AES) fallback
-    const json = await tryDecryptConfig(html);
+    // Step 5: Fallback - encrypted config blob (AES)
+    const json = await tryDecryptConfig(playerHtml);
     const picked = pickStreamFromJson(json);
     if (picked) return { ...picked, subtitles: [...subtitles, ...(picked.subtitles || [])], host: "as-cdn26.top" };
 
