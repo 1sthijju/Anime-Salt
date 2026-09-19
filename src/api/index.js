@@ -83,7 +83,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.34.0",
+          version: "3.35.0",
           endpoints: {
             system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings", "/api/debug/poster", "/api/debug/home-timing"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
@@ -117,7 +117,7 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.34.0-edge",
+          version: "3.35.0-edge",
           endpointsCount: 31
         });
       }
@@ -871,7 +871,7 @@ export default {
       }
 
       // ====================================================================
-      // Stream resolver
+      // Stream resolver — FIXED: passes referer to proxyMediaUrl
       // ====================================================================
       if (path === "/api/stream") {
         const epSlug = params.get("ep");
@@ -918,16 +918,24 @@ export default {
         if (resolvedStream) {
           const workerOrigin = new URL(request.url).origin;
           const primary = resolvedStream.direct_hls || resolvedStream.qualities?.[0]?.url || null;
+          const hostReferer = resolvedStream.host === "as-cdn26.top"
+            ? "https://as-cdn26.top/"
+            : "https://abyssplayer.com/";
+
           let groups = { audio: [], subtitles: [] };
           if (resolvedStream.direct_hls) groups = await getMasterInfo(resolvedStream.direct_hls);
-          let proxied = primary ? proxyMediaUrl(workerOrigin, primary) : null;
+          
+          // FIXED: Pass referer to proxyMediaUrl
+          let proxied = primary ? proxyMediaUrl(workerOrigin, primary, { referer: hostReferer }) : null;
           if (proxied && audio) proxied += `&audio=${encodeURIComponent(audio)}`;
 
+          // FIXED: Pass referer to subtitle proxy URLs
           const subtitles = (resolvedStream.subtitles || []).map(s => ({
             label: s.label,
-            url: proxyMediaUrl(workerOrigin, s.url) +
-                 "&force=" + encodeURIComponent("text/vtt") +
-                 (s.referer ? "&referer=" + encodeURIComponent(s.referer) : ""),
+            url: proxyMediaUrl(workerOrigin, s.url, {
+              force: "text/vtt",
+              referer: s.referer || hostReferer,
+            }),
           }));
 
           return jsonResponse({
@@ -937,7 +945,7 @@ export default {
               audio_languages: groups.audio, subtitle_languages: groups.subtitles,
               selected_audio: audio || null, serverIndex, selectedLanguage,
               isIframe: !!resolvedStream.isIframe,
-              referer: resolvedStream.host === "as-cdn26.top" ? "https://as-cdn26.top/" : "https://abyssplayer.com/",
+              referer: hostReferer,
             },
           });
         }
