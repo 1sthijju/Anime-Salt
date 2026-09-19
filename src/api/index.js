@@ -83,7 +83,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.25.0",
+          version: "3.26.0",
           endpoints: {
             system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings", "/api/debug/poster"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
@@ -117,7 +117,7 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.25.0-edge",
+          version: "3.26.0-edge",
           endpointsCount: 31
         });
       }
@@ -481,7 +481,7 @@ export default {
       }
 
       // ====================================================================
-      // Anime / movie details — v3.25.0 (Full Page Parity)
+      // Anime / movie details — v3.26.0 (Complete Page Parity)
       // ====================================================================
       if (path === "/api/info") {
         const animeId = params.get("id") || params.get("slug");
@@ -649,7 +649,7 @@ export default {
           if (years.length) year = Math.min(...years);
         }
 
-        // ---------------- STATUS (10-page scan + heuristic) ----------------
+        // ---------------- STATUS (3-source resolution) ----------------
         let status = type === "movies" ? "Released" : "Unknown";
         if (type === "series") {
           const label = textOnly.match(/Status\s*[:\-]\s*(Ongoing|Completed|Airing|Finished|Ended)/i);
@@ -683,14 +683,6 @@ export default {
                 } catch (e) { break; }
               }
             }
-            
-            // Source 4: Heuristic — 100+ episodes + high season = ongoing
-            if (status === "Unknown") {
-              const epData = await getEpisodesData(animeId, "all").catch(() => ({ episodes: [], seasons: [] }));
-              if (epData.episodes.length >= 100 && epData.seasons.length >= 5) {
-                status = "Ongoing";
-              }
-            }
           }
         }
 
@@ -698,20 +690,57 @@ export default {
         let seasons = [], totalEpisodes = 0;
         if (type === "series") {
           try { 
-            const epData = await getEpisodesData(animeId, "all"); 
-            seasons = epData.seasons; 
-            if (seasons.length > 0) {
+            const epData = await getEpisodesData(animeId, "all");
+            
+            // Handle the actual response structure from episodes.js
+            const availableSeasons = epData.availableSeasons || [];
+            
+            // Build seasons array from availableSeasons
+            if (availableSeasons.length > 0) {
+              seasons = availableSeasons.map(seasonNum => {
+                const seasonEpisodes = epData.groupedEpisodes?.[seasonNum] || [];
+                const firstEp = seasonEpisodes[0];
+                const lastEp = seasonEpisodes[seasonEpisodes.length - 1];
+                const count = seasonEpisodes.length;
+                
+                let title = `Season ${seasonNum}`;
+                if (firstEp && lastEp) {
+                  title += ` • ${firstEp.num}-${lastEp.num} (${count})`;
+                } else {
+                  title += ` (${count})`;
+                }
+                
+                return { num: seasonNum, title, value: String(seasonNum) };
+              });
+              
               totalEpisodes = seasons.reduce((sum, s) => {
                 const countMatch = s.title.match(/\((\d+)\)/);
                 return sum + (countMatch ? parseInt(countMatch[1]) : 0);
               }, 0);
-            } else {
-              totalEpisodes = epData.episodes.length;
             }
-          } catch (e) {}
+            
+            // Fallback: use totalEpisodes from response
+            if (!totalEpisodes && epData.totalEpisodes) {
+              totalEpisodes = epData.totalEpisodes;
+            }
+            
+            // Heuristic: 100+ episodes = ongoing (if status still unknown)
+            if (status === "Unknown" && totalEpisodes >= 100) {
+              status = "Ongoing";
+            }
+          } catch (e) {
+            console.error(`Episodes fetch failed for ${animeId}:`, e.message);
+          }
+          
+          // Last resort: extract from text chip
           if (!totalEpisodes) {
             const epChip = textOnly.match(/(\d+)\s*Episodes/i);
             if (epChip) totalEpisodes = parseInt(epChip[1]);
+          }
+          
+          // Final heuristic: if we got 100+ episodes from text chip, assume ongoing
+          if (status === "Unknown" && totalEpisodes >= 100) {
+            status = "Ongoing";
           }
         } else { 
           totalEpisodes = 1; 
