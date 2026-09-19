@@ -1,5 +1,5 @@
 import { jsonResponse, corsHeaders, BASE_URL, CACHE_TTL_HOME, CACHE_TTL } from './config.js';
-import { fetchPage, cachedJSON, getSeriesHtml } from './net.js';
+import { fetchPage, cachedJSON, getSeriesHtml, siteAjax } from './net.js';
 import { 
   extractAnimeList, extractHomeSections, extractPostData, stripScriptsStyles, 
   extractPoster, extractBackdrop, extractQuickPlay 
@@ -9,7 +9,7 @@ import { decryptAsCdn26, decryptAbyss } from './decryptors.js';
 import { handleMediaProxy } from './media-proxy.js';
 
 async function getStatusMembership(id, ctx) {
-  const ongoing = await cachedJSON("status_ongoing_v2", async () => {
+  const ongoing = await cachedJSON("status_ongoing_v3", async () => {
     let slugs = [];
     for (let p = 1; p <= 3; p++) {
       try {
@@ -21,7 +21,7 @@ async function getStatusMembership(id, ctx) {
   }, CACHE_TTL, ctx);
   if (ongoing.includes(id)) return "Ongoing";
   
-  const completed = await cachedJSON("status_completed_v2", async () => {
+  const completed = await cachedJSON("status_completed_v3", async () => {
     let slugs = [];
     for (let p = 1; p <= 3; p++) {
       try {
@@ -43,7 +43,7 @@ export default {
     const path = url.pathname;
     
     try {
-      if (path === "/") return jsonResponse({ name: "AnimeSalt Edge API", version: "1.3.0", upstream_proxy: BASE_URL });
+      if (path === "/") return jsonResponse({ name: "AnimeSalt Edge API", version: "1.4.0", upstream_proxy: BASE_URL });
       
       if (path === "/api/health") {
         const start = Date.now();
@@ -56,13 +56,13 @@ export default {
       }
       
       if (path === "/api/home") {
-        const data = await cachedJSON("home_html_v2", async () => extractHomeSections(await fetchPage("/")), CACHE_TTL_HOME, ctx);
+        const data = await cachedJSON("home_html_v3", async () => extractHomeSections(await fetchPage("/")), CACHE_TTL_HOME, ctx);
         return jsonResponse({ success: true, data });
       }
       
       if (path === "/api/search") {
         const kw = url.searchParams.get("keyword") || "", page = url.searchParams.get("page") || "1";
-        const html = await cachedJSON(`search_v2_${kw}_${page}`, async () => fetchPage("/", { s: kw, paged: page }), CACHE_TTL, ctx);
+        const html = await cachedJSON(`search_v3_${kw}_${page}`, async () => fetchPage("/", { s: kw, paged: page }), CACHE_TTL, ctx);
         return jsonResponse({ success: true, page: parseInt(page), data: extractAnimeList(stripScriptsStyles(html)) });
       }
       
@@ -72,7 +72,7 @@ export default {
         
         let dataObj;
         try {
-          dataObj = await cachedJSON(`info_v2_${id}`, async () => getSeriesHtml(id), CACHE_TTL, ctx);
+          dataObj = await cachedJSON(`info_v3_${id}`, async () => getSeriesHtml(id), CACHE_TTL, ctx);
         } catch(e) {
           if (e.message === "Not Found") return jsonResponse({ error: "Not Found" }, 404);
           throw e;
@@ -145,7 +145,7 @@ export default {
         
         let dataObj;
         try {
-          dataObj = await cachedJSON(`info_v2_${id}`, async () => getSeriesHtml(id), CACHE_TTL, ctx);
+          dataObj = await cachedJSON(`info_v3_${id}`, async () => getSeriesHtml(id), CACHE_TTL, ctx);
         } catch(e) {
           if (e.message === "Not Found") return jsonResponse({ error: "Not Found" }, 404);
           throw e;
@@ -174,7 +174,7 @@ export default {
         let html = "";
         for (const prefix of ["episode", "movies", "series"]) {
           try {
-            const text = await cachedJSON(`play_v2_${prefix}_${ep}`, async () => fetchPage(`/${prefix}/${ep}/`), CACHE_TTL, ctx);
+            const text = await cachedJSON(`play_v3_${prefix}_${ep}`, async () => fetchPage(`/${prefix}/${ep}/`), CACHE_TTL, ctx);
             if (!text.includes("404 Not Found")) { html = text; break; }
           } catch(e) {}
         }
@@ -209,7 +209,7 @@ export default {
         let html = "";
         for (const prefix of ["episode", "movies", "series"]) {
           try {
-            const text = await cachedJSON(`play_v2_${prefix}_${ep}`, async () => fetchPage(`/${prefix}/${ep}/`), CACHE_TTL, ctx);
+            const text = await cachedJSON(`play_v3_${prefix}_${ep}`, async () => fetchPage(`/${prefix}/${ep}/`), CACHE_TTL, ctx);
             if (!text.includes("404 Not Found")) { html = text; break; }
           } catch(e) {}
         }
@@ -263,7 +263,7 @@ export default {
         return jsonResponse({ success: true, embedUrl, isIframe: true, referer: BASE_URL });
       }
 
-      // DEBUG ROUTE FOR AJAX PAYLOAD
+      // DEBUG ROUTES
       if (path === "/api/debug/ajax") {
         const id = url.searchParams.get("id") || "one-piece";
         try {
@@ -275,10 +275,34 @@ export default {
         }
       }
       
+      if (path === "/api/debug/ajax-response") {
+        const id = url.searchParams.get("id") || "one-piece";
+        const season = url.searchParams.get("season") || "1";
+        try {
+          const { html } = await getSeriesHtml(id);
+          const { postId, nonce } = extractPostData(html);
+          if (!postId || !nonce) return jsonResponse({ error: "Missing post/nonce", postId, nonce });
+          
+          const params = { action: "action_select_temp", temp: 0, season: season, post: postId, nonce: nonce };
+          let responseText = await siteAjax(params);
+          let parsedJson = null;
+          try { parsedJson = JSON.parse(responseText); } catch(e) {}
+          
+          return jsonResponse({ 
+              raw_response_length: responseText.length, 
+              raw_response_snippet: responseText.substring(0, 500),
+              is_json: parsedJson !== null,
+              parsed_json_keys: parsedJson ? Object.keys(parsedJson) : null
+          });
+        } catch(e) {
+          return jsonResponse({ error: e.message });
+        }
+      }
+      
       if (path === "/proxy/media") return handleMediaProxy(request);
       
       if (path.startsWith("/api/genre/") || path.startsWith("/api/type/") || path.startsWith("/api/category/")) {
-        const html = await cachedJSON(`cat_v2_${path}`, async () => fetchPage(path), CACHE_TTL, ctx);
+        const html = await cachedJSON(`cat_v3_${path}`, async () => fetchPage(path), CACHE_TTL, ctx);
         return jsonResponse({ success: true, data: extractAnimeList(stripScriptsStyles(html)) });
       }
       
