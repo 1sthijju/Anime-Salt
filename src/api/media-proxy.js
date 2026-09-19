@@ -1,4 +1,46 @@
-import { corsHeaders } from './config.js';
+export function proxyMediaUrl(workerOrigin, url, params = {}) {
+  const u = new URL("/proxy/media", workerOrigin);
+  u.searchParams.set("url", url);
+  for (const [k, v] of Object.entries(params)) {
+    if (v) u.searchParams.set(k, v);
+  }
+  return u.toString();
+}
+
+export function parseHlsMediaGroups(manifest) {
+  const audio = [];
+  const subtitles = [];
+  
+  const lines = manifest.split("\n");
+  for (const line of lines) {
+    if (line.startsWith("#EXT-X-MEDIA:")) {
+      if (line.includes("TYPE=AUDIO")) {
+        const langMatch = line.match(/LANGUAGE="([^"]+)"/);
+        const nameMatch = line.match(/NAME="([^"]+)"/);
+        if (langMatch) {
+          audio.push({
+            language: langMatch[1],
+            name: nameMatch ? nameMatch[1] : langMatch[1],
+            default: line.includes("DEFAULT=YES"),
+          });
+        }
+      }
+      if (line.includes("TYPE=SUBTITLES")) {
+        const langMatch = line.match(/LANGUAGE="([^"]+)"/);
+        const nameMatch = line.match(/NAME="([^"]+)"/);
+        if (langMatch) {
+          subtitles.push({
+            language: langMatch[1],
+            name: nameMatch ? nameMatch[1] : langMatch[1],
+            default: line.includes("DEFAULT=YES"),
+          });
+        }
+      }
+    }
+  }
+  
+  return { audio, subtitles };
+}
 
 export async function handleMediaProxy(request) {
   const url = new URL(request.url);
@@ -10,7 +52,10 @@ export async function handleMediaProxy(request) {
   if (!targetUrl) return new Response("Missing url", { status: 400 });
   
   const headers = new Headers();
-  if (referer) { headers.set("Referer", referer); headers.set("Origin", new URL(referer).origin); }
+  if (referer) { 
+    headers.set("Referer", referer); 
+    headers.set("Origin", new URL(referer).origin); 
+  }
   headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
   if (request.headers.has("Range")) headers.set("Range", request.headers.get("Range"));
   
@@ -20,7 +65,14 @@ export async function handleMediaProxy(request) {
   if (contentType.includes("mpegurl") || targetUrl.includes(".m3u8")) {
     let manifest = await res.text();
     manifest = rewriteHlsManifest(manifest, targetUrl, referer, audioLang);
-    return new Response(manifest, { status: res.status, headers: { "Content-Type": "application/vnd.apple.mpegurl", "Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=3600" } });
+    return new Response(manifest, { 
+      status: res.status, 
+      headers: { 
+        "Content-Type": "application/vnd.apple.mpegurl", 
+        "Access-Control-Allow-Origin": "*", 
+        "Cache-Control": "public, max-age=3600" 
+      } 
+    });
   }
   
   if (contentType.includes("subrip") || targetUrl.includes(".srt") || forceType === "text/vtt") {
