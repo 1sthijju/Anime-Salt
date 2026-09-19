@@ -22,8 +22,30 @@ function hexToBytes(hex) {
   return out;
 }
 
-// Try to locate an encrypted config blob + key/iv in the player page and
-// decrypt it (AES-CBC then AES-CTR). Returns parsed JSON or null.
+// ---------------------------------------------------------------------------
+// Pure JS Dean Edwards p,a,c,k,e,d unpacker (No eval() needed for Workers)
+// ---------------------------------------------------------------------------
+function baseEncode(num, base) {
+  const chars = '0123456789abcdefghijklmnopqrstuvwxyz';
+  if (num < base) {
+    return num > 35 ? String.fromCharCode(num + 29) : chars[num];
+  }
+  return baseEncode(Math.floor(num / base), base) + ((num % base) > 35 ? String.fromCharCode((num % base) + 29) : chars[num % base]);
+}
+
+function unpackJs(p, a, c, k) {
+  while (c--) {
+    if (k[c]) {
+      const regex = new RegExp('\\b' + baseEncode(c, a) + '\\b', 'g');
+      p = p.replace(regex, k[c]);
+    }
+  }
+  return p;
+}
+
+// ---------------------------------------------------------------------------
+// AES Blob decryption (for players that hide config in encrypted JSON)
+// ---------------------------------------------------------------------------
 async function tryDecryptConfig(html) {
   const blobMatch =
     html.match(/(?:var|const|let)\s+\w*(?:encrypted|cipher|data|config)\w*\s*=\s*["']([A-Za-z0-9+\/=_-]{64,})["']/i) ||
@@ -71,6 +93,9 @@ function pickStreamFromJson(json) {
   return { direct_hls, qualities, subtitles };
 }
 
+// ---------------------------------------------------------------------------
+// as-cdn26.top Decryptor (Handles Plaintext, Packed JS, and AES blobs)
+// ---------------------------------------------------------------------------
 export async function resolveAsCdn26(embedUrl) {
   try {
     const res = await fetch(embedUrl, {
@@ -84,28 +109,60 @@ export async function resolveAsCdn26(embedUrl) {
     if (!res.ok) return { embedUrl, host: "as-cdn26.top", isIframe: true };
     const html = await res.text();
 
-    // 1) plaintext m3u8 anywhere
-    const plain = html.match(/(https?:\/\/[^"'\s<>\\]+\.m3u8[^"'\s<>\\]*)/i);
-    if (plain) return { direct_hls: plain[1], qualities: [], subtitles: [], host: "as-cdn26.top" };
+    // 1. Extract global subtitles (often defined outside the packed JS)
+    // Format: var playerjsSubtitle = "[English]https://as-cdn30.top/p/...";
+    const subtitles = [];
+    const subMatch = html.match(/var\s+playerjsSubtitle\s*=\s*"(.*?)";/i);
+    if (subMatch) {
+      const rawSub = subMatch[1];
+      const subRegex = /\[([^\]]+)\](https?:\/\/[^"'\s,;]+)/g;
+      let sm;
+      while ((sm = subRegex.exec(rawSub)) !== null) {
+        subtitles.push({ label: sm[1], url: sm[2] });
+      }
+      // Fallback if it's just a raw URL without the [Lang] tag
+      if (subtitles.length === 0 && rawSub.startsWith("http")) {
+        subtitles.push({ label: "Default", url: rawSub });
+      }
+    }
 
-    // 2) encrypted config blob (uses crypto.js)
+    // 2. Plaintext m3u8 scan
+    const plainM3u8 = html.match(/(https?:\/\/[^"'\s<>\\]+\.m3u8[^"'\s<>\\]*)/i);
+    if (plainM3u8) {
+      return { direct_hls: plainM3u8[1], qualities: [], subtitles, host: "as-cdn26.top" };
+    }
+
+    // 3. Packed JS unpacking (p,a,c,k,e,d)
+    // Safely handles escaped quotes inside the single-quoted strings
+    const packedMatch = html.match(/eval\(function\(p,a,c,k,e,d\)\{[\s\S]*?\}\s*\(\s*'((?:\\.|[^'\\])*)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'((?:\\.|[^'\\])*)'\.split\('\|'\)/);
+    if (packedMatch) {
+      try {
+        const p = packedMatch[1].replace(/\\'/g, "'"); // unescape quotes
+        const a = parseInt(packedMatch[2], 10);
+        const c = parseInt(packedMatch[3], 10);
+        const k = packedMatch[4].replace(/\\'/g, "'").split('|');
+        
+        const unpacked = unpackJs(p, a, c, k);
+        
+        // Search the unpacked code for the hidden .m3u8 URL
+        const m3u8InUnpacked = unpacked.match(/(https?:\/\/[^"'\s<>\\]+\.m3u8[^"'\s<>\\]*)/i);
+        if (m3u8InUnpacked) {
+          return {
+            direct_hls: m3u8InUnpacked[1],
+            qualities: [],
+            subtitles,
+            host: "as-cdn26.top"
+          };
+        }
+      } catch (e) {
+        console.warn("Failed to unpack JS:", e.message);
+      }
+    }
+
+    // 4. Encrypted config blob (AES) fallback
     const json = await tryDecryptConfig(html);
     const picked = pickStreamFromJson(json);
-    if (picked) return { ...picked, host: "as-cdn26.top" };
-
-    // 3) known ajax-style endpoint referenced by the player
-    const ajax = html.match(/["'](\/(?:encrypt-)?(?:ajax|api)[^"']*)["']/i);
-    if (ajax) {
-      try {
-        const u = new URL(ajax[1], "https://as-cdn26.top").toString();
-        const r2 = await fetch(u, { headers: { "Referer": embedUrl, "X-Requested-With": "XMLHttpRequest" } });
-        if (r2.ok) {
-          const j2 = await r2.json().catch(() => null);
-          const p2 = pickStreamFromJson(j2);
-          if (p2) return { ...p2, host: "as-cdn26.top" };
-        }
-      } catch (e) { /* ignore */ }
-    }
+    if (picked) return { ...picked, subtitles: [...subtitles, ...(picked.subtitles || [])], host: "as-cdn26.top" };
 
     return { embedUrl, host: "as-cdn26.top", isIframe: true };
   } catch (e) {
@@ -113,6 +170,9 @@ export async function resolveAsCdn26(embedUrl) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Abyss Family Decryptor (short.icu, abysscdn, etc.)
+// ---------------------------------------------------------------------------
 export async function resolveAbyss(embedUrl) {
   try {
     const url = normalizeAbyssUrl(embedUrl);
