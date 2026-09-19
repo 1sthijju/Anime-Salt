@@ -1,28 +1,32 @@
 import { siteAjax } from './net.js';
 
-export async function fetchSeasonEpisodes(postId, nonce, season, temp = 0) {
-  // WP AJAX often requires exact key casing and presence
-  const params = { 
-    action: "action_select_temp", 
-    temp: temp, 
-    season: season, 
-    post: postId, 
-    nonce: nonce 
-  };
-  
-  try {
-    let html = await siteAjax(params);
+export async function fetchSeasonEpisodes(postId, nonces, season, temp = 0) {
+  // Iterate through all extracted nonces until one succeeds
+  for (const nonce of nonces) {
+    const params = { 
+      action: "action_select_temp", 
+      temp: temp, 
+      season: season, 
+      post: postId, 
+      nonce: nonce 
+    };
     
-    // Handle JSON responses from WP AJAX
     try {
-      const json = JSON.parse(html);
-      if (json.html) html = json.html;
-      else if (json.data) html = json.data;
-      else if (json.success && json.data) html = json.data;
-    } catch(e) {}
-    
-    if (!html || html.trim() === "0" || html.trim() === "-1") {
-      // Fallback action
+      let html = await siteAjax(params);
+      
+      // Handle JSON responses from WP AJAX
+      try {
+        const json = JSON.parse(html);
+        if (json.html) html = json.html;
+        else if (json.data) html = json.data;
+      } catch(e) {}
+      
+      // Check if we got valid HTML containing episode links
+      if (html && !html.trim().startsWith("0") && !html.trim().startsWith("-1") && html.includes("/episode/")) {
+        return parseEpisodesFromFragment(html);
+      }
+      
+      // Try fallback action with the same nonce
       params.action = "action_select_season"; 
       html = await siteAjax(params);
       try {
@@ -30,13 +34,13 @@ export async function fetchSeasonEpisodes(postId, nonce, season, temp = 0) {
         if (json.html) html = json.html;
         else if (json.data) html = json.data;
       } catch(e) {}
-    }
-    
-    if (!html || html.trim() === "0" || html.trim() === "-1") return [];
-    return parseEpisodesFromFragment(html);
-  } catch (e) {
-    return [];
+      
+      if (html && !html.trim().startsWith("0") && !html.trim().startsWith("-1") && html.includes("/episode/")) {
+        return parseEpisodesFromFragment(html);
+      }
+    } catch (e) { /* continue to next nonce */ }
   }
+  return [];
 }
 
 export function parseEpisodesFromFragment(html) {
@@ -61,7 +65,6 @@ export function parseEpisodesFromFragment(html) {
       num = parseInt(sxeMatch[2], 10) || 1; 
     }
     
-    // Look for title in the surrounding 500 chars
     const startIdx = Math.max(0, match.index - 500);
     const windowText = html.substring(startIdx, match.index + 500);
     
