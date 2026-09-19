@@ -41,8 +41,6 @@ async function categoryPage(path, tax, params, altPrefixes = []) {
   return jsonResponse({ success: true, page, term, data: [] });
 }
 
-// Movies embed their player on /movies/<slug>/, series on /series/<slug>/,
-// episodes on /episode/<slug>/. Try all three for playback markup.
 async function getPlaybackHtml(slug) {
   const candidates = [`/episode/${slug}/`, `/movies/${slug}/`, `/series/${slug}/`];
   for (const p of candidates) {
@@ -54,7 +52,6 @@ async function getPlaybackHtml(slug) {
   return "";
 }
 
-// Reject 404/error pages; require at least one real-content marker
 function isContentPage(html) {
   if (!html) return false;
   if (/<title>[^<]*404/i.test(html)) return false;
@@ -67,7 +64,7 @@ const LANDSCAPE_TMDB = /image\.tmdb\.org\/t\/p\/w(?:780|1280|1920|original)\//i;
 const PORTRAIT_TMDB = /image\.tmdb\.org\/t\/p\/w(?:500|342|185|154)\//i;
 const SITE_ASSET = /animesalt\.cx\/wp-content\/uploads|AnimeSalt|cropped-|icon\.png|logo\.png|favicon/i;
 const TMDB_HOST = "https://image.tmdb.org";
-const CACHE_TTL_STATUS = 21600; // 6h in SECONDS (Cache API max-age)
+const CACHE_TTL_STATUS = 21600; // 6h in SECONDS
 
 // ---------------------------------------------------------------------------
 // Worker entry
@@ -615,7 +612,7 @@ export default {
                        || data.match(/<meta[^>]*name="description"[^>]*content="([^"]+)"/i);
         const description = descMatch ? descMatch[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim() : "";
 
-        // Genres (strict <a> only, both /category/genre/ and /genre/)
+        // Genres (matches both /category/genre/ and /genre/, strict <a> only)
         const genres = [];
         const genreRegex = /<a[^>]+href="[^"]*\/(?:category\/)?genre\/[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
         let match;
@@ -624,7 +621,7 @@ export default {
           if (g && g.length < 50 && !genres.includes(g)) genres.push(g);
         }
 
-        // Languages (strict <a> only, both /category/language/ and /language/)
+        // Languages (matches both /category/language/ and /language/, strict <a> only)
         const languages = [];
         const langRegex = /<a[^>]+href="[^"]*\/(?:category\/)?language\/[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
         while ((match = langRegex.exec(data)) !== null) {
