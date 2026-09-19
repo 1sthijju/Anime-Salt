@@ -1,6 +1,7 @@
 export const BASE_URL = "https://animesalt-proxy.v1nx.workers.dev";
-export const CACHE_TTL_HOME = 1800; // 30 minutes
-export const CACHE_TTL = 21600;     // 6 hours
+export const ORIGIN_URL = "https://animesalt.cx"; // Direct origin for AJAX fallback
+export const CACHE_TTL_HOME = 1800; 
+export const CACHE_TTL = 21600;     
 
 export const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
