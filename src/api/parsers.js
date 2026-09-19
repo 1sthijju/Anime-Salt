@@ -31,7 +31,7 @@ export function extractAnimeList(html) {
       h.match(/\bdata-original="([^"]+)"/i) ||
       h.match(/\bsrc="([^"]+)"/i);
     let image = imgMatch ? imgMatch[1] : "";
-    if (image.startsWith("data:")) image = "";         // lazy placeholder
+    if (image.startsWith("data:")) image = "";
     if (image.startsWith("//")) image = "https:" + image;
 
     results.push({
@@ -88,14 +88,6 @@ export function extractPopularItems(html, targetType) {
 
 // ---------------------------------------------------------------------------
 // Episode grid (WordPress AJAX fragment returned by admin-ajax)
-//
-// - Thumbnail detection: inside the <a> first, then nearest <img> in an
-//   800-char window BEFORE the link (sibling card layout used by animesalt).
-// - Lazy-load aware: data-src, data-lazy-src, data-original, srcset,
-//   and CSS background-image.
-// - regionalDub flag: flips to false once the divider
-//   "Below episodes aren't dubbed in regional languages" appears in
-//   document order.
 // ---------------------------------------------------------------------------
 export function parseEpisodesFromHtml(html, seasonNum) {
   const eps = [];
@@ -133,7 +125,6 @@ export function parseEpisodesFromHtml(html, seasonNum) {
   };
 
   while ((match = epRegex.exec(html)) !== null) {
-    // dub-divider detection (document order)
     const between = html.slice(lastIdx, match.index);
     if (DUB_DIVIDER.test(between)) regionalDub = false;
     lastIdx = match.index + match[0].length;
@@ -148,7 +139,6 @@ export function parseEpisodesFromHtml(html, seasonNum) {
     const epNum = sxe ? parseInt(sxe[2], 10) : 0;
     if (epNum === 0) continue;
 
-    // Enhanced title extraction with multiple fallback patterns
     const linkHtml = match[2];
     let title = "";
     
@@ -156,15 +146,14 @@ export function parseEpisodesFromHtml(html, seasonNum) {
       /class="[^"]*(?:entry-title|title|ep-title)[^"]*"[^>]*>([^<]+)/i,
       /<span[^>]*class="[^"]*title[^"]*"[^>]*>([^<]+)<\/span>/i,
       /<div[^>]*class="[^"]*title[^"]*"[^>]*>([^<]+)<\/div>/i,
-      />([^<]+)<\/a>/i,  // fallback: any text before </a>
+      />([^<]+)<\/a>/i,
     ];
     
     for (const pattern of titlePatterns) {
       const titleMatch = linkHtml.match(pattern);
       if (titleMatch) {
         title = titleMatch[1].trim();
-        // Clean up common patterns
-        title = title.replace(/^\d+[\.\)]\s*/, "");  // Remove "1. " or "1) "
+        title = title.replace(/^\d+[\.\)]\s*/, "");
         title = title.replace(/\s*View\s*$/i, "");
         title = title.replace(/Episode\s+\d+/i, "");
         if (title.length > 2) break;
@@ -175,7 +164,6 @@ export function parseEpisodesFromHtml(html, seasonNum) {
       title = `Episode ${epNum}`;
     }
 
-    // thumbnail: inside anchor → else nearest img in 800 chars before it
     let image = grabUrl(linkHtml);
     if (!image) {
       const windowStart = Math.max(0, match.index - 800);
@@ -199,8 +187,7 @@ export function parseEpisodesFromHtml(html, seasonNum) {
 }
 
 // ---------------------------------------------------------------------------
-// Server iframe embed URL for a given server index (used by /api/servers &
-// /api/stream). Each server lives in <div id="options-N">.
+// Server iframe embed URL for a given server index
 // ---------------------------------------------------------------------------
 export function extractEmbedForIndex(html, index) {
   const containerRegex = new RegExp(
@@ -212,7 +199,6 @@ export function extractEmbedForIndex(html, index) {
     const iframeMatch = containerMatch[1].match(/<iframe[^>]*(?:src|data-src)="([^"]+)"/i);
     if (iframeMatch && iframeMatch[1]) return iframeMatch[1];
   }
-  // Fallback: walk all iframes in document order
   const iframeRegex = /<iframe[^>]*(?:src|data-src)="([^"]+)"/gi;
   let m, i = 0;
   while ((m = iframeRegex.exec(html)) !== null) {
@@ -240,14 +226,11 @@ export function extractTaxonomy(html, tax) {
     const slug = m[2];
     let name = m[3].replace(/<[^>]+>/g, "").trim();
     
-    // Skip if empty or too long (script/style capture)
     if (!name || name.length > 50) continue;
     
-    // Skip common navigation words
     const nameLower = name.toLowerCase();
     if (nameLower === 'all' || nameLower === 'view all' || nameLower === 'see all') continue;
     
-    // Use slug as fallback if name is too short
     if (name.length < 2) {
       name = slug.replace(/-/g, " ").replace(/\b\w/g, l => l.toUpperCase());
     }
@@ -259,15 +242,122 @@ export function extractTaxonomy(html, tax) {
   return results;
 }
 
+// ---------------------------------------------------------------------------
+// Extract all categories from sitemap or homepage
+// Handles both /category/taxonomy/term/ and /category/term/ patterns
+// Parses XML sitemap structure to extract <loc> URLs
+// ---------------------------------------------------------------------------
+export function extractAllCategories(html) {
+  const results = {
+    genres: [],
+    languages: [],
+    types: [],
+    statuses: [],
+    networks: [],
+    franchises: [],
+    topLevel: []
+  };
+
+  // Check if this is XML sitemap (has <urlset> or <loc> tags)
+  const isXml = html.includes('<urlset') || html.includes('<loc>');
+  
+  if (isXml) {
+    // Parse XML sitemap - extract all <loc> tags
+    const locRegex = /<loc>(.*?)<\/loc>/gi;
+    let m;
+    
+    while ((m = locRegex.exec(html)) !== null) {
+      const url = m[1].trim();
+      
+      // Must be a category URL
+      if (!url.includes('/category/')) continue;
+      
+      // Extract path after /category/
+      const catMatch = url.match(/\/category\/(.+)/);
+      if (!catMatch) continue;
+      
+      const path = catMatch[1];
+      const parts = path.split('/').filter(p => p);
+      
+      if (parts.length === 2) {
+        // /category/taxonomy/term/ pattern
+        const taxonomy = parts[0];
+        const slug = parts[1];
+        const name = slug.replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+        
+        if (taxonomy === 'genre') {
+          results.genres.push({ slug, name, url });
+        } else if (taxonomy === 'language') {
+          results.languages.push({ slug, name, url });
+        } else if (taxonomy === 'type') {
+          results.types.push({ slug, name, url });
+        } else if (taxonomy === 'status') {
+          results.statuses.push({ slug, name, url });
+        } else if (taxonomy === 'network') {
+          results.networks.push({ slug, name, url });
+        } else if (taxonomy === 'franchise') {
+          results.franchises.push({ slug, name, url });
+        }
+      } else if (parts.length === 1) {
+        // /category/term/ pattern (top-level categories)
+        const slug = parts[0];
+        const name = slug.replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+        results.topLevel.push({ slug, name, url });
+      }
+    }
+  } else {
+    // Parse HTML page - extract <a> tags with category links
+    const categoryRegex = /<a[^>]+href="([^"]*\/category\/([^"]+))["'][^>]*>([\s\S]*?)<\/a>/gi;
+    let m;
+
+    while ((m = categoryRegex.exec(html)) !== null) {
+      const url = m[1];
+      const path = m[2];
+      let name = m[3].replace(/<[^>]+>/g, "").trim();
+
+      if (!name || name.length > 50 || name.length < 2) continue;
+
+      const nameLower = name.toLowerCase();
+      if (nameLower === 'all' || nameLower === 'view all') continue;
+
+      const parts = path.split('/').filter(p => p);
+      
+      if (parts.length === 2) {
+        const taxonomy = parts[0];
+        const slug = parts[1].replace(/\/$/, '');
+        
+        if (taxonomy === 'genre') {
+          results.genres.push({ slug, name, url });
+        } else if (taxonomy === 'language') {
+          results.languages.push({ slug, name, url });
+        } else if (taxonomy === 'type') {
+          results.types.push({ slug, name, url });
+        } else if (taxonomy === 'status') {
+          results.statuses.push({ slug, name, url });
+        } else if (taxonomy === 'network') {
+          results.networks.push({ slug, name, url });
+        } else if (taxonomy === 'franchise') {
+          results.franchises.push({ slug, name, url });
+        }
+      } else if (parts.length === 1) {
+        const slug = parts[0].replace(/\/$/, '');
+        results.topLevel.push({ slug, name, url });
+      }
+    }
+  }
+
+  // Deduplicate
+  for (const key in results) {
+    results[key] = results[key].filter((item, index, self) =>
+      index === self.findIndex(t => t.slug === item.slug)
+    );
+  }
+
+  return results;
+}
+
 // ===========================================================================
 // HOMEPAGE SECTION SPLITTER (CPU-OPTIMIZED)
-//
-// Slices the homepage at each known heading and extracts the cards between
-// two headings.
-//
-// CRITICAL for CPU: precompute script/style byte-ranges ONCE, then test
-// membership by range scan. The old implementation did html.slice(0, idx)
-// per regex match (O(n²)) which caused Cloudflare 1102 CPU-limit crashes.
 // ===========================================================================
 export const HOME_SECTION_TITLES = [
   "Most-Watched Series",
@@ -281,13 +371,11 @@ export const HOME_SECTION_TITLES = [
   "Latest Episodes",
 ];
 
-// "Just In: Cartoon Series" → /Just[^A-Za-z0-9]{0,3}In[^A-Za-z0-9]{0,3}Cartoon.../i
 function titleRegex(title) {
   const words = title.split(/[^A-Za-z0-9]+/).filter(Boolean);
   return new RegExp(words.join("[^A-Za-z0-9]{0,3}"), "i");
 }
 
-// Build sorted [start, end] byte-ranges for every <script>/<style> block.
 function scriptStyleRanges(html) {
   const ranges = [];
   const re = /<(?:script|style)\b[^>]*>[\s\S]*?<\/(?:script|style)>/gi;
@@ -298,7 +386,6 @@ function scriptStyleRanges(html) {
   return ranges;
 }
 
-// O(ranges) membership test; ranges sorted by start → early exit.
 function isInsideRanges(ranges, idx) {
   for (let i = 0; i < ranges.length; i++) {
     if (idx >= ranges[i][0] && idx < ranges[i][1]) return true;
@@ -307,7 +394,6 @@ function isInsideRanges(ranges, idx) {
   return false;
 }
 
-// First occurrence of the title that is a HEADING, not a nav/menu link.
 function findSectionStart(html, title, ranges) {
   const re = titleRegex(title);
   let m;
@@ -338,7 +424,6 @@ export function extractHomeSections(html) {
     const end = i + 1 < positions.length ? positions[i + 1].idx : html.length;
     const slice = html.slice(start, end);
 
-    // Ranked chart blocks first (Most-Watched); else generic article grid.
     let items = extractPopularItems(slice);
     if (!items.length) items = extractAnimeList(slice);
 
