@@ -40,7 +40,7 @@ export default {
     const path = url.pathname;
     
     try {
-      if (path === "/") return jsonResponse({ name: "AnimeSalt Edge API", version: "1.1.0", upstream_proxy: BASE_URL });
+      if (path === "/") return jsonResponse({ name: "AnimeSalt Edge API", version: "1.2.0", upstream_proxy: BASE_URL });
       
       if (path === "/api/health") {
         const start = Date.now();
@@ -62,11 +62,23 @@ export default {
       if (path === "/api/info") {
         const id = url.searchParams.get("id");
         if (!id) return jsonResponse({ error: "Missing id" }, 400);
-        const { html, type } = await cachedJSON(`info_${id}`, async () => getSeriesHtml(id), CACHE_TTL, ctx);
+        
+        let dataObj;
+        try {
+          dataObj = await cachedJSON(`info_${id}`, async () => getSeriesHtml(id), CACHE_TTL, ctx);
+        } catch(e) {
+          if (e.message === "Not Found") return jsonResponse({ error: "Not Found" }, 404);
+          throw e;
+        }
+        
+        const { html, type } = dataObj;
         const cleanHtml = stripScriptsStyles(html);
         
-        const titleMatch = cleanHtml.match(/<h1[^>]*class="[^"]*entry-title[^"]*"[^>]*>([\s\S]*?)<\/h1>/i);
-        const title = titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').trim() : id;
+        // Permissive title extraction
+        let title = id;
+        const titleMatch = cleanHtml.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+        if (titleMatch) title = titleMatch[1].replace(/<[^>]+>/g, '').trim();
+        
         const poster = extractPoster(cleanHtml);
         const backdrop = extractBackdrop(cleanHtml);
         const overviewMatch = cleanHtml.match(/<div[^>]*id="overview-text"[^>]*>([\s\S]*?)<\/div>/i);
@@ -124,16 +136,27 @@ export default {
       
       if (path.startsWith("/api/episodes/")) {
         const id = path.split("/")[3]; const season = url.searchParams.get("season") || "1";
-        const { html, type } = await cachedJSON(`info_${id}`, async () => getSeriesHtml(id), CACHE_TTL, ctx);
+        
+        let dataObj;
+        try {
+          dataObj = await cachedJSON(`info_${id}`, async () => getSeriesHtml(id), CACHE_TTL, ctx);
+        } catch(e) {
+          if (e.message === "Not Found") return jsonResponse({ error: "Not Found" }, 404);
+          throw e;
+        }
+        
+        const { html, type } = dataObj;
         
         if (type === "movies") {
-          const titleMatch = html.match(/<h1[^>]*class="[^"]*entry-title[^"]*"[^>]*>([\s\S]*?)<\/h1>/i);
+          const titleMatch = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
           const title = titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').trim() : id;
           const poster = extractPoster(stripScriptsStyles(html));
           return jsonResponse({ success: true, data: { animeId: id, requestedSeason: 1, availableSeasons: [1], totalEpisodes: 1, failedSeasons: [], groupedEpisodes: { "1": [{ num: 1, season: 1, title, slug: id, url: `/movies/${id}/`, image: poster, regionalDub: true }] }, isMovie: true } });
         }
         
         const { postId, nonce } = extractPostData(html);
+        if (!postId || !nonce) return jsonResponse({ success: true, data: { animeId: id, requestedSeason: parseInt(season), availableSeasons: [], totalEpisodes: 0, failedSeasons: [parseInt(season)], groupedEpisodes: {} } });
+        
         const seasonNum = parseInt(season);
         const episodes = await fetchSeasonEpisodes(postId, nonce, seasonNum);
         return jsonResponse({ success: true, data: { animeId: id, requestedSeason: seasonNum, availableSeasons: [seasonNum], totalEpisodes: episodes.length, failedSeasons: [], groupedEpisodes: { [seasonNum]: episodes } } });
