@@ -86,7 +86,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.32.0",
+          version: "3.33.0",
           endpoints: {
             system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings", "/api/debug/poster", "/api/debug/home-timing"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
@@ -120,7 +120,7 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.32.0-edge",
+          version: "3.33.0-edge",
           endpointsCount: 31
         });
       }
@@ -615,7 +615,7 @@ export default {
                        || data.match(/<meta[^>]*name="description"[^>]*content="([^"]+)"/i);
         const description = descMatch ? descMatch[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim() : "";
 
-        // Genres (matches both /category/genre/ and /genre/, strict <a> only)
+        // Genres (strict <a> only, both /category/genre/ and /genre/)
         const genres = [];
         const genreRegex = /<a[^>]+href="[^"]*\/(?:category\/)?genre\/[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
         let match;
@@ -624,7 +624,7 @@ export default {
           if (g && g.length < 50 && !genres.includes(g)) genres.push(g);
         }
 
-        // Languages (matches both /category/language/ and /language/, strict <a> only)
+        // Languages (strict <a> only, both /category/language/ and /language/)
         const languages = [];
         const langRegex = /<a[^>]+href="[^"]*\/(?:category\/)?language\/[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
         while ((match = langRegex.exec(data)) !== null) {
