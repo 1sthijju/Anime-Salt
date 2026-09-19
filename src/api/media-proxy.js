@@ -10,55 +10,29 @@ export async function handleMediaProxy(request) {
   if (!targetUrl) return new Response("Missing url", { status: 400 });
   
   const headers = new Headers();
-  if (referer) {
-    headers.set("Referer", referer);
-    headers.set("Origin", new URL(referer).origin);
-  }
+  if (referer) { headers.set("Referer", referer); headers.set("Origin", new URL(referer).origin); }
   headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
-  
-  if (request.headers.has("Range")) {
-    headers.set("Range", request.headers.get("Range"));
-  }
+  if (request.headers.has("Range")) headers.set("Range", request.headers.get("Range"));
   
   const res = await fetch(targetUrl, { headers });
   const contentType = forceType || res.headers.get("Content-Type") || "application/octet-stream";
   
-  // HLS Manifest Rewrite
   if (contentType.includes("mpegurl") || targetUrl.includes(".m3u8")) {
     let manifest = await res.text();
     manifest = rewriteHlsManifest(manifest, targetUrl, referer, audioLang);
-    
-    return new Response(manifest, {
-      status: res.status,
-      headers: {
-        "Content-Type": "application/vnd.apple.mpegurl",
-        "Access-Control-Allow-Origin": "*",
-        "Cache-Control": "public, max-age=3600"
-      }
-    });
+    return new Response(manifest, { status: res.status, headers: { "Content-Type": "application/vnd.apple.mpegurl", "Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=3600" } });
   }
   
-  // SRT to VTT Conversion
   if (contentType.includes("subrip") || targetUrl.includes(".srt") || forceType === "text/vtt") {
     let srt = await res.text();
     let vtt = "WEBVTT\n\n" + srt.replace(/\r\n/g, "\n"); 
-    return new Response(vtt, {
-      headers: {
-        "Content-Type": "text/vtt",
-        "Access-Control-Allow-Origin": "*"
-      }
-    });
+    return new Response(vtt, { headers: { "Content-Type": "text/vtt", "Access-Control-Allow-Origin": "*" } });
   }
   
-  // Passthrough for video segments/audio
   const responseHeaders = new Headers(res.headers);
   responseHeaders.set("Access-Control-Allow-Origin", "*");
   responseHeaders.set("Content-Type", contentType);
-  
-  return new Response(res.body, {
-    status: res.status,
-    headers: responseHeaders
-  });
+  return new Response(res.body, { status: res.status, headers: responseHeaders });
 }
 
 function rewriteHlsManifest(manifest, baseUrl, referer, audioLang) {
@@ -66,8 +40,18 @@ function rewriteHlsManifest(manifest, baseUrl, referer, audioLang) {
   const out = [];
   
   for (let line of lines) {
+    if (line.startsWith("#EXT-X-MEDIA:TYPE=AUDIO")) {
+      if (audioLang) {
+        const langMatch = line.match(/LANGUAGE="([^"]+)"/);
+        if (langMatch && langMatch[1].toLowerCase().includes(audioLang.toLowerCase())) {
+          line = line.replace(/DEFAULT=NO/, "DEFAULT=YES").replace(/AUTOSELECT=NO/, "AUTOSELECT=YES");
+        } else {
+          line = line.replace(/DEFAULT=YES/, "DEFAULT=NO").replace(/AUTOSELECT=YES/, "AUTOSELECT=NO");
+        }
+      }
+    }
+    
     if (line.startsWith("#")) {
-      // Rewrites URIs inside EXT-X- tags (like AUDIO/SUBTITLES groups)
       line = line.replace(/URI="([^"]+)"/g, (match, uri) => {
         const absolute = new URL(uri, baseUrl).toString();
         const proxyUrl = `/proxy/media?url=${encodeURIComponent(absolute)}${referer ? `&referer=${encodeURIComponent(referer)}` : ''}`;
@@ -75,7 +59,6 @@ function rewriteHlsManifest(manifest, baseUrl, referer, audioLang) {
       });
       out.push(line);
     } else if (line.trim()) {
-      // Rewrites stream segment URIs
       const absolute = new URL(line.trim(), baseUrl).toString();
       const proxyUrl = `/proxy/media?url=${encodeURIComponent(absolute)}${referer ? `&referer=${encodeURIComponent(referer)}` : ''}`;
       out.push(proxyUrl);
@@ -83,6 +66,5 @@ function rewriteHlsManifest(manifest, baseUrl, referer, audioLang) {
       out.push(line);
     }
   }
-  
   return out.join("\n");
 }
