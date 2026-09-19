@@ -83,7 +83,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.28.0",
+          version: "3.29.0",
           endpoints: {
             system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings", "/api/debug/poster"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
@@ -117,7 +117,7 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.28.0-edge",
+          version: "3.29.0-edge",
           endpointsCount: 31
         });
       }
@@ -135,52 +135,51 @@ export default {
       }
 
       // ====================================================================
-      // HOME — parsed payload cached (heavy work runs once per TTL)
+      // HOME — simple shape (no nested payload cache)
       // ====================================================================
       if (path === "/api/home") {
-        const payload = await cachedJSON("home:payload:v4", async () => {
-          const raw = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
-          // Strip scripts/styles FIRST: cuts parse size by 60-80%
-          const homeData = raw
-            .replace(/<script[\s\S]*?<\/script>/gi, " ")
-            .replace(/<style[\s\S]*?<\/style>/gi, " ");
+        const raw = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
+        const homeData = raw
+          .replace(/<script[\s\S]*?<\/script>/gi, " ")
+          .replace(/<style[\s\S]*?<\/style>/gi, " ");
 
-          const secs = extractHomeSections(homeData);
-          const mostWatchedSeries = secs["Most-Watched Series"] || [];
-          const mostWatchedFilms = secs["Most-Watched Films"] || [];
+        const secs = extractHomeSections(homeData);
+        const mostWatchedSeries = secs["Most-Watched Series"] || [];
+        const mostWatchedFilms = secs["Most-Watched Films"] || [];
 
-          const [ongoing, completed, movies, freshDrops] = await Promise.all([
-            cachedJSON("list:ongoing:v2", async () => {
-              try { return extractAnimeList(await fetchPage("/category/status/ongoing/")).slice(0, 18); } catch (e) { return []; }
-            }, CACHE_TTL_HOME),
-            cachedJSON("list:completed:v2", async () => {
-              try { return extractAnimeList(await fetchPage("/category/status/completed/")).slice(0, 18); } catch (e) { return []; }
-            }, CACHE_TTL_HOME),
-            cachedJSON("list:movies:v2", async () => {
-              for (const p of ["/movies/", "/category/type/movies/"]) {
-                try { const items = extractAnimeList(await fetchPage(p)); if (items.length) return items.slice(0, 18); } catch (e) { /* next */ }
-              }
-              return [];
-            }, CACHE_TTL_HOME),
-            cachedJSON("list:fresh:v2", async () => {
-              for (const base of ["/new/", "/recent/", "/latest/"]) {
-                try { const items = extractAnimeList(await fetchPage(base)); if (items.length) return items.slice(0, 18); } catch (e) { /* next */ }
-              }
-              return [];
-            }, CACHE_TTL_HOME),
-          ]);
+        const [ongoing, completed, movies, freshDrops] = await Promise.all([
+          (async () => {
+            try { return extractAnimeList(await fetchPage("/category/status/ongoing/")).slice(0, 18); } catch (e) { return []; }
+          })(),
+          (async () => {
+            try { return extractAnimeList(await fetchPage("/category/status/completed/")).slice(0, 18); } catch (e) { return []; }
+          })(),
+          (async () => {
+            for (const p of ["/movies/", "/category/type/movies/"]) {
+              try { const items = extractAnimeList(await fetchPage(p)); if (items.length) return items.slice(0, 18); } catch (e) { /* next */ }
+            }
+            return [];
+          })(),
+          (async () => {
+            for (const base of ["/new/", "/recent/", "/latest/"]) {
+              try { const items = extractAnimeList(await fetchPage(base)); if (items.length) return items.slice(0, 18); } catch (e) { /* next */ }
+            }
+            return [];
+          })(),
+        ]);
 
-          const latestEpisodes = extractAnimeList(homeData).slice(0, 20);
-          return {
+        const latestEpisodes = extractAnimeList(homeData).slice(0, 20);
+
+        return jsonResponse({
+          success: true,
+          data: {
             mostWatchedSeries, mostWatchedFilms, latest: latestEpisodes,
             ongoing, completed, movies, freshDrops,
             popular: [...mostWatchedSeries.slice(0, 12), ...mostWatchedFilms.slice(0, 12)],
             popularSeries: mostWatchedSeries.slice(0, 12),
             popularFilms: mostWatchedFilms.slice(0, 12),
-          };
-        }, CACHE_TTL_HOME);
-
-        return jsonResponse({ success: true, data: payload });
+          },
+        });
       }
 
       // ====================================================================
@@ -215,30 +214,30 @@ export default {
           try { html = await fetchPage(`/movies/${id}/`); } catch (e) {}
         }
         if (!html) return jsonResponse({ success: false, error: "not found" }, 404);
-        
+
         const titleIdx = html.search(/<h1/i);
         const before = html.slice(0, titleIdx > -1 ? titleIdx : 20000);
         const after = html.slice(titleIdx > -1 ? titleIdx : 0);
-        
+
         const dataAttrs = [...html.matchAll(/\bdata-[a-z-]+="[^"]*"/gi)].map(m => m[0]).slice(0, 20);
         const cdnRefs = [...html.matchAll(/https?:\/\/[^"'\s<>]+/gi)]
           .map(m => m[0])
           .filter(u => u.includes("img.animesalt") || u.includes("tmdb"))
           .slice(0, 10);
-        
+
         const imgs = [...before.matchAll(/<img[^>]*>/gi)].map(m => m[0]).slice(-6);
         const imgsAfter = [...after.matchAll(/<img[^>]*>/gi)].map(m => m[0]).slice(0, 8);
         const metas = [...html.matchAll(/<meta[^>]*(?:og:image|twitter:image)[^>]*>/gi)].map(m => m[0]);
         const bgImages = [...before.matchAll(/background(?:-image)?:\s*url\([^)]*\)/gi)].map(m => m[0]).slice(-4);
         const backdropHints = [...html.matchAll(/.{0,60}backdrop.{0,100}/gi)].map(m => m[0]).slice(0, 6);
-        
+
         return jsonResponse({
           success: true,
-          data: { 
-            imgsBeforeTitle: imgs, 
-            imgsAfterTitle: imgsAfter, 
-            metas, 
-            bgBeforeTitle: bgImages, 
+          data: {
+            imgsBeforeTitle: imgs,
+            imgsAfterTitle: imgsAfter,
+            metas,
+            bgBeforeTitle: bgImages,
             backdropHints,
             dataAttributes: dataAttrs,
             cdnReferences: cdnRefs
@@ -246,9 +245,6 @@ export default {
         });
       }
 
-      // ====================================================================
-      // Latest episodes — cached parse
-      // ====================================================================
       if (path === "/api/latest-episodes") {
         const items = await cachedJSON("list:latest:v2", async () => {
           const raw = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
@@ -278,7 +274,7 @@ export default {
       }
 
       // ====================================================================
-      // Popular charts — shared cached parse
+      // Popular charts
       // ====================================================================
       if (path === "/api/popular" || path === "/api/popular/films" || path === "/api/popular/series") {
         const charts = await cachedJSON("charts:payload:v2", async () => {
@@ -480,7 +476,7 @@ export default {
       }
 
       // ====================================================================
-      // Anime / movie details — v3.28.0 (Structure-Corrected Build)
+      // Anime / movie details
       // ====================================================================
       if (path === "/api/info") {
         const animeId = params.get("id") || params.get("slug");
@@ -505,7 +501,7 @@ export default {
           return jsonResponse({ success: false, error: "Content not found" }, 404);
         }
 
-        const titleMatch = data.match(/<h1[^>]*class="[^"]*entry-title[^"]*"[^>]*>([\s\S]*?)<\/h1>/i) 
+        const titleMatch = data.match(/<h1[^>]*class="[^"]*entry-title[^"]*"[^>]*>([\s\S]*?)<\/h1>/i)
                         || data.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
         const title = titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').trim() : "Unknown";
 
@@ -581,26 +577,26 @@ export default {
         if (backdrop.startsWith("//")) backdrop = "https:" + backdrop;
 
         // Description
-        const descMatch = data.match(/<div[^>]*id="overview-text"[^>]*>([\s\S]*?)<\/div>/i) 
+        const descMatch = data.match(/<div[^>]*id="overview-text"[^>]*>([\s\S]*?)<\/div>/i)
                        || data.match(/<div[^>]*class="[^"]*(?:synopsis|overview|description)[^"]*"[^>]*>([\s\S]*?)<\/div>/i)
                        || data.match(/<meta[^>]*name="description"[^>]*content="([^"]+)"/i);
         const description = descMatch ? descMatch[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim() : "";
 
         // Genres
-        const genres = []; 
-        const genreRegex = /href="[^"]*\/category\/genre\/[^"]*"[^>]*>([^<]+)<\/a>/gi; 
+        const genres = [];
+        const genreRegex = /href="[^"]*\/category\/genre\/[^"]*"[^>]*>([^<]+)<\/a>/gi;
         let match;
-        while ((match = genreRegex.exec(data)) !== null) { 
-          const g = match[1].trim(); 
-          if (g && !genres.includes(g)) genres.push(g); 
+        while ((match = genreRegex.exec(data)) !== null) {
+          const g = match[1].trim();
+          if (g && !genres.includes(g)) genres.push(g);
         }
 
         // Languages
-        const languages = []; 
+        const languages = [];
         const langRegex = /href="[^"]*\/category\/language\/[^"]*"[^>]*>([^<]+)<\/a>/gi;
-        while ((match = langRegex.exec(data)) !== null) { 
-          const l = match[1].trim(); 
-          if (l && !languages.includes(l)) languages.push(l); 
+        while ((match = langRegex.exec(data)) !== null) {
+          const l = match[1].trim();
+          if (l && !languages.includes(l)) languages.push(l);
         }
 
         // Tag-stripped visible text
@@ -655,13 +651,11 @@ export default {
           if (label) {
             status = /Ongoing|Airing/i.test(label[1]) ? "Ongoing" : "Completed";
           } else {
-            // Source 1: home page latest updates
             try {
               const homeHtml = await cachedJSON("html:home", () => fetchPage("/"), CACHE_TTL_HOME);
               if (extractAnimeList(homeHtml).some(i => i.id === animeId)) status = "Ongoing";
             } catch (e) {}
-            
-            // Source 2: ongoing category, 10 pages deep
+
             if (status === "Unknown") {
               for (let pg = 1; pg <= 10 && status === "Unknown"; pg++) {
                 try {
@@ -671,8 +665,7 @@ export default {
                 } catch (e) { break; }
               }
             }
-            
-            // Source 3: completed category, 10 pages deep
+
             if (status === "Unknown") {
               for (let pg = 1; pg <= 10 && status === "Unknown"; pg++) {
                 try {
@@ -685,46 +678,34 @@ export default {
           }
         }
 
-        // ---------------- SEASONS / EPISODES (STRUCTURE-CORRECTED) ----------------
+        // ---------------- SEASONS / EPISODES ----------------
         let seasons = [], totalEpisodes = 0;
         if (type === "series") {
           try {
             const epData = await getEpisodesData(animeId, "all");
-            
-            // episodes.js returns: { seasons: [...], episodes: [...], failedSeasons: [...] }
             seasons = epData.seasons || [];
-            
-            // Group flat episodes array by season
-            const groupedEpisodes = {};
-            for (const ep of (epData.episodes || [])) {
-              if (!groupedEpisodes[ep.season]) groupedEpisodes[ep.season] = [];
-              groupedEpisodes[ep.season].push(ep);
-            }
-            
-            // Calculate totalEpisodes from seasons metadata or sum of episodes
+
             if (seasons.length > 0) {
               totalEpisodes = seasons.reduce((sum, s) => {
                 const countMatch = s.title.match(/\((\d+)\)/);
                 return sum + (countMatch ? parseInt(countMatch[1], 10) : 0);
               }, 0);
             } else {
-              totalEpisodes = epData.episodes.length;
+              totalEpisodes = (epData.episodes || []).length;
             }
-            
-            // Heuristic: 100+ episodes = ongoing (if status still unknown)
+
             if (status === "Unknown" && totalEpisodes >= 100) {
               status = "Ongoing";
             }
           } catch (e) {
             console.error(`Episodes fetch failed for ${animeId}:`, e.message);
           }
-          
-          // Fallback: extract from text chips
+
           if (!totalEpisodes) {
             const epChip = textOnly.match(/(\d+)\s*Episodes/i);
             if (epChip) totalEpisodes = parseInt(epChip[1], 10);
           }
-          
+
           if (!seasons.length) {
             const sChip = textOnly.match(/(\d+)\s*Seasons/i);
             if (sChip) {
@@ -734,8 +715,7 @@ export default {
               }));
             }
           }
-          
-          // Final heuristic
+
           if (status === "Unknown" && totalEpisodes >= 100) {
             status = "Ongoing";
           }
@@ -743,19 +723,19 @@ export default {
           totalEpisodes = 1;
         }
 
-        return jsonResponse({ 
-          success: true, 
-          data: { 
+        return jsonResponse({
+          success: true,
+          data: {
             id: animeId, title, poster, backdrop, description, type,
             totalEpisodes, year, status, seasons, genres, languages,
             runtime,
             quickPlay: { first: firstEp, latestDub: latestDub, latestSub: latestSub }
-          } 
+          }
         });
       }
 
       // ====================================================================
-      // Episodes — with MOVIE fallback
+      // Episodes
       // ====================================================================
       if (path.startsWith("/api/episodes/")) {
         const animeId = path.split("/")[3];
@@ -796,9 +776,9 @@ export default {
           groupedEpisodes[ep.season].push(ep);
         }
 
-        return jsonResponse({ 
-          success: true, 
-          data: { animeId, requestedSeason, availableSeasons: seasons.map(s => s.num), totalEpisodes: episodes.length, failedSeasons, groupedEpisodes } 
+        return jsonResponse({
+          success: true,
+          data: { animeId, requestedSeason, availableSeasons: seasons.map(s => s.num), totalEpisodes: episodes.length, failedSeasons, groupedEpisodes }
         });
       }
 
