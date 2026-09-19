@@ -99,7 +99,7 @@ export function extractPopularItems(html, targetType) {
 // ---------------------------------------------------------------------------
 export function parseEpisodesFromHtml(html, seasonNum) {
   const eps = [];
-  const DUB_DIVIDER = /aren['’]t dubbed in regional languages/i;
+  const DUB_DIVIDER = /aren['']t dubbed in regional languages/i;
   let regionalDub = true;
   let lastIdx = 0;
 
@@ -148,15 +148,35 @@ export function parseEpisodesFromHtml(html, seasonNum) {
     const epNum = sxe ? parseInt(sxe[2], 10) : 0;
     if (epNum === 0) continue;
 
-    const titleMatch =
-      match[2].match(/class="[^"]*(?:entry-title|title)[^"]*"[^>]*>([^<]+)/i) ||
-      match[2].match(/>([^<]+)</i);
-    const title = titleMatch
-      ? titleMatch[1].trim().replace(/^\d+\s*/, "").replace(/\s*View\s*$/i, "").trim()
-      : `Episode ${epNum}`;
+    // Enhanced title extraction with multiple fallback patterns
+    const linkHtml = match[2];
+    let title = "";
+    
+    const titlePatterns = [
+      /class="[^"]*(?:entry-title|title|ep-title)[^"]*"[^>]*>([^<]+)/i,
+      /<span[^>]*class="[^"]*title[^"]*"[^>]*>([^<]+)<\/span>/i,
+      /<div[^>]*class="[^"]*title[^"]*"[^>]*>([^<]+)<\/div>/i,
+      />([^<]+)<\/a>/i,  // fallback: any text before </a>
+    ];
+    
+    for (const pattern of titlePatterns) {
+      const titleMatch = linkHtml.match(pattern);
+      if (titleMatch) {
+        title = titleMatch[1].trim();
+        // Clean up common patterns
+        title = title.replace(/^\d+[\.\)]\s*/, "");  // Remove "1. " or "1) "
+        title = title.replace(/\s*View\s*$/i, "");
+        title = title.replace(/Episode\s+\d+/i, "");
+        if (title.length > 2) break;
+      }
+    }
+    
+    if (!title || title.length < 3) {
+      title = `Episode ${epNum}`;
+    }
 
     // thumbnail: inside anchor → else nearest img in 800 chars before it
-    let image = grabUrl(match[2]);
+    let image = grabUrl(linkHtml);
     if (!image) {
       const windowStart = Math.max(0, match.index - 800);
       image = grabUrl(html.slice(windowStart, match.index));
@@ -214,6 +234,10 @@ export function extractTaxonomy(html, tax) {
     `<a[^>]+href="([^"]*\\/${tax}\\/([^\\/"]+)\\/?)["'][^>]*>([\\s\\S]*?)</a>`,
     "gi"
   );
+  
+  // Blacklist navigation/filter text
+  const blacklist = ['all', 'view all', 'see all', 'show all', 'more', 'browse', 'categories', 'genres', 'view', 'see', 'filter'];
+  
   let m;
   while ((m = regex.exec(html)) !== null) {
     const fullUrl = m[1];
@@ -223,8 +247,27 @@ export function extractTaxonomy(html, tax) {
     let name = m[3].replace(/<[^>]+>/g, "").trim();
     if (!name) name = slug.replace(/-/g, " ").replace(/\b\w/g, l => l.toUpperCase());
 
-    // Safety: huge captured text = false positive (script/style capture)
+    // Skip if name is too long (script/style capture)
     if (name.length > 50) continue;
+    
+    // Skip if name is too short (likely navigation)
+    if (name.length < 3) continue;
+    
+    // Skip if name contains blacklist words (navigation links)
+    const nameLower = name.toLowerCase();
+    if (blacklist.some(word => nameLower === word || nameLower.startsWith(word + ' '))) continue;
+    
+    // Require name to match slug pattern (genre names should relate to their slug)
+    const slugWords = slug.split('-').map(w => w.toLowerCase());
+    const nameWords = nameLower.split(/\s+/);
+    
+    // At least one significant word from slug should appear in name
+    // (skip common words like "the", "a", etc.)
+    const significantSlugWords = slugWords.filter(w => w.length > 2);
+    if (significantSlugWords.length > 0) {
+      const hasMatch = significantSlugWords.some(word => nameLower.includes(word));
+      if (!hasMatch) continue;
+    }
 
     if (slug && name && !results.find(r => r.slug === slug)) {
       results.push({ slug, name, url: fullUrl });
