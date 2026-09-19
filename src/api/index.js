@@ -1,6 +1,6 @@
 import { jsonResponse, corsHeaders, BASE_URL, CACHE_TTL_HOME, CACHE_TTL, CHROME_HEADERS } from "./config.js";
 import { cachedJSON, fetchPage, siteAjax } from "./net.js";
-import { extractAnimeList, extractPopularItems, extractEmbedForIndex, extractTaxonomy, extractHomeSections } from "./parsers.js";
+import { extractAnimeList, extractPopularItems, extractEmbedForIndex, extractTaxonomy, extractHomeSections, extractAllCategories } from "./parsers.js";
 import { getEpisodesData } from "./episodes.js";
 import { resolveAsCdn26, resolveAbyss, normalizeAbyssUrl } from "./decryptors.js";
 import { proxyMediaUrl, handleMediaProxy, parseHlsMediaGroups } from "./media-proxy.js";
@@ -83,7 +83,7 @@ export default {
       if (path === "/") {
         return jsonResponse({
           name: "AnimeSalt Edge API",
-          version: "3.33.0",
+          version: "3.34.0",
           endpoints: {
             system: ["/api/health", "/api/ajax", "/proxy/media", "/api/debug/home-headings", "/api/debug/poster", "/api/debug/home-timing"],
             home: ["/api/home", "/api/latest-episodes", "/api/fresh-drops"],
@@ -117,7 +117,7 @@ export default {
           status: upstreamOnline ? "healthy" : "degraded",
           timestamp: new Date().toISOString(),
           upstream: { source: BASE_URL, online: upstreamOnline, latencyMs: upstreamLatency, error: upstreamError },
-          version: "3.33.0-edge",
+          version: "3.34.0-edge",
           endpointsCount: 31
         });
       }
@@ -135,7 +135,7 @@ export default {
       }
 
       // ====================================================================
-      // HOME — cache the FINAL parsed payload (heavy work runs once per TTL)
+      // HOME — cache the FINAL parsed payload
       // ====================================================================
       if (path === "/api/home") {
         const payload = await cachedJSON("home:payload:v5", async () => {
@@ -247,7 +247,7 @@ export default {
       }
 
       // ====================================================================
-      // DEBUG: home payload timing (CPU profiling)
+      // DEBUG: home payload timing
       // ====================================================================
       if (path === "/api/debug/home-timing") {
         const t0 = Date.now();
@@ -304,7 +304,7 @@ export default {
       }
 
       // ====================================================================
-      // Popular charts (shared cached parse)
+      // Popular charts
       // ====================================================================
       if (path === "/api/popular" || path === "/api/popular/films" || path === "/api/popular/series") {
         const charts = await cachedJSON("charts:payload:v2", async () => {
@@ -450,26 +450,46 @@ export default {
       }
 
       // ====================================================================
-      // Taxonomy lists
+      // Taxonomy lists — uses sitemap for comprehensive data
       // ====================================================================
       if (path === "/api/genres" || path === "/api/languages" || path === "/api/countries" || path === "/api/discover") {
-        const pagesToTry = ["/", "/category/type/series/", "/series/", "/category/genre/action/", "/genre/action/"];
-        let genres = [], languages = [], countries = [];
-        for (const p of pagesToTry) {
+        // Fetch sitemap (cached for 6 hours)
+        const sitemapData = await cachedJSON("sitemap:categories:v1", async () => {
           try {
-            const html = await cachedJSON(`html:${p}`, () => fetchPage(p), CACHE_TTL_HOME);
-            genres = extractTaxonomy(html, "genre");
-            languages = extractTaxonomy(html, "language");
-            countries = extractTaxonomy(html, "country");
-            if (genres.length > 0) break;
-          } catch (e) { /* try next page */ }
-        }
-        if (path === "/api/genres") return jsonResponse({ success: true, data: genres });
-        if (path === "/api/languages") return jsonResponse({ success: true, data: languages });
-        if (path === "/api/countries") return jsonResponse({ success: true, data: countries });
+            const sitemapHtml = await fetchPage("/category-sitemap.xml");
+            return extractAllCategories(sitemapHtml);
+          } catch (e) {
+            // Fallback to homepage if sitemap fails
+            const homeHtml = await fetchPage("/");
+            return extractAllCategories(homeHtml);
+          }
+        }, CACHE_TTL);
+
+        if (path === "/api/genres") return jsonResponse({ success: true, data: sitemapData.genres });
+        if (path === "/api/languages") return jsonResponse({ success: true, data: sitemapData.languages });
+        if (path === "/api/countries") return jsonResponse({ success: true, data: sitemapData.topLevel.filter(c => ['country', 'countries'].some(w => c.slug.includes(w))) });
+        
+        // /api/discover - comprehensive taxonomy
         return jsonResponse({
           success: true,
-          data: { genres, languages, countries, types: ["series", "movies", "anime", "cartoon"], statuses: ["ongoing", "completed"] },
+          data: {
+            genres: sitemapData.genres,
+            languages: sitemapData.languages,
+            types: sitemapData.types,
+            statuses: sitemapData.statuses,
+            networks: sitemapData.networks,
+            franchises: sitemapData.franchises,
+            topLevel: sitemapData.topLevel,
+            counts: {
+              genres: sitemapData.genres.length,
+              languages: sitemapData.languages.length,
+              types: sitemapData.types.length,
+              statuses: sitemapData.statuses.length,
+              networks: sitemapData.networks.length,
+              franchises: sitemapData.franchises.length,
+              topLevel: sitemapData.topLevel.length,
+            }
+          }
         });
       }
 
