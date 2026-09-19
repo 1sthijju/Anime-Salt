@@ -1,19 +1,28 @@
 import { siteAjax } from './net.js';
 
 export async function fetchSeasonEpisodes(postId, nonce, season, temp = 0) {
-  const params = { action: "action_select_temp", temp, season, post: postId, nonce };
+  // WP AJAX often requires exact key casing and presence
+  const params = { 
+    action: "action_select_temp", 
+    temp: temp, 
+    season: season, 
+    post: postId, 
+    nonce: nonce 
+  };
   
   try {
     let html = await siteAjax(params);
     
-    // Handle JSON responses from WP AJAX (some themes wrap HTML in JSON)
+    // Handle JSON responses from WP AJAX
     try {
       const json = JSON.parse(html);
       if (json.html) html = json.html;
       else if (json.data) html = json.data;
+      else if (json.success && json.data) html = json.data;
     } catch(e) {}
     
-    if (!html || html.trim() === "0") {
+    if (!html || html.trim() === "0" || html.trim() === "-1") {
+      // Fallback action
       params.action = "action_select_season"; 
       html = await siteAjax(params);
       try {
@@ -23,7 +32,7 @@ export async function fetchSeasonEpisodes(postId, nonce, season, temp = 0) {
       } catch(e) {}
     }
     
-    if (!html || html.trim() === "0") return [];
+    if (!html || html.trim() === "0" || html.trim() === "-1") return [];
     return parseEpisodesFromFragment(html);
   } catch (e) {
     return [];
@@ -36,7 +45,7 @@ export function parseEpisodesFromFragment(html) {
   let dividerIndex = html.indexOf(divider);
   if (dividerIndex === -1) dividerIndex = html.length;
   
-  const linkRegex = /<a[^>]+href="([^"]+\/episode\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  const linkRegex = /href="([^"]+\/episode\/[^"]+)"/gi;
   let match;
   
   while ((match = linkRegex.exec(html)) !== null) {
@@ -45,15 +54,21 @@ export function parseEpisodesFromFragment(html) {
     if (!slugMatch) continue;
     const slug = slugMatch[1];
     
-    const sxeMatch = slug.match(/-(\d+)x(\d+)$/i);
+    const sxeMatch = slug.match(/-(\d+)x(\d+)$/i) || slug.match(/-s(\d+)e(\d+)/i) || slug.match(/-episode-(\d+)/i);
     let season = 1, num = 1;
-    if (sxeMatch) { season = parseInt(sxeMatch[1], 10); num = parseInt(sxeMatch[2], 10); }
+    if (sxeMatch) { 
+      season = parseInt(sxeMatch[1], 10); 
+      num = parseInt(sxeMatch[2], 10) || 1; 
+    }
     
-    const titleMatch = match[2].match(/>([^<]+)</);
-    const title = titleMatch ? titleMatch[1].trim() : `Episode ${num}`;
+    // Look for title in the surrounding 500 chars
+    const startIdx = Math.max(0, match.index - 500);
+    const windowText = html.substring(startIdx, match.index + 500);
     
-    const startIdx = Math.max(0, match.index - 800);
-    const windowText = html.substring(startIdx, match.index + match[0].length);
+    let title = `Episode ${num}`;
+    const titleMatch = windowText.match(/<(?:h[2-4]|span)[^>]*>([^<]+)<\//i);
+    if (titleMatch) title = titleMatch[1].trim();
+    
     const imgMatch = windowText.match(/<img[^>]+data-src="([^"]+)"[^>]*>/i) || windowText.match(/<img[^>]+src="([^"]+)"[^>]*>/i);
     
     let image = "";
