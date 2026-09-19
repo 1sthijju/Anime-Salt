@@ -12,7 +12,6 @@ export function extractAnimeList(html) {
   const cards = [];
   const seen = new Set();
   
-  // Extremely permissive: finds ANY link to series or movies
   const linkRegex = /href="([^"]*(?:\/series\/|\/movies\/)[^"]+)"/gi;
   let match;
   
@@ -22,26 +21,33 @@ export function extractAnimeList(html) {
     if (!slugMatch) continue;
     const id = slugMatch[1];
     
-    if (seen.has(id)) continue; // Deduplicate
+    if (seen.has(id)) continue; 
     seen.add(id);
     
-    // Look for title and image in a 1000-char window around the link
-    const startIdx = Math.max(0, match.index - 1000);
-    const endIdx = Math.min(html.length, match.index + 1000);
-    const windowText = html.substring(startIdx, endIdx);
+    // STRICT DIRECTION: Look AFTER the link for the title (up to 1500 chars)
+    const afterText = html.substring(match.index, Math.min(html.length, match.index + 1500));
+    const hMatchAfter = afterText.match(/<(?:h[1-4]|span|div|p)[^>]*class="[^"]*(?:title|entry-title|card-title)[^"]*"[^>]*>([^<]+)<\//i) ||
+                        afterText.match(/<(?:h[1-4])[^>]*>\s*([^<]+)\s*<\//i);
     
-    // Title extraction: looks for h2, h3, h4, or alt/title attributes
+    // Look BEFORE the link (up to 500 chars back) if not found after
+    const beforeText = html.substring(Math.max(0, match.index - 500), match.index);
+    const hMatchBefore = beforeText.match(/<(?:h[1-4]|span|div|p)[^>]*class="[^"]*(?:title|entry-title|card-title)[^"]*"[^>]*>([^<]+)<\//i) ||
+                         beforeText.match(/<(?:h[1-4])[^>]*>\s*([^<]+)\s*<\//i);
+
     let title = "";
-    const hMatch = windowText.match(/<(?:h[2-4]|span)[^>]*>([^<]+)<\//i);
-    if (hMatch) title = hMatch[1].trim();
-    if (!title) {
-      const altMatch = windowText.match(/(?:alt|title)="([^"]+)"/i);
-      if (altMatch) title = altMatch[1].trim();
+    if (hMatchAfter) title = hMatchAfter[1].trim();
+    else if (hMatchBefore) title = hMatchBefore[1].trim();
+    else {
+        // Fallback to alt/title attributes inside or immediately around the link
+        const windowText = html.substring(Math.max(0, match.index - 200), match.index + match[0].length);
+        const altMatch = windowText.match(/(?:alt|title)="([^"]+)"/i);
+        if (altMatch) title = altMatch[1].trim();
     }
     
-    // Image extraction: looks for data-src or src in the window
+    // Image extraction: look in a 1000-char window around the link
+    const imgWindow = html.substring(Math.max(0, match.index - 1000), Math.min(html.length, match.index + 1000));
     let image = "";
-    const imgMatch = windowText.match(/<img[^>]+>/i);
+    const imgMatch = imgWindow.match(/<img[^>]+>/i);
     if (imgMatch) {
       const imgTag = imgMatch[0];
       const dataSrc = imgTag.match(/data-src="([^"]+)"/i);
@@ -55,7 +61,7 @@ export function extractAnimeList(html) {
     
     cards.push({ 
       id, 
-      title: title || id, // Fallback to ID if title not found
+      title: title || id, 
       image, 
       type: url.includes("/movies/") ? "movies" : "series", 
       url: normalizeUrl(url) 
@@ -77,7 +83,6 @@ export function extractHomeSections(html) {
   
   const indices = [];
   for (const h of headings) {
-    // Case-insensitive search for the heading text
     const idx = cleanHtml.toLowerCase().indexOf(h.toLowerCase());
     if (idx !== -1) indices.push({ heading: h, index: idx + h.length });
   }
@@ -99,13 +104,11 @@ export function extractHomeSections(html) {
 }
 
 export function extractPostData(html) {
-  // Extremely permissive matching for WP post ID
   const postMatch = html.match(/postid-(\d+)/i) || 
                     html.match(/post-(\d+)/i) || 
                     html.match(/data-(?:post|id)="(\d+)"/i) ||
                     html.match(/"id":(\d+)/i);
                     
-  // Permissive matching for nonce
   const nonceMatch = html.match(/["']nonce["']\s*:\s*["']([a-z0-9]+)["']/i) || 
                      html.match(/nonce\s*=\s*["']([a-z0-9]+)["']/i) ||
                      html.match(/_wpnonce["'][^"']*["']([a-z0-9]+)/i) ||
