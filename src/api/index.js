@@ -1,7 +1,17 @@
 // ==========================================================================
-// AnimeSalt Cloudflare Worker — FIXED (v3.40.0)
-// Corrected upstream paths + robust parser
+// AnimeSalt Cloudflare Worker — Main Router (v3.40.0)
+// Modular architecture with imported parsers
 // ==========================================================================
+
+import {
+  parseCatalogItems,
+  parseFeatured,
+  parseLatest,
+  parseRandomItem,
+  parseInfoPage,
+  parseServers,
+  parseTaxonomy,
+} from "./parsers.js";
 
 // --------------------------------------------------------------------------
 // Config
@@ -20,7 +30,7 @@ const corsHeaders = {
 };
 
 // --------------------------------------------------------------------------
-// Semaphore + fetch helpers
+// Semaphore — cap parallel upstream fetches to avoid CPU spikes
 // --------------------------------------------------------------------------
 function semaphore(max) {
   let active = 0, queue = [];
@@ -35,6 +45,9 @@ function semaphore(max) {
 }
 const gate = semaphore(6);
 
+// --------------------------------------------------------------------------
+// Upstream fetch helper — timeout + retry + semaphore-gated
+// --------------------------------------------------------------------------
 async function fetchUpstream(path, opts = {}) {
   const url = UPSTREAM + path;
   const { timeoutMs = 10000, retries = 2 } = opts;
@@ -56,7 +69,7 @@ async function fetchUpstream(path, opts = {}) {
 }
 
 // --------------------------------------------------------------------------
-// JSON helpers
+// JSON response helpers
 // --------------------------------------------------------------------------
 function json(body, status = 200, extra = {}) {
   return new Response(JSON.stringify(body), {
@@ -68,7 +81,7 @@ const jsonSuccess = (data, extra = {}) => json({ success: true, data }, 200, ext
 const jsonError = (msg, status = 500) => json({ success: false, error: msg }, status);
 
 // --------------------------------------------------------------------------
-// Cache wrapper
+// Cache wrapper (stale-while-revalidate)
 // --------------------------------------------------------------------------
 async function cached(key, ttl, compute, ctx) {
   const cache = caches.default;
@@ -96,153 +109,7 @@ async function cached(key, ttl, compute, ctx) {
 }
 
 // ==========================================================================
-// FIXED PARSERS — multiple pattern matching
-// ==========================================================================
-
-function parseCatalogItems(html) {
-  const out = [];
-  
-  // Pattern 1: Standard article with data attributes
-  const pattern1 = /<article[^>]*>[\s\S]*?<a[^>]+href="(https:\/\/animesalt\.cx\/(?:series|movies)\/([^"\/]+)\/?)"[^>]*>[\s\S]*?<img[^>]+src="([^"]+)"[^>]*>[\s\S]*?<h[23][^>]*>([^<]+)<\/h[23]>/gi;
-  let m;
-  while ((m = pattern1.exec(html)) !== null) {
-    const [, url, slug, img, title] = m;
-    out.push({ id: slug, title: title.trim(), image: img, type: url.includes("/movies/") ? "movie" : "series", url });
-  }
-  
-  // Pattern 2: Simpler card structure
-  if (out.length === 0) {
-    const pattern2 = /<a[^>]+href="(https:\/\/animesalt\.cx\/(?:series|movies)\/([^"\/]+)\/?)"[^>]*class="[^"]*(?:card|item|poster)[^"]*"[^>]*>[\s\S]*?<img[^>]+src="([^"]+)"[^>]*>[\s\S]*?(?:<h[23][^>]*>([^<]+)<\/h[23]>|alt="([^"]+)")/gi;
-    while ((m = pattern2.exec(html)) !== null) {
-      const [, url, slug, img, title1, title2] = m;
-      const title = (title1 || title2 || "").trim();
-      if (title && !title.startsWith("View")) {
-        out.push({ id: slug, title, image: img, type: url.includes("/movies/") ? "movie" : "series", url });
-      }
-    }
-  }
-  
-  // Pattern 3: Extract from structured data (JSON-LD or data attributes)
-  if (out.length === 0) {
-    const pattern3 = /data-post-id="(\d+)"[^>]*data-slug="([^"]+)"[^>]*>[\s\S]*?<img[^>]+src="([^"]+)"[^>]*>[\s\S]*?<h[23][^>]*>([^<]+)<\/h[23]>/gi;
-    while ((m = pattern3.exec(html)) !== null) {
-      const [, , slug, img, title] = m;
-      out.push({ id: slug, title: title.trim(), image: img, type: "series", url: `https://animesalt.cx/series/${slug}/` });
-    }
-  }
-  
-  // Dedupe by id
-  const seen = new Set();
-  return out.filter(it => { if (seen.has(it.id)) return false; seen.add(it.id); return true; });
-}
-
-function parseFeatured(html) {
-  // Try multiple patterns for featured/hero content
-  const patterns = [
-    /<div[^>]*class="[^"]*(?:hero|featured|slider|spotlight)[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/gi,
-    /<section[^>]*class="[^"]*(?:hero|featured|spotlight)[^"]*"[^>]*>([\s\S]*?)<\/section>/gi,
-    /<div[^>]*id="[^"]*(?:hero|featured|slider)[^"]*"[^>]*>([\s\S]*?)<\/div>/gi,
-  ];
-  
-  for (const pattern of patterns) {
-    const items = [];
-    let m;
-    while ((m = pattern.exec(html)) !== null) {
-      const block = m[1];
-      const urlM = block.match(/href="(https:\/\/animesalt\.cx\/(series|movies)\/([^"\/]+)\/?)"/);
-      const imgM = block.match(/<img[^>]+src="([^"]+)"/);
-      const tiM = block.match(/<(?:h[123]|p)[^>]*>([^<]{3,100})<\/(?:h[123]|p)>/);
-      if (urlM && tiM) {
-        items.push({
-          id: urlM[3],
-          title: tiM[1].trim(),
-          image: imgM ? imgM[1] : "",
-          type: urlM[2] === "series" ? "series" : "movie",
-          url: urlM[1],
-        });
-      }
-    }
-    if (items.length > 0) return items;
-  }
-  
-  // Fallback: use parseCatalogItems
-  return parseCatalogItems(html).slice(0, 6);
-}
-
-function parseLatest(html) {
-  return parseCatalogItems(html).slice(0, 24);
-}
-
-function parseRandomItem(html) {
-  const items = parseCatalogItems(html);
-  return items.length ? items[Math.floor(Math.random() * items.length)] : null;
-}
-
-function parseInfoPage(html, id) {
-  const titleM = html.match(/<h1[^>]*class="[^"]*title[^"]*"[^>]*>([^<]+)<\/h1>/i) || html.match(/<h1[^>]*>([^<]+)<\/h1>/i);
-  const posterM = html.match(/<div[^>]*class="[^"]*poster[^"]*"[^>]*>[\s\S]*?<img[^>]+src="([^"]+)"/i);
-  const descM = html.match(/<div[^>]*class="[^"]*(?:description|wp-content|entry-content)[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
-  
-  const genres = [...html.matchAll(/<a[^>]+href="[^"]*\/category\/genre\/([^"\/]+)[^"]*"[^>]*>([^<]+)<\/a>/gi)].map(m => m[2].trim());
-  const languages = [...html.matchAll(/<a[^>]+href="[^"]*\/category\/language\/([^"\/]+)[^"]*"[^>]*>([^<]+)<\/a>/gi)].map(m => m[2].trim());
-  
-  const seasonsRaw = [...html.matchAll(/<option[^>]+value="(\d+)"[^>]*>Season\s*(\d+)[\s\S]*?(\d+)\s*[-–]\s*(\d+)\s*\((\d+)\)/gi)];
-  const seasons = seasonsRaw.map(m => ({ num: +m[2], title: `Season ${m[2]} • ${m[3]}-${m[4]} (${m[5]})`, value: m[1] }));
-  
-  return {
-    id,
-    title: (titleM ? titleM[1] : id).trim(),
-    poster: posterM ? posterM[1] : "",
-    backdrop: "",
-    description: descM ? descM[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim() : "",
-    type: html.includes("/movies/") ? "movie" : "series",
-    totalEpisodes: seasons.reduce((sum, s) => sum + (parseInt(s.title.match(/\((\d+)\)/)?.[1] || 0, 10)), 0),
-    year: "",
-    status: "",
-    seasons,
-    genres,
-    languages,
-    runtime: "",
-    quickPlay: {
-      first: seasons[0] ? { season: seasons[0].num, episode: 1, slug: `${id}-${seasons[0].num}x1` } : null,
-      latestDub: seasons.length ? { season: seasons[seasons.length - 1].num, episode: 1, slug: `${id}-${seasons[seasons.length - 1].num}x1` } : null,
-      latestSub: null,
-    },
-  };
-}
-
-function parseServers(html, epSlug) {
-  const servers = [];
-  const re = /<li[^>]*data-id="(\d+)"[^>]*>[\s\S]*?<a[^>]+href="([^"]+)"[^>]*>[\s\S]*?<span[^>]*>([^<]+)<\/span>/gi;
-  let m;
-  while ((m = re.exec(html)) !== null) {
-    const [_, idxStr, embedUrl, name] = m;
-    servers.push({
-      index: parseInt(idxStr, 10),
-      serverName: name.trim(),
-      embedUrl,
-      isMultiLang: /multi-lang/i.test(name),
-      languages: [],
-    });
-  }
-  return servers;
-}
-
-function parseTaxonomy(html) {
-  const parse = (pattern) => [...html.matchAll(pattern)].map(m => ({ slug: m[1], name: m[2].trim() }));
-  return {
-    genres: parse(/<a[^>]+href="[^"]*\/category\/genre\/([^"\/]+)[^"]*"[^>]*>([^<]+)<\/a>/gi),
-    languages: parse(/<a[^>]+href="[^"]*\/category\/language\/([^"\/]+)[^"]*"[^>]*>([^<]+)<\/a>/gi),
-    types: [], // Doesn't exist on upstream
-    statuses: [], // Doesn't exist on upstream
-    networks: parse(/<a[^>]+href="[^"]*\/category\/network\/([^"\/]+)[^"]*"[^>]*>([^<]+)<\/a>/gi),
-    franchises: parse(/<a[^>]+href="[^"]*\/category\/franchise\/([^"\/]+)[^"]*"[^>]*>([^<]+)<\/a>/gi),
-    topLevel: [],
-  };
-}
-
-// ==========================================================================
-// DECRYPTORS
+// DECRYPTORS — resolve streaming URLs
 // ==========================================================================
 async function resolveAsCdn26(embedUrl) {
   try {
@@ -294,7 +161,7 @@ async function resolveAbyss(embedUrl) {
 }
 
 // ==========================================================================
-// MEDIA PROXY
+// MEDIA PROXY — proxy HLS segments + VTT subtitles
 // ==========================================================================
 function proxyMediaUrl(workerOrigin, url, params = {}) {
   const u = new URL("/proxy/media", workerOrigin);
@@ -361,7 +228,7 @@ async function handleMediaProxy(request) {
 }
 
 // ==========================================================================
-// EPISODES
+// EPISODES — fetch + synthesize episodes with fallback
 // ==========================================================================
 async function getEpisodesData(animeId, requestedSeason) {
   const html = await fetchUpstream(`/series/${animeId}/`);
@@ -420,14 +287,14 @@ async function getEpisodesData(animeId, requestedSeason) {
 }
 
 // ==========================================================================
-// ROUTE HANDLERS — FIXED PATHS
+// ROUTE HANDLERS — using imported parsers
 // ==========================================================================
 async function handleHealth(ctx) {
   return cached("health", 300, async () => {
     const start = Date.now();
     let online = false, error = null;
     try { const r = await fetch(UPSTREAM + "/", { headers: CHROME_HEADERS }); online = r.status < 500; } catch (e) { error = e.message; }
-    return { success: true, status: online ? "healthy" : "degraded", timestamp: new Date().toISOString(), upstream: { source: UPSTREAM, online, latencyMs: Date.now() - start, error }, version: "3.40.0-fixed" };
+    return { success: true, status: online ? "healthy" : "degraded", timestamp: new Date().toISOString(), upstream: { source: UPSTREAM, online, latencyMs: Date.now() - start, error }, version: "3.40.0-modular" };
   }, ctx);
 }
 
@@ -438,15 +305,15 @@ async function handleHomeHero(ctx) {
   }, ctx);
 }
 
-// FIXED: Use correct upstream paths
+// Corrected upstream paths
 const SECTION_FETCHERS = {
   "latest": () => fetchUpstream("/").then(parseCatalogItems).then(d => d.slice(0, 24)),
   "most-watched-series": () => fetchUpstream("/").then(h => parseCatalogItems(h).filter(i => i.type === "series").slice(0, 25)),
   "most-watched-films": () => fetchUpstream("/").then(h => parseCatalogItems(h).filter(i => i.type === "movie").slice(0, 25)),
-  "fresh-drops": () => fetchUpstream("/").then(parseCatalogItems).then(d => d.slice(0, 12)), // From homepage
-  "ongoing": () => fetchUpstream("/category/status/ongoing/").then(parseCatalogItems), // FIXED path
-  "completed": () => fetchUpstream("/category/status/completed/").then(parseCatalogItems), // FIXED path
-  "movies": () => fetchUpstream("/movies/").then(parseCatalogItems), // FIXED: trailing slash
+  "fresh-drops": () => fetchUpstream("/").then(parseCatalogItems).then(d => d.slice(0, 12)),
+  "ongoing": () => fetchUpstream("/category/status/ongoing/").then(parseCatalogItems),
+  "completed": () => fetchUpstream("/category/status/completed/").then(parseCatalogItems),
+  "movies": () => fetchUpstream("/movies/").then(parseCatalogItems),
 };
 
 async function handleHomeSection(section, ctx) {
@@ -465,7 +332,7 @@ async function handleRandom(ctx) {
   }, ctx);
 }
 
-// FIXED: Use correct upstream paths
+// Corrected upstream paths for catalog
 async function handleCatalog(kind, ctx, url) {
   const page = Number(url.searchParams.get("page") || 1);
   const pathMap = {
@@ -475,7 +342,7 @@ async function handleCatalog(kind, ctx, url) {
     "cartoon": "/category/cartoon/",
     "ongoing": "/category/status/ongoing/",
     "completed": "/category/status/completed/",
-    "fresh-drops": "/", // From homepage
+    "fresh-drops": "/",
     "popular": "/",
     "popular/series": "/",
     "popular/films": "/",
@@ -590,7 +457,7 @@ export default {
       if (path === "/api/stream") return await handleStream(ctx, url);
       if (path === "/proxy/media") return await handleMediaProxy(request);
       if (path === "/" || path === "") {
-        return new Response(`AnimeSalt API v3.40.0-fixed\n\nCorrected upstream paths:\n- /series/ → /series/\n- /movies/ → /movies/\n- /anime/ → /category/anime/\n- /cartoon/ → /category/cartoon/\n- /ongoing/ → /category/status/ongoing/\n- /completed/ → /category/status/completed/\n`, { headers: { "Content-Type": "text/plain" } });
+        return new Response(`AnimeSalt API v3.40.0\n\nModular architecture:\n- Parsers imported from ./parsers.js\n- Corrected upstream paths\n- Stale-while-revalidate caching\n`, { headers: { "Content-Type": "text/plain" } });
       }
       return jsonError("Not found", 404);
     } catch (e) {
