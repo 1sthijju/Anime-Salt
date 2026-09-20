@@ -5,6 +5,7 @@
 //  - referer/origin spoofing via candidate list (CDN hotlink whitelists)
 //  - HLS manifest rewriting (segments, URI=, #EXT-X-KEY, #EXT-X-MAP,
 //    #EXT-X-MEDIA) — tag prefixes preserved (v4 fix)
+//  - Audio language selection via ?audio=<code> → flips DEFAULT flag (v5)
 //  - Range passthrough for segments
 //  - force=text/vtt → returns valid VTT even for binary input
 // ==========================================================================
@@ -12,7 +13,8 @@
 import { jsonError } from "../util/response.js";
 
 const UPSTREAM_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -20,6 +22,24 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Headers": "Content-Type, Range",
   "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
 };
+
+// ---------- audio language normalization ----------
+const NAME2CODE = {
+  japanese: "jpn", english: "eng", hindi: "hin", tamil: "tam", telugu: "tel",
+  spanish: "spa", french: "fre", german: "ger", italian: "ita",
+  portuguese: "por", russian: "rus", korean: "kor", chinese: "chi", arabic: "ara",
+};
+const TWO2THREE = {
+  ja: "jpn", en: "eng", hi: "hin", ta: "tam", te: "tel", es: "spa", fr: "fre",
+  de: "ger", it: "ita", pt: "por", ru: "rus", ko: "kor", zh: "chi", ar: "ara",
+};
+function normAudio(v) {
+  const s = String(v || "").trim().toLowerCase();
+  if (!s) return "";
+  if (NAME2CODE[s]) return NAME2CODE[s];
+  if (TWO2THREE[s]) return TWO2THREE[s];
+  return s.slice(0, 3);
+}
 
 /**
  * Build the public URL clients will use to fetch media through the proxy.
@@ -47,22 +67,33 @@ function detectKind(url, ct) {
 }
 
 /**
- * Rewrite HLS manifest so every segment and URI="..." reference points back
- * through /proxy/media — keeps the whole chain proxied for referer spoofing.
+ * Rewrite HLS manifest:
+ *  - Proxy every segment, URI=, #EXT-X-KEY, #EXT-X-MAP, #EXT-X-MEDIA
+ *  - When ?audio=<code> is present, flip the matching AUDIO rendition to
+ *    DEFAULT=YES (all others DEFAULT=NO) so ANY engine auto-selects it.
  *
- * v4 FIX: capture groups now INCLUDE the tag prefix (#EXT-X-MEDIA:,
- * #EXT-X-KEY:, #EXT-X-MAP:) so rebuilt lines keep their tags. Previously the
- * prefix was dropped, producing invalid lines like `TYPE=AUDIO,...` which
- * made players ignore all audio renditions (silent playback, no audio menu).
+ * v4 FIX: capture groups INCLUDE the tag prefix so rebuilt lines keep
+ * #EXT-X-MEDIA: / #EXT-X-KEY: / #EXT-X-MAP: intact.
+ * v5 ADD: audio DEFAULT-flip for reload-based switching.
  */
 function rewriteManifest(text, origin, baseUrl, referer, audio) {
+  const want = audio ? normAudio(audio) : null;
   const lines = text.split(/\r?\n/);
   const out = [];
 
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
+    let line = lines[i];
 
-    // #EXT-X-MEDIA:...URI="..."  (audio / subtitle renditions)
+    // --- AUDIO: flip DEFAULT flag when ?audio= is present ---
+    if (want && /^#EXT-X-MEDIA:/i.test(line) && /TYPE=AUDIO/i.test(line)) {
+      const langM = line.match(/LANGUAGE="([^"]+)"/i);
+      const nameM = line.match(/NAME="([^"]+)"/i);
+      const hit = (langM && normAudio(langM[1]) === want) ||
+                  (nameM && normAudio(nameM[1]) === want);
+      line = line.replace(/DEFAULT=(YES|NO)/i, `DEFAULT=${hit ? "YES" : "NO"}`);
+    }
+
+    // --- #EXT-X-MEDIA:URI="..." (audio / subtitle renditions) ---
     const mediaM = line.match(/^(#EXT-X-MEDIA:.*?URI=")([^"]+)(".*)$/i);
     if (mediaM) {
       const abs = mediaM[2].startsWith("http") ? mediaM[2] : new URL(mediaM[2], baseUrl).href;
@@ -70,7 +101,7 @@ function rewriteManifest(text, origin, baseUrl, referer, audio) {
       continue;
     }
 
-    // #EXT-X-KEY:...URI="..."  (encryption key)
+    // --- #EXT-X-KEY:URI="..." (encryption key) ---
     const keyM = line.match(/^(#EXT-X-KEY:.*?URI=")([^"]+)(".*)$/i);
     if (keyM) {
       const abs = keyM[2].startsWith("http") ? keyM[2] : new URL(keyM[2], baseUrl).href;
@@ -78,7 +109,7 @@ function rewriteManifest(text, origin, baseUrl, referer, audio) {
       continue;
     }
 
-    // #EXT-X-MAP:...URI="..."  (initialization segment)
+    // --- #EXT-X-MAP:URI="..." (initialization segment) ---
     const mapM = line.match(/^(#EXT-X-MAP:.*?URI=")([^"]+)(".*)$/i);
     if (mapM) {
       const abs = mapM[2].startsWith("http") ? mapM[2] : new URL(mapM[2], baseUrl).href;
@@ -86,7 +117,7 @@ function rewriteManifest(text, origin, baseUrl, referer, audio) {
       continue;
     }
 
-    // Bare URL line (segment or child manifest)
+    // --- Bare URL line (segment or child manifest) ---
     if (!line.startsWith("#") && line.trim()) {
       const abs = line.trim().startsWith("http") ? line.trim() : new URL(line.trim(), baseUrl).href;
       out.push(proxyMediaUrl(origin, abs, { referer, audio }));
@@ -112,7 +143,6 @@ export async function handleMediaProxy(request) {
   if (!targetUrl) return jsonError("Missing url", 400);
 
   // --- Referer candidates in priority order ---
-  // Different CDNs whitelist different origins. The list tries each until 2xx.
   const targetOrigin = (() => {
     try { return new URL(targetUrl).origin; } catch { return ""; }
   })();
@@ -225,7 +255,6 @@ export async function handleMediaProxy(request) {
   if (cr) outHeaders.set("Content-Range", cr);
   outHeaders.set("Accept-Ranges", "bytes");
 
-  // Cache: segments & VTT & images stable (1h); manifests short (60s)
   const maxAge = kind === "manifest" ? 60 : 3600;
   outHeaders.set("Cache-Control", `public, max-age=${maxAge}`);
 
