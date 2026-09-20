@@ -1,5 +1,5 @@
 // ==========================================================================
-// /api/info?id=<id> — tries /series/ then /movies/, cache-busted key
+// /api/info?id=<id> — series→movies fallback + status inference
 // ==========================================================================
 
 import { fetchUpstream } from "../util/fetcher.js";
@@ -8,12 +8,27 @@ import { parseInfoPage } from "../parsers/info.js";
 import { TTL } from "../config.js";
 import { jsonError } from "../util/response.js";
 
+async function inferStatus(id) {
+  const needles = [`/series/${id}/`, `/movies/${id}/`];
+  try {
+    for (let p = 1; p <= 2; p++) {
+      const ong = await fetchUpstream(`/category/status/ongoing/${p > 1 ? `page/${p}/` : ""}`);
+      if (needles.some((n) => ong.includes(n))) return "Ongoing";
+    }
+    for (let p = 1; p <= 2; p++) {
+      const comp = await fetchUpstream(`/category/status/completed/${p > 1 ? `page/${p}/` : ""}`);
+      if (needles.some((n) => comp.includes(n))) return "Completed";
+    }
+  } catch {}
+  return "";
+}
+
 export async function handleInfo(ctx, url) {
   const id = url.searchParams.get("id");
   if (!id) return jsonError("Missing id", 400);
 
   return cached(
-    `info:v2:${id}`,
+    `info:v3:${id}`,
     TTL.info,
     async () => {
       let html, kind = "series";
@@ -24,7 +39,9 @@ export async function handleInfo(ctx, url) {
         html = await fetchUpstream(`/movies/${id}/`);
         kind = "movie";
       }
-      return parseInfoPage(html, id, kind);
+      const info = parseInfoPage(html, id, kind);
+      if (!info.status) info.status = await inferStatus(id);
+      return info;
     },
     ctx
   );
