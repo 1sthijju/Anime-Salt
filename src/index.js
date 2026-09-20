@@ -1,5 +1,5 @@
 // ==========================================================================
-// AnimeSalt Worker — Main Router (v4.4.0-sections)
+// AnimeSalt Worker — Main Router (v4.5.0-az)
 // ==========================================================================
 
 import { corsHeaders, UPSTREAM, CHROME_HEADERS } from "./config.js";
@@ -12,7 +12,7 @@ import {
   handleHomeDebug,
   HOME_SECTIONS,
 } from "./api/home.js";
-import { handleCatalog, handleRandom } from "./api/catalog.js";
+import { handleCatalog, handleRandom, handleLetter } from "./api/catalog.js";
 import {
   handleDiscover,
   handleGenreList,
@@ -43,7 +43,7 @@ export default {
         return jsonSuccess({
           pong: true,
           timestamp: new Date().toISOString(),
-          worker: "v4.4.0-sections",
+          worker: "v4.5.0-az",
         });
       }
 
@@ -74,9 +74,12 @@ export default {
         if (path === `/api/${kind}`) return await handleCatalog(kind, ctx, url);
       }
 
+      // ---------- letter browse: /api/letter/<A-Z|#> ----------
+      const letterM = path.match(/^\/api\/letter\/([#A-Za-z])$/);
+      if (letterM) return await handleLetter(letterM[1], ctx);
+
       // ---------- taxonomy ----------
       if (path === "/api/discover") return await handleDiscover(ctx);
-      // NOTE: handleGenreList returns a Response from cached() — do NOT wrap
       if (path === "/api/genres") return await handleGenreList(ctx);
       for (const kind of TAXONOMY_KINDS) {
         const m = path.match(new RegExp(`^/api/${kind}/([^/]+)$`));
@@ -100,15 +103,16 @@ export default {
       // ---------- media proxy ----------
       if (path === "/proxy/media") return await handleMediaProxy(request);
 
-      // ---------- audit (upstream-only; self-probes unreliable in Workers) ----------
+      // ---------- audit ----------
       if (path === "/api/debug/audit") return await handleAudit();
 
       // ---------- root ----------
       if (path === "/" || path === "") {
         return new Response(
-          `AnimeSalt Worker v4.4.0-sections\n\n` +
+          `AnimeSalt Worker v4.5.0-az\n\n` +
           `Home:      /api/home/hero, /api/home/<section>\n` +
           `Sections:  ${HOME_SECTIONS.join(", ")}\n` +
+          `Letters:   /api/letter/<A-Z|#>\n` +
           `Catalog:   /api/series, /api/movies, /api/anime, /api/cartoon, /api/ongoing, /api/completed, /api/popular[/series|/films]\n` +
           `Taxonomy:  /api/discover, /api/genres, /api/<kind>/<slug>\n` +
           `Search:    /api/search?keyword=<kw>\n` +
@@ -147,6 +151,7 @@ async function handleAudit() {
   const upstreams = [
     "/", "/series/", "/movies/", "/category/anime/", "/category/cartoon/",
     "/category/status/ongoing/", "/category/status/completed/", "/wp-sitemap.xml",
+    "/letter/a/", "/letter/z/",
   ];
   const report = [];
   for (const u of upstreams) {
