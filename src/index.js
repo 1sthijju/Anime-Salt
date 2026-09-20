@@ -1,13 +1,13 @@
 // ==========================================================================
-// AnimeSalt Worker — Main entry point (v4.0.0)
-// This is a stub that proves deployment works. Real routes come in later batches.
+// AnimeSalt Worker — Main entry point (v4.1.0)
+// Wires up modular API routes
 // ==========================================================================
 
 import { corsHeaders } from "./config.js";
-import { jsonSuccess } from "./util/response.js";
-import { fetchUpstream } from "./util/fetcher.js";
-import { cached } from "./util/cache.js";
-import { TTL } from "./config.js";
+import { jsonSuccess, jsonError } from "./util/response.js";
+import { handleHealth } from "./api/health.js";
+import { handleHomeHero, handleHomeSection, HOME_SECTIONS } from "./api/home.js";
+import { handleCatalog, handleRandom } from "./api/catalog.js";
 
 export default {
   async fetch(request, env, ctx) {
@@ -20,43 +20,62 @@ export default {
     }
 
     try {
-      // ----- Stub routes to prove each layer works -----
-
-      // Health ping — no upstream call, just prove routing works
+      // ----- Health -----
+      if (path === "/api/health") return await handleHealth(ctx);
       if (path === "/api/ping") {
         return jsonSuccess({
           pong: true,
           timestamp: new Date().toISOString(),
-          worker: "v4.0.0-stub",
+          worker: "v4.1.0-modular",
         });
       }
 
-      // Upstream ping — prove fetcher works
-      if (path === "/api/upstream-ping") {
-        return cached(
-          "upstream:ping",
-          TTL.health,
-          async () => {
-            const start = Date.now();
-            const html = await fetchUpstream("/");
-            return {
-              status: "ok",
-              latencyMs: Date.now() - start,
-              bytes: html.length,
-              hasContent: html.length > 1000,
-            };
-          },
-          ctx
-        );
+      // ----- Modular Home -----
+      if (path === "/api/home/hero") return await handleHomeHero(ctx);
+      if (path.startsWith("/api/home/")) {
+        const section = path.replace("/api/home/", "");
+        return await handleHomeSection(section, ctx);
+      }
+      if (path === "/api/home") {
+        return jsonSuccess({
+          _deprecated: "Use /api/home/hero + /api/home/<section> in parallel",
+          sections: HOME_SECTIONS,
+        });
       }
 
-      // Root
+      // ----- Random -----
+      if (path === "/api/random") return await handleRandom(ctx);
+
+      // ----- Catalog -----
+      const catalogKinds = [
+        "series",
+        "movies",
+        "anime",
+        "cartoon",
+        "ongoing",
+        "completed",
+        "fresh-drops",
+        "popular",
+        "popular/series",
+        "popular/films",
+      ];
+      for (const kind of catalogKinds) {
+        if (path === `/api/${kind}`) {
+          return await handleCatalog(kind, ctx, url);
+        }
+      }
+
+      // ----- Root -----
       if (path === "/" || path === "") {
         return new Response(
-          `AnimeSalt Worker v4.0.0\n\n` +
-          `Test endpoints:\n` +
-          `  GET /api/ping          → routing check\n` +
-          `  GET /api/upstream-ping → fetcher + cache check\n`,
+          `AnimeSalt Worker v4.1.0\n\n` +
+            `Modular home: /api/home/hero, /api/home/<section>\n` +
+            `Sections: ${HOME_SECTIONS.join(", ")}\n` +
+            `Catalog: /api/series, /api/movies, /api/anime, /api/cartoon\n` +
+            `Status: /api/ongoing, /api/completed\n` +
+            `Popular: /api/popular, /api/popular/series, /api/popular/films\n` +
+            `Random: /api/random\n` +
+            `Health: /api/health\n`,
           {
             headers: {
               "Content-Type": "text/plain; charset=utf-8",
@@ -66,11 +85,15 @@ export default {
         );
       }
 
-      // Catch-all
-      return jsonSuccess({ error: "Not implemented yet", path }, 404);
+      // ----- Catch-all -----
+      return jsonError("Not found", 404);
     } catch (e) {
       return new Response(
-        JSON.stringify({ success: false, error: e.message, stack: e.stack }),
+        JSON.stringify({
+          success: false,
+          error: e.message,
+          stack: e.stack,
+        }),
         {
           status: 500,
           headers: {
