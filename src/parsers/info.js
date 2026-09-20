@@ -1,9 +1,8 @@
 // ==========================================================================
-// Info page parser v8
-// - Strip leading HTML fragments from description
-// - Year search limited to header (exclude footer)
-// - Better episode title extraction
-// - Filter out "Comments" and non-episode links
+// Info page parser v9
+// - Year: anchored near runtime chip, excludes footer
+// - Backdrop: CSS background-image search
+// - Episodes: try data-title attribute, fall back to generic
 // ==========================================================================
 
 const clean = (t) =>
@@ -48,14 +47,20 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     if (hit) { poster = hit; break; }
   }
 
-  // ---------------- backdrop (wide art) ----------------
+  // ---------------- backdrop (wide art in CSS background) ----------------
   let backdrop = "";
-  const bdM = html.slice(0, 40000).match(
-    /url\(['"]?(\/\/image\.tmdb\.org\/t\/p\/w(?:780|1280|original)\/[^'")]+|https?:\/\/image\.tmdb\.org\/t\/p\/w(?:780|1280|original)\/[^'")]+)/i
-  );
-  if (bdM) backdrop = fixUrl(bdM[1]);
+  // Try style="background-image: url(...)"
+  const bgM = html.match(/style="[^"]*background(?:-image)?\s*:\s*url\(['"]?(\/\/image\.tmdb\.org[^'")]+|https?:\/\/image\.tmdb\.org[^'")]+)/i);
+  if (bgM) backdrop = fixUrl(bgM[1]);
+  // Fallback: look for wide TMDB images (w780, w1280, original) that aren't the poster
+  if (!backdrop && poster) {
+    for (const img of tmdbImgs) {
+      if (img === poster) continue;
+      if (/w(?:780|1280|original)\//.test(img)) { backdrop = img; break; }
+    }
+  }
 
-  // ---------------- description: Overview → Read More / Genres ----------------
+  // ---------------- description ----------------
   let description = "";
   const ovIdx = html.search(/>\s*Overview\s*</i);
   if (ovIdx !== -1) {
@@ -86,36 +91,24 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     }
   }
 
-  // ---------------- year: limit to first 20000 chars (exclude footer) ----------------
-  const headerSection = html.slice(0, 20000);
+  // ---------------- year: anchored near runtime, strict ----------------
   let year = "";
-  
-  // Strategy 1: year near "min" runtime
-  const y1 = headerSection.match(/\d+\s*min[\s\S]{0,600}?(19[5-9]\d|20[0-2]\d)/i);
-  if (y1) year = y1[1];
-  
-  // Strategy 2: year after Episodes/Seasons label
-  if (!year) {
-    const y2 = headerSection.match(/(?:Episodes|Seasons)[\s\S]{0,800}?(19[5-9]\d|20[0-2]\d)/i);
-    if (y2) year = y2[1];
+  const runtimeM = html.match(/(\d+)\s*min/i);
+  if (runtimeM) {
+    // Look for year within 500 chars after runtime
+    const afterRuntime = html.slice(runtimeM.index, runtimeM.index + 500);
+    const y1 = afterRuntime.match(/(19[5-9]\d|20[0-2]\d)/);
+    if (y1) year = y1[1];
   }
-  
-  // Strategy 3: standalone year chip after metadata labels
+  // Fallback: year after "Seasons" or "Episodes" label (but not 2025/2026 which are footer)
   if (!year) {
-    const y3 = headerSection.match(/(?:Genres|Languages|Status|Type)[\s\S]{0,1500}>(19[5-9]\d|20[0-2]\d)</i);
-    if (y3) year = y3[1];
+    const y2 = html.slice(0, 15000).match(/(?:Seasons?|Episodes?)[\s\S]{0,800}?(19[5-9]\d|20[0-2]\d)/i);
+    if (y2 && y2[1] !== "2025" && y2[1] !== "2026") year = y2[1];
   }
-  
-  // Strategy 4: JSON-LD datePublished
+  // Fallback: JSON-LD
   if (!year) {
-    const y4 = html.match(/"datePublished"\s*:\s*"(\d{4})/i);
-    if (y4) year = y4[1];
-  }
-  
-  // Strategy 5: <time datetime>
-  if (!year) {
-    const y5 = headerSection.match(/<time[^>]*datetime="(\d{4})/i);
-    if (y5) year = y5[1];
+    const y3 = html.match(/"datePublished"\s*:\s*"(\d{4})/i);
+    if (y3 && y3[1] !== "2025" && y3[1] !== "2026") year = y3[1];
   }
 
   // ---------------- status ----------------
@@ -149,38 +142,36 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     })
     .filter(Boolean);
 
-  // ---------------- episodes (real titles, filtered) ----------------
+  // ---------------- episodes (try data-title, fallback to generic) ----------------
   const episodesPreview = [];
-  const epRe = /<a[^>]+href="https?:\/\/animesalt\.cx\/episode\/([^"\/?#]+)\/?"[^>]*>([\s\S]*?)<\/a>/g;
+  const epRe = /<a[^>]+href="https?:\/\/animesalt\.cx\/episode\/([^"\/?#]+)\/?"([^>]*)>([\s\S]*?)<\/a>/g;
   let em;
   while ((em = epRe.exec(html)) !== null) {
     const slug = em[1];
+    const attrs = em[2];
     if (episodesPreview.some((e) => e.slug === slug)) continue;
-    const chunk = em[2];
+    const chunk = em[3];
     
-    // Extract title from various possible locations
+    // Try data-title attribute first
     let title = "";
-    const tM =
-      chunk.match(/class="[^"]*(?:ep-?title|episode-?title|title|name)[^"]*"[^>]*>([^<]{2,100})</i) ||
-      chunk.match(/<(?:h[34]|div|span)[^>]*class="[^"]*title[^"]*"[^>]*>([^<]{2,100})</i) ||
-      chunk.match(/\balt="([^"]{2,100})"/i);
-    
-    if (tM) {
-      const candidate = clean(tM[1]);
+    const dataTitle = attrs.match(/\bdata-(?:title|ep-?title)="([^"]+)"/i);
+    if (dataTitle) {
+      const candidate = clean(dataTitle[1]);
       if (!isNonEpisodeTitle(candidate)) title = candidate;
     }
     
-    // Fallback: look for title in HTML after the link
+    // Fallback: look for title in chunk
     if (!title) {
-      const after = html.slice(em.index + em[0].length, em.index + em[0].length + 400);
-      const aM = after.match(/<(?:div|span|h[34])[^>]*class="[^"]*(?:title|name|ep)[^"]*"[^>]*>([^<]{2,100})</i);
-      if (aM) {
-        const candidate = clean(aM[1]);
+      const tM =
+        chunk.match(/class="[^"]*(?:ep-?title|episode-?title|title|name)[^"]*"[^>]*>([^<]{2,100})</i) ||
+        chunk.match(/<(?:h[34]|div|span)[^>]*class="[^"]*title[^"]*"[^>]*>([^<]{2,100})</i) ||
+        chunk.match(/\balt="([^"]{2,100})"/i);
+      if (tM) {
+        const candidate = clean(tM[1]);
         if (!isNonEpisodeTitle(candidate)) title = candidate;
       }
     }
     
-    // Skip if title is "Comments" or similar
     if (isNonEpisodeTitle(title)) continue;
     
     const sxe = slug.match(/(\d+)x(\d+)$/);
