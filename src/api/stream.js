@@ -1,12 +1,15 @@
 // ==========================================================================
 // /api/stream?ep=<slug>&server=<n>&lang=<l>&audio=<a>
+// Decodes embed URLs to direct HLS streams via decryptors
 // ==========================================================================
 
 import { jsonSuccess, jsonError } from "../util/response.js";
 import { handleServers } from "./servers.js";
 import { resolveAsCdn26 } from "../decryptors/as-cdn26.js";
 import { resolveAbyss } from "../decryptors/abyss.js";
+import { resolveMegaplay } from "../decryptors/megaplay.js";
 import { proxyMediaUrl } from "../proxy/media.js";
+import { fetchUpstream } from "../util/fetcher.js";
 
 /**
  * Follow a shortener URL (short.icu etc.) to find the real embed.
@@ -22,6 +25,7 @@ async function followShortener(shortUrl) {
   } catch {}
 
   if (/as-cdn/i.test(finalUrl)) return resolveAsCdn26(finalUrl);
+  if (/megaplay/i.test(finalUrl)) return resolveMegaplay(finalUrl);
 
   try {
     const res = await fetch(finalUrl, {
@@ -36,6 +40,7 @@ async function followShortener(shortUrl) {
     if (iframeM) {
       const innerUrl = iframeM[1].replace(/\\\//g, "/").replace(/^\/\//, "https://");
       if (/as-cdn/i.test(innerUrl)) return resolveAsCdn26(innerUrl);
+      if (/megaplay/i.test(innerUrl)) return resolveMegaplay(innerUrl);
       const innerResolved = await resolveAbyss(innerUrl);
       if (innerResolved.direct_hls) return innerResolved;
     }
@@ -55,6 +60,39 @@ async function followShortener(shortUrl) {
 }
 
 /**
+ * Extract subtitles from episode page (working version from earlier)
+ */
+async function extractSubtitlesFromPage(epSlug) {
+  try {
+    const html = await fetchUpstream(`/episode/${epSlug}/`);
+    const subtitles = [];
+
+    // Pattern 1: playerjsSubtitle variable
+    const pjsMatch = html.match(/var\s+playerjsSubtitle\s*=\s*["']([^"']*)["']/i);
+    if (pjsMatch && pjsMatch[1].trim() !== "") {
+      const re = /\[([^\]]+)\]\s*(https?:\/\/[^"'\s,;]+)/g;
+      let pm;
+      while ((pm = re.exec(pjsMatch[1])) !== null) {
+        const label = pm[1].trim();
+        const url = pm[2].trim();
+        if (url) {
+          subtitles.push({
+            label: label || "Sub",
+            url: url,
+            referer: new URL(url).origin + "/",
+          });
+        }
+      }
+    }
+
+    return subtitles;
+  } catch (e) {
+    console.error("Failed to extract subtitles from page:", e.message);
+    return [];
+  }
+}
+
+/**
  * Main stream handler
  */
 export async function handleStream(ctx, url) {
@@ -65,7 +103,7 @@ export async function handleStream(ctx, url) {
 
   if (!ep) return jsonError("Missing ep", 400);
 
-  // 1. Fetch servers list (handle Response object from cached())
+  // 1. Fetch servers list
   const srvRes = await handleServers(ctx, url);
   let servers;
   try {
@@ -105,6 +143,8 @@ export async function handleStream(ctx, url) {
   try {
     if (/as-cdn26|as-cdn/i.test(embedUrl)) {
       resolved = await resolveAsCdn26(embedUrl);
+    } else if (/megaplay\.buzz/i.test(embedUrl)) {
+      resolved = await resolveMegaplay(embedUrl);
     } else if (/short\.icu|multi-lang-plyr/i.test(embedUrl)) {
       resolved = await followShortener(embedUrl);
     } else {
@@ -140,8 +180,10 @@ export async function handleStream(ctx, url) {
   result.qualities = resolved.qualities || [];
   result.poster = resolved.poster || null;
   result.isIframe = false;
+  result.intro = resolved.intro || null;
+  result.outro = resolved.outro || null;
   
-  // Map subtitles (from the HLS manifest/API)
+  // Map subtitles from decryptor
   result.subtitles = (resolved.subtitles || []).map((s) => ({
     label: s.label || "Sub",
     url: proxyMediaUrl(url.origin, s.url, {
