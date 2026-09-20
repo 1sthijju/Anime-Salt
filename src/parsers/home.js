@@ -1,8 +1,8 @@
 // ==========================================================================
-// Homepage section parser v2
+// Homepage section parser v3
 // - Heading match tolerates h1-h6/div/span/p + inner icon tags
 // - Blocks sliced heading→heading so cards never leak across rows
-// - Networks strip + A-Z index parsers
+// - Networks strip + tolerant A-Z index parser (two strategies)
 // - inspectHomeSections() = live debug report per section
 // ==========================================================================
 
@@ -25,8 +25,7 @@ export const SECTIONS = [
 /**
  * Tolerant heading finder.
  * Matches <h3|div|span|p …> optionally followed by inner tags (icons/svg),
- * then the exact section title text.
- * Returns character position or -1.
+ * then the exact section title text. Returns position or -1.
  */
 const headingPos = (html, title) => {
   const re = new RegExp(
@@ -39,18 +38,15 @@ const headingPos = (html, title) => {
 
 /**
  * Parse every homepage row into its own keyed array.
- * Cards are extracted ONLY from the block between this heading and the next,
- * so items never leak across sections.
+ * Cards are extracted ONLY from the block between this heading and the next.
  */
 export function parseHomeSections(html) {
-  // Ranked charts have their own dedicated structure
   const mw = parseMostWatched(html);
   const out = {
     "most-watched-series": mw.series,
     "most-watched-films": mw.films,
   };
 
-  // Locate each section heading, in document order
   const marks = [];
   for (const [key, title] of SECTIONS) {
     const pos = headingPos(html, title);
@@ -58,20 +54,17 @@ export function parseHomeSections(html) {
   }
   marks.sort((a, b) => a.pos - b.pos);
 
-  // Slice heading→heading and parse cards inside each block
   marks.forEach((mk, i) => {
     const end = i + 1 < marks.length ? marks[i + 1].pos : html.length;
     out[mk.key] = parseCatalogItems(html.slice(mk.pos, end));
   });
 
-  // Convenience alias for older clients
   out["latest"] = out["new-arrivals"] || parseCatalogItems(html).slice(0, 24);
   return out;
 }
 
 /**
  * Top network-logo strip → [{slug, name, image}]
- * (Prime Video / Netflix / Hotstar / Crunchyroll row)
  */
 export function parseNetworkStrip(html) {
   const seen = new Set();
@@ -98,22 +91,52 @@ export function parseNetworkStrip(html) {
 
 /**
  * "Navigate A to Z" index → [{letter, url}]
+ * Two strategies:
+ *   1. <a href="…"><span>A</span></a>  (WordPress widget pattern)
+ *   2. <a href="…">A</a>               (bare anchor text)
+ * Deduplicates and normalizes protocols.
  */
 export function parseAzIndex(html) {
   const pos = headingPos(html, "Navigate A to Z");
   if (pos === -1) return [];
-  const block = html.slice(pos, pos + 8000);
+  const block = html.slice(pos, pos + 12000);
   const out = [];
-  const re = /<a[^>]+href="([^"]+)"[^>]*>\s*([#A-Z])\s*<\/a>/g;
+  const seen = new Set();
+
+  // Strategy 1: anchor with optional inner wrapper tags
+  const re = /<a\b[^>]+href="([^"]+)"[^>]*>(?:\s*<[^>]+>)*\s*([#A-Za-z])\s*(?:<[^>]+>\s*)*<\/a>/g;
   let m;
   while ((m = re.exec(block)) !== null) {
-    out.push({ letter: m[2], url: m[1] });
+    const letter = m[2].toUpperCase();
+    const url = m[1].startsWith("//") ? "https:" + m[1] : m[1];
+    const key = letter + url;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ letter, url });
+    if (out.length >= 40) break;
+  }
+
+  // Strategy 2: fallback — any link whose stripped text is exactly one letter
+  if (out.length < 20) {
+    const re2 = /<a\b[^>]+href="([^"]+)"[^>]*>([\s\S]{1,200}?)<\/a>/g;
+    while ((m = re2.exec(block)) !== null) {
+      const text = m[2].replace(/<[^>]+>/g, "").trim();
+      if (/^[#A-Za-z]$/.test(text)) {
+        const letter = text.toUpperCase();
+        const url = m[1].startsWith("//") ? "https:" + m[1] : m[1];
+        const key = letter + url;
+        if (!seen.has(key)) {
+          seen.add(key);
+          out.push({ letter, url });
+        }
+      }
+    }
   }
   return out;
 }
 
 /**
- * Debug report: for every expected section — heading found? items parsed?
+ * Debug report: heading found? items parsed? first title?
  * Used by GET /api/debug/home to validate parsers against the live site.
  */
 export function inspectHomeSections(html) {
