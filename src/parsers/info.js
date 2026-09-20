@@ -1,12 +1,14 @@
 // ==========================================================================
-// Info page parser v6
-// description : paragraph/div AFTER "Overview" heading
-// year        : metadata section year, exclude footer
+// Info page parser v7
+// description : text between ">Overview<" and "Read More"/"Genres"
+// year        : chip after "NN min" → fallbacks (release_date, JSON-LD, time)
+// backdrop    : wide TMDB art inside url(...)
+// episodes    : real titles from the visible season grid
 // ==========================================================================
 
 const clean = (t) =>
   String(t || "")
-    .replace(/<[^>]+>/g, "")
+    .replace(/<[^>]+>/g, " ")
     .replace(/^Image\s+/i, "")
     .replace(/&amp;/g, "&").replace(/&#8217;/g, "'").replace(/&#8211;/g, "-")
     .replace(/&nbsp;/g, " ").replace(/&quot;/g, '"').replace(/&#39;/g, "'")
@@ -16,20 +18,21 @@ const clean = (t) =>
 
 const fixUrl = (u) => (u && u.startsWith("//") ? "https:" + u : u || "");
 
-const isSpamDesc = (d) => /Download\s*\/\s*Watch Online|480p,\s*720p|Hindi Dubbed/i.test(d);
+const isSpamDesc = (d) =>
+  /Download\s*\/\s*Watch Online|480p,\s*720p|Hindi Dubbed|Watch Online \d/i.test(d);
 
 export function parseInfoPage(html, id, fetchedKind = "series") {
-  // ---- title ----
+  // ---------------- title ----------------
   const titleM = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
 
-  // ---- type: canonical / og:url ----
+  // ---------------- type ----------------
   const canon =
     html.match(/<link[^>]*rel="canonical"[^>]*href="([^"]+)"/i) ||
     html.match(/<meta[^>]*property="og:url"[^>]*content="([^"]+)"/i);
   let type = fetchedKind;
   if (canon) type = /\/movies?\//i.test(canon[1]) ? "movie" : "series";
 
-  // ---- poster: best TMDB width ----
+  // ---------------- poster (best TMDB width) ----------------
   let poster = "";
   const tmdbImgs = [...html.matchAll(/<img[^>]*?\b(?:data-src|src)="(\/\/image\.tmdb\.org[^"]+|https?:\/\/image\.tmdb\.org[^"]+)"/gi)]
     .map((m) => fixUrl(m[1]))
@@ -39,93 +42,130 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     if (hit) { poster = hit; break; }
   }
 
-  // ---- description: find Overview heading, grab NEXT paragraph/div ----
+  // ---------------- backdrop (wide art in url(...)) ----------------
+  let backdrop = "";
+  const bdM = html.slice(0, 40000).match(
+    /url\(['"]?(\/\/image\.tmdb\.org\/t\/p\/w(?:780|1280|original)\/[^'")]+|https?:\/\/image\.tmdb\.org\/t\/p\/w(?:780|1280|original)\/[^'")]+)/i
+  );
+  if (bdM) backdrop = fixUrl(bdM[1]);
+
+  // ---------------- description: Overview → Read More / Genres ----------------
   let description = "";
-  
-  // Pattern 1: Look for "Overview" or "Synopsis" heading, then grab next <p> or <div>
-  const overviewM = html.match(/(?:Overview|Synopsis|Summary|Plot)\s*<\/(?:h[2-4]|div|span)>[\s\S]{0,200}?(<(?:p|div)[^>]*>([\s\S]{40,5000}?)<\/(?:p|div)>)/i);
-  if (overviewM) description = clean(overviewM[2]);
-  
-  // Pattern 2: class-based description
-  if (!description || description.length < 30) {
-    const dm = html.match(/<div[^>]*class="[^"]*(?:desc|synopsis|summary|content)[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+  const ovIdx = html.search(/>\s*Overview\s*</i);
+  if (ovIdx !== -1) {
+    let seg = html.slice(ovIdx);
+    const rm = seg.indexOf("Read More");
+    const gn = seg.indexOf(">Genres<");
+    let cut = seg.length;
+    if (rm !== -1) cut = Math.min(cut, rm);
+    if (gn !== -1) cut = Math.min(cut, gn);
+    seg = seg.slice(0, Math.min(cut, 8000)).replace(/^>\s*Overview\s*</i, "");
+    const text = clean(seg);
+    if (text.length > 40 && !isSpamDesc(text)) description = text;
+  }
+  if (!description) {
+    const dm = html.match(/<div[^>]*class="[^"]*(?:desc|synopsis|summary)[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
     if (dm) {
-      const desc = clean(dm[1]);
-      if (desc.length > 30 && !isSpamDesc(desc)) description = desc;
+      const t = clean(dm[1]);
+      if (t.length > 40 && !isSpamDesc(t)) description = t;
     }
   }
-  
-  // Pattern 3: og:description (filter spam)
-  if (!description || description.length < 30) {
+  if (!description) {
     const ogDesc =
       html.match(/<meta[^>]*property="og:description"[^>]*content="([^"]+)"/i) ||
       html.match(/<meta[^>]*name="description"[^>]*content="([^"]+)"/i);
     if (ogDesc) {
-      const desc = clean(ogDesc[1]);
-      if (desc.length > 30 && !isSpamDesc(desc)) description = desc;
+      const t = clean(ogDesc[1]);
+      if (t.length > 40 && !isSpamDesc(t)) description = t;
     }
   }
 
-  // ---- year: find in metadata section, exclude footer ----
+  // ---------------- year: chip after "NN min" → fallbacks ----------------
+  const head30 = html.slice(0, 30000);
   let year = "";
-  
-  // Strategy: search first 30KB (before footer), look for year near "Release" or in metadata div
-  const headerSection = html.slice(0, 30000);
-  
-  // Pattern 1: "Release: 2022" or "Year: 2016"
-  const releaseM = headerSection.match(/(?:Release|Year|Aired|Premiered|Released)[^0-9\n]{0,50}(19[5-9]\d|20[0-2]\d)/i);
-  if (releaseM) year = releaseM[1];
-  
-  // Pattern 2: <time datetime="2022">
+  const y1 = head30.match(/\d+\s*min<\/[\s\S]{0,400}?(19[5-9]\d|20[0-2]\d)/i);
+  if (y1) year = y1[1];
   if (!year) {
-    const timeM = headerSection.match(/<time[^>]*datetime="(\d{4})/i);
-    if (timeM) year = timeM[1];
+    const y2 = head30.match(/(?:Episodes|Seasons)<\/[\s\S]{0,600}?(19[5-9]\d|20[0-2]\d)/i);
+    if (y2) year = y2[1];
   }
-  
-  // Pattern 3: JSON-LD datePublished
   if (!year) {
-    const jsonM = html.match(/"datePublished"\s*:\s*"(\d{4})/i);
-    if (jsonM) year = jsonM[1];
+    const y3 = html.match(/video:release_date[^>]*content="(\d{4})/i);
+    if (y3) year = y3[1];
   }
-  
-  // Pattern 4: standalone year in metadata section (not footer)
   if (!year) {
-    // Look for year after "Genres" or "Languages" but before footer
-    const metaSection = html.slice(0, 25000);
-    const yearChip = metaSection.match(/(?:Genres|Languages|Status)[\s\S]{0,2000}>(19[5-9]\d|20[0-2]\d)</);
-    if (yearChip) year = yearChip[1];
+    const y4 = html.match(/"datePublished"\s*:\s*"(\d{4})/i);
+    if (y4) year = y4[1];
+  }
+  if (!year) {
+    const y5 = head30.match(/<time[^>]*datetime="(\d{4})/i);
+    if (y5) year = y5[1];
   }
 
-  // ---- status ----
+  // ---------------- status ----------------
   let status = "";
   const sm = html.match(/\/category\/status\/([a-z0-9-]+)\/?["']/i);
   if (sm) status = sm[1].replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 
-  // ---- genres / languages ----
+  // ---------------- genres / languages ----------------
   const genresBlock = html.match(/Genres[\s\S]*?<div[^>]*>([\s\S]*?)<\/div>/i);
   const genres = genresBlock
     ? [...genresBlock[1].matchAll(/<a[^>]+href="[^"]*\/category\/genre\/[^"]*"[^>]*>([^<]+)<\/a>/gi)].map((m) => m[1].trim())
     : [];
   const langsBlock = html.match(/Languages[\s\S]*?<div[^>]*>([\s\S]*?)<\/div>/i);
   const languages = langsBlock
-    ? [...langsBlock[1].matchAll(/(?:>|\s)([A-Za-z][A-Za-z]+)(?:<|\s{2,}|,)/g)].map((m) => m[1].trim()).filter((l) => l.length > 1 && l.length < 20)
+    ? [...langsBlock[1].matchAll(/(?:>|\s)([A-Za-z][A-Za-z]+)(?:<|\s{2,}|,)/g)]
+        .map((m) => m[1].trim())
+        .filter((l) => l.length > 1 && l.length < 20)
     : [];
 
-  // ---- seasons ----
-  const seasons = [...html.matchAll(/<a[^>]+href="javascript:void\(0\)"[^>]*>([^<]*Season\s*\d+[^<]*)<\/a>/gi)]
+  // ---------------- seasons (tabs: a or button) ----------------
+  const seasons = [...html.matchAll(
+    /<(?:a|button)[^>]*(?:href="javascript:void\(0\)"|data-season)[^>]*>([^<]*Season\s*\d+[^<]*)<\/(?:a|button)>/gi
+  )]
     .map((m) => clean(m[1]))
     .map((label) => {
       const numM = label.match(/Season\s*(\d+)/i);
       const countM = label.match(/\((\d+)\)/);
-      return numM ? { num: +numM[1], title: label, count: countM ? +countM[1] : 0, value: numM[1] } : null;
+      return numM
+        ? { num: +numM[1], title: label, count: countM ? +countM[1] : 0, value: numM[1] }
+        : null;
     })
     .filter(Boolean);
 
-  // ---- episode slugs ----
-  const epLinks = [...html.matchAll(/href="https?:\/\/animesalt\.cx\/episode\/([^"\/?#]+)\/?"/gi)].map((m) => m[1]);
-  const episodeSlugs = [...new Set(epLinks)];
+  // ---------------- episodes (visible season grid, real titles) ----------------
+  const episodesPreview = [];
+  const epRe = /<a[^>]+href="https?:\/\/animesalt\.cx\/episode\/([^"\/?#]+)\/?"[^>]*>([\s\S]*?)<\/a>/g;
+  let em;
+  while ((em = epRe.exec(html)) !== null) {
+    const slug = em[1];
+    if (episodesPreview.some((e) => e.slug === slug)) continue;
+    const chunk = em[2];
+    let title = "";
+    const tM =
+      chunk.match(/class="[^"]*(?:title|name|ep-t)[^"]*"[^>]*>([^<]{2,80})</i) ||
+      chunk.match(/\balt="([^"]{2,80})"/i);
+    if (tM) title = clean(tM[1]);
+    if (!title) {
+      const after = html.slice(em.index + em[0].length, em.index + em[0].length + 250);
+      const aM = after.match(/<(?:div|span|h[34])[^>]*class="[^"]*(?:title|name)[^"]*"[^>]*>([^<]{2,80})</i);
+      if (aM) title = clean(aM[1]);
+    }
+    const sxe = slug.match(/(\d+)x(\d+)$/);
+    episodesPreview.push({
+      slug,
+      season: sxe ? +sxe[1] : 1,
+      num: sxe ? +sxe[2] : 0,
+      title: title && !/^Image\s/i.test(title) ? title : `Episode ${sxe ? sxe[2] : ""}`,
+      image: (() => {
+        const iM = chunk.match(/<img[^>]*?\b(?:data-src|src)="(?!data:)([^"]+)"/i);
+        return iM ? fixUrl(iM[1]) : null;
+      })(),
+    });
+  }
+  const episodeSlugs = episodesPreview.map((e) => e.slug);
 
-  // ---- quickPlay ----
+  // ---------------- quickPlay ----------------
   let firstSlug = null, latestSlug = null;
   const linkRe = /href="https?:\/\/animesalt\.cx\/episode\/([^"\/?#]+)\/?"[^>]*>([\s\S]{0,80}?)<\/a>/g;
   let lm;
@@ -148,8 +188,8 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     id,
     title: titleM ? clean(titleM[1]) : id,
     poster,
-    backdrop: "",
-    description: description.slice(0, 1200),
+    backdrop,
+    description: description.slice(0, 1500),
     type,
     totalEpisodes: seasons.reduce((s, x) => s + (x.count || 0), 0),
     year,
@@ -159,6 +199,7 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     languages: [...new Set(languages)].slice(0, 10),
     runtime: (html.match(/(\d+)\s*min/i) || [])[1] || "",
     episodeSlugs,
+    episodesPreview,
     quickPlay: {
       first: firstSlug ? { slug: firstSlug } : null,
       latestDub: latestSlug ? { slug: latestSlug } : null,
