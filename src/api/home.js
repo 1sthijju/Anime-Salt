@@ -1,78 +1,108 @@
 // ==========================================================================
-// /api/home/* — modular home endpoints
+// /api/home/* — every section from ONE cached homepage fetch
+// v3: section-scoped parsing + legacy category fallbacks + debug report
 // ==========================================================================
 
 import { fetchUpstream } from "../util/fetcher.js";
 import { cached } from "../util/cache.js";
 import {
-  parseFeatured,
-  parseLatest,
-  parseMostWatched,
-  parseCatalogItems,
-} from "../parsers/cards.js";
+  parseHomeSections,
+  parseNetworkStrip,
+  parseAzIndex,
+  inspectHomeSections,
+} from "../parsers/home.js";
+import { parseCatalogItems } from "../parsers/cards.js";
 import { TTL } from "../config.js";
 import { jsonError } from "../util/response.js";
 
-/**
- * /api/home/hero — featured items + ticker
- */
-export async function handleHomeHero(ctx) {
-  return cached(
-    "home:hero",
-    TTL.hero,
-    async () => {
-      const html = await fetchUpstream("/");
-      return {
-        featured: parseFeatured(html).slice(0, 6),
-        tickerItems: parseLatest(html)
-          .slice(0, 14)
-          .map((it) => ({ title: it.title, sub: "new drop" })),
-      };
-    },
-    ctx
-  );
-}
+export const HOME_SECTIONS = [
+  "latest",
+  "most-watched-series",
+  "most-watched-films",
+  "fresh-drops",
+  "on-air",
+  "new-arrivals",
+  "cartoon-series",
+  "anime-movies",
+  "cartoon-films",
+  "networks",
+  "az",
+  // legacy keys served from dedicated category pages:
+  "ongoing",
+  "completed",
+  "movies",
+];
 
-/**
- * Section fetchers — each maps to a modular /api/home/<section> endpoint
- */
-const SECTION_FETCHERS = {
-  latest: () => fetchUpstream("/").then(parseLatest),
-  "most-watched-series": () =>
-    fetchUpstream("/").then((h) => parseMostWatched(h).series),
-  "most-watched-films": () =>
-    fetchUpstream("/").then((h) => parseMostWatched(h).films),
-  "fresh-drops": () =>
-    fetchUpstream("/").then(parseCatalogItems).then((d) => d.slice(0, 12)),
-  ongoing: () =>
-    fetchUpstream("/category/status/ongoing/").then(parseCatalogItems),
-  completed: () =>
-    fetchUpstream("/category/status/completed/").then(parseCatalogItems),
-  movies: () => fetchUpstream("/movies/").then(parseCatalogItems),
+const LEGACY = {
+  ongoing: "/category/status/ongoing/",
+  completed: "/category/status/completed/",
+  movies: "/movies/",
 };
 
-/**
- * /api/home/<section> — generic section handler
- */
-export async function handleHomeSection(section, ctx) {
-  const fetcher = SECTION_FETCHERS[section];
-  if (!fetcher) return jsonError(`Unknown section: ${section}`, 404);
-  return cached(
-    `home:section:${section}`,
-    TTL.section,
-    async () => {
-      try {
-        return await fetcher();
-      } catch (e) {
-        console.error(`Section ${section} failed:`, e.message);
-        return [];
-      }
-    },
-    ctx
-  );
+/** One cached parse of the homepage → full section map */
+async function sectionsMap(ctx) {
+  const res = await cached("home:sections:v2", TTL.section, async () => {
+    const html = await fetchUpstream("/");
+    return {
+      ...parseHomeSections(html),
+      networks: parseNetworkStrip(html),
+      az: parseAzIndex(html),
+    };
+  }, ctx);
+  return await res.json();
 }
 
 /**
- * List of available sections (for /api/home root)
+ * /api/home/hero — featured (top-3 series + top-3 films) + ticker
  */
-export const HOME_SECTIONS = Object.keys(SECTION_FETCHERS);
+export async function handleHomeHero(ctx) {
+  return cached("home:hero:v2", TTL.hero, async () => {
+    const map = await sectionsMap(ctx);
+    return {
+      featured: [
+        ...(map["most-watched-series"] || []).slice(0, 3),
+        ...(map["most-watched-films"] || []).slice(0, 3),
+      ],
+      tickerItems: (map["new-arrivals"] || map["latest"] || [])
+        .slice(0, 14)
+        .map((it) => ({ title: it.title, sub: "new drop" })),
+    };
+  }, ctx);
+}
+
+/**
+ * /api/home/<section> — raw JSON array per section
+ */
+export async function handleHomeSection(section, ctx) {
+  // Legacy keys keep their dedicated category pages
+  if (LEGACY[section]) {
+    return cached(
+      `home:section:${section}`,
+      TTL.section,
+      async () => parseCatalogItems(await fetchUpstream(LEGACY[section])),
+      ctx
+    );
+  }
+
+  const map = await sectionsMap(ctx);
+  const data = map[section];
+  if (!data) return jsonError(`Unknown section: ${section}`, 404);
+
+  return new Response(JSON.stringify(data), {
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": `public, max-age=${TTL.section}, stale-while-revalidate=86400`,
+    },
+  });
+}
+
+/**
+ * /api/debug/home — per-section parse report against the LIVE homepage
+ */
+export async function handleHomeDebug(ctx) {
+  return cached("home:debug:v1", 60, async () => {
+    const html = await fetchUpstream("/");
+    return { htmlLength: html.length, sections: inspectHomeSections(html) };
+  }, ctx);
+}
