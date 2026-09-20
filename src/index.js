@@ -1,6 +1,6 @@
 // ==========================================================================
-// AnimeSalt Worker — Main entry point (v4.1.0)
-// Wires up modular API routes
+// AnimeSalt Worker — Main entry point (v4.2.0)
+// All API routes wired up
 // ==========================================================================
 
 import { corsHeaders } from "./config.js";
@@ -8,6 +8,10 @@ import { jsonSuccess, jsonError } from "./util/response.js";
 import { handleHealth } from "./api/health.js";
 import { handleHomeHero, handleHomeSection, HOME_SECTIONS } from "./api/home.js";
 import { handleCatalog, handleRandom } from "./api/catalog.js";
+import { handleDiscover, handleGenreList, handleTaxonomy, TAXONOMY_KINDS } from "./api/taxonomy.js";
+import { handleSearch } from "./api/search.js";
+import { handleInfo } from "./api/info.js";
+import { handleEpisodes } from "./api/episodes.js";
 
 export default {
   async fetch(request, env, ctx) {
@@ -26,7 +30,7 @@ export default {
         return jsonSuccess({
           pong: true,
           timestamp: new Date().toISOString(),
-          worker: "v4.1.0-modular",
+          worker: "v4.2.0-full",
         });
       }
 
@@ -48,16 +52,9 @@ export default {
 
       // ----- Catalog -----
       const catalogKinds = [
-        "series",
-        "movies",
-        "anime",
-        "cartoon",
-        "ongoing",
-        "completed",
-        "fresh-drops",
-        "popular",
-        "popular/series",
-        "popular/films",
+        "series", "movies", "anime", "cartoon",
+        "ongoing", "completed", "fresh-drops",
+        "popular", "popular/series", "popular/films",
       ];
       for (const kind of catalogKinds) {
         if (path === `/api/${kind}`) {
@@ -65,17 +62,42 @@ export default {
         }
       }
 
+      // ----- Taxonomy -----
+      if (path === "/api/discover") return await handleDiscover(ctx);
+      if (path === "/api/genres") return jsonSuccess(await handleGenreList(ctx));
+      for (const kind of TAXONOMY_KINDS) {
+        const m = path.match(new RegExp(`^/api/${kind}/([^/]+)$`));
+        if (m) {
+          return await handleTaxonomy(kind, decodeURIComponent(m[1]), ctx, url);
+        }
+      }
+
+      // ----- Search -----
+      if (path === "/api/search") return await handleSearch(ctx, url);
+
+      // ----- Info -----
+      if (path === "/api/info") return await handleInfo(ctx, url);
+
+      // ----- Episodes -----
+      if (path.startsWith("/api/episodes/")) {
+        const id = decodeURIComponent(path.replace("/api/episodes/", ""));
+        return await handleEpisodes(id, ctx, url);
+      }
+
       // ----- Root -----
       if (path === "/" || path === "") {
         return new Response(
-          `AnimeSalt Worker v4.1.0\n\n` +
-            `Modular home: /api/home/hero, /api/home/<section>\n` +
-            `Sections: ${HOME_SECTIONS.join(", ")}\n` +
-            `Catalog: /api/series, /api/movies, /api/anime, /api/cartoon\n` +
-            `Status: /api/ongoing, /api/completed\n` +
-            `Popular: /api/popular, /api/popular/series, /api/popular/films\n` +
-            `Random: /api/random\n` +
-            `Health: /api/health\n`,
+          `AnimeSalt Worker v4.2.0\n\n` +
+          `Health: /api/health\n` +
+          `Home: /api/home/hero, /api/home/<section>\n` +
+          `Catalog: /api/series, /api/movies, /api/anime, /api/cartoon\n` +
+          `Status: /api/ongoing, /api/completed\n` +
+          `Popular: /api/popular, /api/popular/series, /api/popular/films\n` +
+          `Random: /api/random\n` +
+          `Search: /api/search?keyword=<kw>\n` +
+          `Taxonomy: /api/discover, /api/genres, /api/genre/<slug>\n` +
+          `Info: /api/info?id=<id>\n` +
+          `Episodes: /api/episodes/<id>?season=<n|all>\n`,
           {
             headers: {
               "Content-Type": "text/plain; charset=utf-8",
