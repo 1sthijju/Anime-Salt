@@ -1,189 +1,229 @@
 // ==========================================================================
-// Media proxy — rewrites HLS manifests + proxies VTT with referer
-// Safely handles upstream misconfigurations (e.g. binary images requested as VTT)
+// /proxy/media?url=<target>&referer=<ref>&force=text/vtt&audio=<code>
+//
+// Proxies media (HLS manifests, segments, VTT, images) with:
+//  - referer/origin spoofing via candidate list (CDN hotlink whitelists)
+//  - HLS manifest rewriting (segments, URI=, #EXT-X-KEY, #EXT-X-MAP)
+//  - Range passthrough for segments
+//  - force=text/vtt → returns valid VTT even for binary input
 // ==========================================================================
 
-import { CHROME_HEADERS, corsHeaders } from "../config.js";
+import { jsonError } from "../util/response.js";
+
+const UPSTREAM_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Range",
+  "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
+};
 
 /**
- * Build a proxied media URL
+ * Build the public URL clients will use to fetch media through the proxy.
+ * Preserves referer / force / audio so the chain stays proxied.
  */
-export function proxyMediaUrl(workerOrigin, url, params = {}) {
-  const u = new URL("/proxy/media", workerOrigin);
-  u.searchParams.set("url", url);
-  for (const [k, v] of Object.entries(params)) {
-    if (v) u.searchParams.set(k, v);
-  }
+export function proxyMediaUrl(origin, targetUrl, opts = {}) {
+  const u = new URL("/proxy/media", origin);
+  u.searchParams.set("url", targetUrl);
+  if (opts.referer) u.searchParams.set("referer", opts.referer);
+  if (opts.force) u.searchParams.set("force", opts.force);
+  if (opts.audio) u.searchParams.set("audio", opts.audio);
   return u.toString();
 }
 
 /**
- * Handle /proxy/media requests
- * Proxies HLS segments, VTT subtitles, and media files with proper referer
+ * Detect content type from URL extension / headers.
+ */
+function detectKind(url, ct) {
+  const lower = (ct || "").toLowerCase();
+  if (/mpegurl|manifest/i.test(lower) || /\.m3u8(\?|$)/i.test(url)) return "manifest";
+  if (/\.(ts|m4s|aac|mp4|mp3|webm|fmp4)(\?|$)/i.test(url)) return "segment";
+  if (/text\/vtt|subrip/i.test(lower) || /\.vtt(\?|$)/i.test(url) || /\.srt(\?|$)/i.test(url)) return "vtt";
+  if (/image\//i.test(lower) || /\.(jpe?g|png|webp|gif|svg|avif)(\?|$)/i.test(url)) return "image";
+  return "binary";
+}
+
+/**
+ * Rewrite HLS manifest so every segment and URI="..." reference points back
+ * through /proxy/media — keeps the whole chain proxied for referer spoofing.
+ */
+function rewriteManifest(text, origin, baseUrl, referer, audio) {
+  const lines = text.split(/\r?\n/);
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // #EXT-X-MEDIA:...URI="..." → rewrite URI value (audio/subtitle renditions)
+    const mediaM = line.match(/^#EXT-X-MEDIA:(.*?URI=")([^"]+)(".*)$/i);
+    if (mediaM) {
+      const abs = mediaM[2].startsWith("http") ? mediaM[2] : new URL(mediaM[2], baseUrl).href;
+      out.push(mediaM[1] + proxyMediaUrl(origin, abs, { referer, audio }) + mediaM[3]);
+      continue;
+    }
+
+    // #EXT-X-KEY:...URI="..." → proxy the decryption key
+    const keyM = line.match(/^#EXT-X-KEY:(.*?URI=")([^"]+)(".*)$/i);
+    if (keyM) {
+      const abs = keyM[2].startsWith("http") ? keyM[2] : new URL(keyM[2], baseUrl).href;
+      out.push(keyM[1] + proxyMediaUrl(origin, abs, { referer }) + keyM[3]);
+      continue;
+    }
+
+    // #EXT-X-MAP:URI="..." → proxy initialization segment
+    const mapM = line.match(/^#EXT-X-MAP:(.*?URI=")([^"]+)(".*)$/i);
+    if (mapM) {
+      const abs = mapM[2].startsWith("http") ? mapM[2] : new URL(mapM[2], baseUrl).href;
+      out.push(mapM[1] + proxyMediaUrl(origin, abs, { referer }) + mapM[3]);
+      continue;
+    }
+
+    // Bare URL line (segment or child manifest)
+    if (!line.startsWith("#") && line.trim()) {
+      const abs = line.trim().startsWith("http") ? line.trim() : new URL(line.trim(), baseUrl).href;
+      out.push(proxyMediaUrl(origin, abs, { referer, audio }));
+      continue;
+    }
+
+    out.push(line);
+  }
+  return out.join("\n");
+}
+
+/**
+ * Main handler: fetches upstream with referer/origin spoofing,
+ * rewrites manifests, streams binary with Range passthrough.
  */
 export async function handleMediaProxy(request) {
   const url = new URL(request.url);
   const targetUrl = url.searchParams.get("url");
-  let referer = url.searchParams.get("referer");
-  const forceType = url.searchParams.get("force");
+  const refererParam = url.searchParams.get("referer");
+  const force = url.searchParams.get("force");
+  const audio = url.searchParams.get("audio");
 
-  if (!targetUrl) {
-    return new Response("Missing url", { status: 400, headers: corsHeaders });
-  }
-  if (!referer) {
-    try {
-      referer = new URL(targetUrl).origin + "/";
-    } catch {
-      referer = "";
-    }
-  }
+  if (!targetUrl) return jsonError("Missing url", 400);
 
-  // Try multiple referer candidates
+  // --- Referer candidates in priority order ---
+  // Different CDNs whitelist different origins. The list tries each until 2xx.
+  const targetOrigin = (() => {
+    try { return new URL(targetUrl).origin; } catch { return ""; }
+  })();
+
   const candidates = [
-    referer,
-    "",
-    new URL(targetUrl).origin + "/",
+    refererParam,
+    "https://megaplay.buzz/",        // ← fetch.nexabloom.top whitelist
+    "https://megaplay.buzz",
     "https://as-cdn26.top/",
-  ].filter((v, i, a) => v && a.indexOf(v) === i);
+    "https://as-cdn27.top/",
+    "https://as-cdn28.top/",
+    "https://as-cdn29.top/",
+    "https://as-cdn30.top/",
+    "https://animesalt.cx/",
+    targetOrigin ? targetOrigin + "/" : null,
+    "",                              // last-resort: no referer
+  ].filter((v, i, a) => v !== null && a.indexOf(v) === i);
 
-  let res, lastStatus;
-  for (const r of candidates) {
-    const h = new Headers({
-      "User-Agent": CHROME_HEADERS["User-Agent"],
-      Accept: "*/*",
-    });
-    if (r) {
-      h.set("Referer", r);
-      try {
-        h.set("Origin", new URL(r).origin);
-      } catch {}
+  // --- Upstream headers template ---
+  const baseHeaders = {
+    "User-Agent": UPSTREAM_UA,
+    Accept: "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "no-cors",
+    "Sec-Fetch-Site": "cross-site",
+  };
+
+  // --- Range passthrough ---
+  const clientRange = request.headers.get("Range");
+
+  // --- Try each candidate until 2xx ---
+  let upstreamRes = null;
+  let usedReferer = "";
+  let lastStatus = 0;
+
+  for (const cand of candidates) {
+    const h = { ...baseHeaders };
+    if (cand) {
+      h.Referer = cand;
+      try { h.Origin = new URL(cand).origin; } catch {}
     }
-    const rng = request.headers.get("Range");
-    if (rng) h.set("Range", rng);
+    if (clientRange) h.Range = clientRange;
+
     try {
-      res = await fetch(targetUrl, { headers: h, redirect: "follow" });
-    } catch {
-      continue;
-    }
-    if (res.ok) break;
-    lastStatus = res.status;
-    try {
-      if (res.body) await res.body.cancel();
-    } catch {}
-    if (lastStatus !== 403 && lastStatus !== 404) break;
-  }
-
-  if (!res || !res.ok) {
-    // Return empty VTT if forcing text/vtt
-    if (forceType === "text/vtt") {
-      return new Response("WEBVTT\n\n", {
-        headers: {
-          "Content-Type": "text/vtt",
-          "Access-Control-Allow-Origin": "*",
-        },
+      const r = await fetch(targetUrl, {
+        method: request.method,
+        headers: h,
+        redirect: "follow",
       });
-    }
-    return new Response(`Upstream error: ${lastStatus || "unknown"}`, {
-      status: 502,
-      headers: corsHeaders,
-    });
-  }
-
-  const ct = (res.headers.get("Content-Type") || "").toLowerCase();
-
-  // Force text/vtt for subtitles (and protect against binary images like .jpg)
-  if (forceType === "text/vtt") {
-    const text = await res.text();
-    // Detect if it's actually an image (binary magic bytes)
-    const isImage = /^\u00FF\u00D8\u00FF|\u0089PNG|GIF8|RIFF/.test(text);
-    if (isImage) {
-      return new Response("WEBVTT\n\n", {
-        headers: {
-          "Content-Type": "text/vtt",
-          "Access-Control-Allow-Origin": "*",
-        },
-      });
-    }
-    const vtt = text.trimStart().startsWith("WEBVTT")
-      ? text
-      : "WEBVTT\n\n" + text.replace(/\r\n/g, "\n");
-    return new Response(vtt, {
-      headers: {
-        "Content-Type": "text/vtt",
-        "Access-Control-Allow-Origin": "*",
-        "Cache-Control": "public, max-age=3600",
-      },
-    });
-  }
-
-  const reader = res.body.getReader();
-  const first = await reader.read();
-  const headText = first.value
-    ? new TextDecoder().decode(first.value.subarray(0, 64))
-    : "";
-
-  // Check if it's an HLS manifest
-  if (!first.done && headText.trimStart().startsWith("#EXTM3U")) {
-    let text = new TextDecoder().decode(first.value);
-    for (;;) {
-      const r = await reader.read();
-      if (r.done) break;
-      text += new TextDecoder().decode(r.value);
-    }
-    const lines = text.split(/\r?\n/);
-    const out = lines.map((line) => {
-      if (!line.trim()) return line;
-      // Rewrite segment URLs
-      if (!line.startsWith("#")) {
-        try {
-          return proxyMediaUrl(
-            url.origin,
-            new URL(line.trim(), targetUrl).toString(),
-            { referer }
-          );
-        } catch {
-          return line;
-        }
+      lastStatus = r.status;
+      if (r.status >= 200 && r.status < 300) {
+        upstreamRes = r;
+        usedReferer = cand;
+        break;
       }
-      // Rewrite URI= in #EXT-X-KEY etc.
-      return line.replace(/URI="([^"]+)"/g, (_, uri) => {
-        try {
-          return `URI="${proxyMediaUrl(
-            url.origin,
-            new URL(uri, targetUrl).toString(),
-            { referer }
-          )}"`;
-        } catch {
-          return `URI="${uri}"`;
-        }
-      });
+      try { if (r.body) await r.body.cancel(); } catch {}
+    } catch {
+      // network error → next candidate
+    }
+  }
+
+  if (!upstreamRes) {
+    return new Response(`Upstream error: ${lastStatus || "unreachable"}`, {
+      status: 502,
+      headers: { "Content-Type": "text/plain;charset=UTF-8", ...CORS_HEADERS },
     });
-    return new Response(out.join("\n"), {
+  }
+
+  // --- Content kind ---
+  const upstreamCt = upstreamRes.headers.get("Content-Type") || "";
+  const kind = detectKind(targetUrl, upstreamCt);
+
+  // --- force=text/vtt branch (binary placeholder → valid empty VTT) ---
+  if (force === "text/vtt" && kind !== "vtt") {
+    try { if (upstreamRes.body) await upstreamRes.body.cancel(); } catch {}
+    return new Response("WEBVTT\n\n", {
+      status: 200,
       headers: {
-        "Content-Type": "application/vnd.apple.mpegurl",
-        "Access-Control-Allow-Origin": "*",
-        "Cache-Control": "public, max-age=60",
+        "Content-Type": "text/vtt; charset=utf-8",
+        "Content-Length": "7",
+        "Cache-Control": "public, max-age=3600",
+        ...CORS_HEADERS,
       },
     });
   }
 
-  // Stream binary data (video segments, images, etc.)
-  const stream = new ReadableStream({
-    async start(c) {
-      if (first.value) c.enqueue(first.value);
-    },
-    async pull(c) {
-      const r = await reader.read();
-      r.done ? c.close() : c.enqueue(r.value);
-    },
+  // --- HLS manifest: rewrite and return ---
+  if (kind === "manifest") {
+    const text = await upstreamRes.text();
+    const rewritten = rewriteManifest(text, url.origin, targetUrl, usedReferer, audio);
+    return new Response(rewritten, {
+      status: 200,
+      headers: {
+        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+        "Content-Length": String(new TextEncoder().encode(rewritten).length),
+        "Cache-Control": "public, max-age=60",
+        ...CORS_HEADERS,
+      },
+    });
+  }
+
+  // --- Binary / segment / image / VTT: stream with Range passthrough ---
+  const outHeaders = new Headers({ ...CORS_HEADERS });
+  const ct = upstreamRes.headers.get("Content-Type");
+  if (ct) outHeaders.set("Content-Type", ct);
+  const cl = upstreamRes.headers.get("Content-Length");
+  if (cl) outHeaders.set("Content-Length", cl);
+  const cr = upstreamRes.headers.get("Content-Range");
+  if (cr) outHeaders.set("Content-Range", cr);
+  outHeaders.set("Accept-Ranges", "bytes");
+
+  // Cache: segments & VTT stable (1h), images (1h), binary (1h)
+  const maxAge = kind === "manifest" ? 60 : 3600;
+  outHeaders.set("Cache-Control", `public, max-age=${maxAge}`);
+
+  return new Response(upstreamRes.body, {
+    status: upstreamRes.status,
+    headers: outHeaders,
   });
-  const rh = new Headers({
-    "Access-Control-Allow-Origin": "*",
-    "Content-Type": ct || "application/octet-stream",
-    "Cache-Control": "public, max-age=3600",
-  });
-  ["Content-Range", "Content-Length"].forEach((h) => {
-    if (res.headers.has(h)) rh.set(h, res.headers.get(h));
-  });
-  return new Response(stream, { status: res.status, headers: rh });
 }
