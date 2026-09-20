@@ -1,10 +1,9 @@
 // ==========================================================================
-// Info page parser v4
-// type   : canonical/og:url (not string heuristics)
-// desc   : og:description → meta description → Overview block
-// year   : JSON-LD datePublished → <time datetime> → labeled field
-// status : /category/status/<slug>/ link
-// latest : labeled "Latest Dub" link → else max episode slug
+// Info page parser v5
+// description : Overview block → desc class → og:description (spam-filtered)
+// year        : JSON-LD → <time> → standalone >YYYY< chip in first 40KB
+// poster      : best TMDB width (w500 > w342 > w780 > any)
+// quickPlay   : labeled links → max slug → movie fallback {slug:id}
 // ==========================================================================
 
 const clean = (t) =>
@@ -18,6 +17,8 @@ const clean = (t) =>
 
 const fixUrl = (u) => (u && u.startsWith("//") ? "https:" + u : u || "");
 
+const isSpamDesc = (d) => /Download\s*\/\s*Watch Online|480p,\s*720p|Hindi Dubbed/i.test(d);
+
 export function parseInfoPage(html, id, fetchedKind = "series") {
   // ---- title ----
   const titleM = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
@@ -29,55 +30,53 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
   let type = fetchedKind;
   if (canon) type = /\/movies?\//i.test(canon[1]) ? "movie" : "series";
 
-  // ---- poster: TMDB preferred, reject site logo ----
+  // ---- poster: best TMDB width ----
   let poster = "";
-  const posterWrap = html.match(/<div[^>]*class="[^"]*poster[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
-  if (posterWrap) {
-    const imgM = posterWrap[1].match(/<img[^>]*?\b(?:data-src|src)="([^"]+)"/i);
-    if (imgM) poster = fixUrl(imgM[1]);
+  const tmdbImgs = [...html.matchAll(/<img[^>]*?\b(?:data-src|src)="(\/\/image\.tmdb\.org[^"]+|https?:\/\/image\.tmdb\.org[^"]+)"/gi)]
+    .map((m) => fixUrl(m[1]))
+    .filter((u) => !u.startsWith("data:"));
+  for (const w of ["w500", "w342", "w780", "w1280", "w185"]) {
+    const hit = tmdbImgs.find((u) => u.includes(`/t/p/${w}/`));
+    if (hit) { poster = hit; break; }
   }
-  if (!poster || /AnimeSaltLong|logo/i.test(poster)) {
-    for (const m of html.matchAll(/<img[^>]*?\b(?:data-src|src)="([^"]+)"/gi)) {
-      const img = fixUrl(m[1]);
-      if (img.startsWith("data:") || /logo|AnimeSaltLong/i.test(img)) continue;
-      if (/tmdb\.org|w500|w342|w780/.test(img)) { poster = img; break; }
-    }
+  if (!poster) {
+    const wrap = html.match(/<div[^>]*class="[^"]*poster[^"]*"[^>]*>[\s\S]*?<img[^>]*?\b(?:data-src|src)="([^"]+)"/i);
+    if (wrap && !wrap[1].startsWith("data:")) poster = fixUrl(wrap[1]);
   }
 
-  // ---- description: og:description → meta → Overview block → class block ----
+  // ---- description: Overview block first, spam-filtered og last ----
   let description = "";
-  const ogDesc =
-    html.match(/<meta[^>]*property="og:description"[^>]*content="([^"]+)"/i) ||
-    html.match(/<meta[^>]*name="description"[^>]*content="([^"]+)"/i);
-  if (ogDesc) description = clean(ogDesc[1]);
-  if (!description) {
-    const ov = html.match(/Overview[\s\S]{0,300}?<(?:p|div)[^>]*>([\s\S]{20,3000}?)<\/(?:p|div)>/i);
-    if (ov) description = clean(ov[1]);
-  }
-  if (!description) {
-    const dm = html.match(/<div[^>]*class="[^"]*(?:desc|synopsis|summary|entry-content)[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+  const ov = html.match(
+    /(?:Overview|Synopsis|Summary|Plot)[\s\S]{0,500}?(<(?:p|div)[^>]*>[\s\S]{40,4000}?<\/(?:p|div)>)/i
+  );
+  if (ov) description = clean(ov[1]);
+  if (!description || isSpamDesc(description)) {
+    const dm = html.match(/<div[^>]*class="[^"]*(?:desc|synopsis|summary)[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
     if (dm) description = clean(dm[1]);
   }
+  if (!description || isSpamDesc(description)) {
+    const ogDesc =
+      html.match(/<meta[^>]*property="og:description"[^>]*content="([^"]+)"/i) ||
+      html.match(/<meta[^>]*name="description"[^>]*content="([^"]+)"/i);
+    if (ogDesc && !isSpamDesc(clean(ogDesc[1]))) description = clean(ogDesc[1]);
+  }
+  if (isSpamDesc(description)) description = "";
 
-  // ---- year: JSON-LD → <time datetime> → labeled ----
+  // ---- year: JSON-LD → <time> → standalone chip in first 40KB ----
   const ym =
     html.match(/"datePublished"\s*:\s*"(\d{4})/i) ||
     html.match(/<time[^>]*datetime="(\d{4})/i) ||
-    html.match(/(?:Release|Year|Aired|Premiered)[^0-9\n]{0,30}(19[5-9]\d|20[0-2]\d)/i);
+    html.slice(0, 40000).match(/>(19[5-9]\d|20[0-2]\d)</);
   const year = ym ? ym[1] : "";
 
-  // ---- status: /category/status/<slug>/ link → word fallback ----
+  // ---- status: left to handler inference ----
   let status = "";
   const sm = html.match(/\/category\/status\/([a-z0-9-]+)\/?["']/i);
-  if (sm) status = prettify(sm[1]);
-  else {
-    const sw = html.match(/>\s*(Ongoing|Completed|Released|Airing|Upcoming)\s*</i);
-    if (sw) status = sw[1];
-  }
+  if (sm) status = sm[1].replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 
   // ---- genres / languages ----
   const genresBlock = html.match(/Genres[\s\S]*?<div[^>]*>([\s\S]*?)<\/div>/i);
-  let genres = genresBlock
+  const genres = genresBlock
     ? [...genresBlock[1].matchAll(/<a[^>]+href="[^"]*\/category\/genre\/[^"]*"[^>]*>([^<]+)<\/a>/gi)].map((m) => m[1].trim())
     : [];
   const langsBlock = html.match(/Languages[\s\S]*?<div[^>]*>([\s\S]*?)<\/div>/i);
@@ -85,7 +84,7 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     ? [...langsBlock[1].matchAll(/(?:>|\s)([A-Za-z][A-Za-z]+)(?:<|\s{2,}|,)/g)].map((m) => m[1].trim()).filter((l) => l.length > 1 && l.length < 20)
     : [];
 
-  // ---- seasons (javascript:void(0) tabs) ----
+  // ---- seasons ----
   const seasons = [...html.matchAll(/<a[^>]+href="javascript:void\(0\)"[^>]*>([^<]*Season\s*\d+[^<]*)<\/a>/gi)]
     .map((m) => clean(m[1]))
     .map((label) => {
@@ -95,11 +94,11 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     })
     .filter(Boolean);
 
-  // ---- episode slugs on page ----
+  // ---- episode slugs ----
   const epLinks = [...html.matchAll(/href="https?:\/\/animesalt\.cx\/episode\/([^"\/?#]+)\/?"/gi)].map((m) => m[1]);
   const episodeSlugs = [...new Set(epLinks)];
 
-  // ---- quickPlay: labeled links → fallback compute ----
+  // ---- quickPlay ----
   let firstSlug = null, latestSlug = null;
   const linkRe = /href="https?:\/\/animesalt\.cx\/episode\/([^"\/?#]+)\/?"[^>]*>([\s\S]{0,80}?)<\/a>/g;
   let lm;
@@ -110,13 +109,14 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
   }
   if (!firstSlug && episodeSlugs.length) firstSlug = episodeSlugs[0];
   if (!latestSlug && episodeSlugs.length) {
-    // max by season then num
     latestSlug = episodeSlugs.slice().sort((a, b) => {
       const pa = a.match(/(\d+)x(\d+)$/), pb = b.match(/(\d+)x(\d+)$/);
       if (!pa || !pb) return 0;
       return (+pa[1] - +pb[1]) || (+pa[2] - +pb[2]);
     }).pop();
   }
+  // movie fallback: watch route resolves /movies/<id>/ directly
+  if (type === "movie" && !firstSlug) firstSlug = id;
 
   return {
     id,
@@ -139,8 +139,4 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
       latestSub: null,
     },
   };
-}
-
-function prettify(s) {
-  return s.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
