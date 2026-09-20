@@ -1,5 +1,6 @@
 // ==========================================================================
-// Taxonomy v2 — discover via WP sitemap, fallback to candidate index pages
+// /api/discover, /api/genres, /api/genre/<slug>, /api/language/<slug>, etc.
+// v3: sitemap-powered discovery + plural aliases + singular-key read
 // ==========================================================================
 
 import { fetchUpstream } from "../util/fetcher.js";
@@ -7,13 +8,38 @@ import { cached } from "../util/cache.js";
 import { parseCatalogItems } from "../parsers/cards.js";
 import { TTL } from "../config.js";
 
-const KINDS = ["genre", "language", "country", "type", "year", "network", "franchise", "status"];
+const KINDS = [
+  "genre",
+  "language",
+  "country",
+  "type",
+  "year",
+  "network",
+  "franchise",
+  "status",
+];
+
 export const TAXONOMY_KINDS = KINDS;
 
-const prettify = (slug) =>
-  slug.replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+// Singular → plural aliases exposed alongside singular keys
+const ALIAS = {
+  genre: "genres",
+  language: "languages",
+  country: "countries",
+  type: "types",
+  year: "years",
+  network: "networks",
+  franchise: "franchises",
+  status: "statuses",
+};
 
-/** Parse /category/<kind>/<slug>/ anchor links from any HTML */
+const prettify = (slug) =>
+  String(slug).replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+
+/**
+ * Parse taxonomy links from any HTML page.
+ * Matches <a href="/category/<kind>/<slug>">Name</a>
+ */
 function parseTaxonomyLinks(html) {
   const out = {};
   for (const kind of KINDS) {
@@ -35,7 +61,9 @@ function parseTaxonomyLinks(html) {
   return out;
 }
 
-/** Source 1: WordPress sitemap (lists every category URL) */
+/**
+ * Source 1: WordPress sitemap — lists every category URL.
+ */
 async function discoverFromSitemap() {
   const idx = await fetchUpstream("/wp-sitemap.xml");
   const locs = [...idx.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1].trim());
@@ -46,7 +74,11 @@ async function discoverFromSitemap() {
   for (const abs of taxMaps.slice(0, 4)) {
     const path = abs.replace(/^https?:\/\/[^/]+/, "");
     let xml;
-    try { xml = await fetchUpstream(path); } catch { continue; }
+    try {
+      xml = await fetchUpstream(path);
+    } catch {
+      continue;
+    }
     for (const m of xml.matchAll(/<loc>([^<]+)<\/loc>/g)) {
       const cm = m[1].trim().match(/\/category\/([a-z-]+)\/([^/]+)\/?$/i);
       if (!cm) continue;
@@ -61,17 +93,33 @@ async function discoverFromSitemap() {
   return found;
 }
 
-/** Source 2: candidate index pages that may contain category menus */
+/**
+ * Source 2: candidate index pages that may contain category menus.
+ */
 async function discoverFromPages() {
-  const candidates = ["/genres/", "/genre/", "/category/genre/", "/filter/", "/advanced-search/", "/anime/", "/"];
+  const candidates = [
+    "/genres/",
+    "/genre/",
+    "/category/genre/",
+    "/filter/",
+    "/advanced-search/",
+    "/anime/",
+    "/",
+  ];
   const merged = Object.fromEntries(KINDS.map((k) => [k, []]));
   for (const p of candidates) {
     let html;
-    try { html = await fetchUpstream(p); } catch { continue; }
+    try {
+      html = await fetchUpstream(p);
+    } catch {
+      continue;
+    }
     const t = parseTaxonomyLinks(html);
     for (const kind of KINDS) {
       for (const item of t[kind]) {
-        if (!merged[kind].some((x) => x.slug === item.slug)) merged[kind].push(item);
+        if (!merged[kind].some((x) => x.slug === item.slug)) {
+          merged[kind].push(item);
+        }
       }
     }
   }
@@ -80,28 +128,58 @@ async function discoverFromPages() {
   return merged;
 }
 
+/**
+ * Try sitemap first, fall back to candidate index pages.
+ */
 async function discoverTaxonomy() {
-  try { return await discoverFromSitemap(); } catch {}
-  try { return await discoverFromPages(); } catch {}
+  try {
+    return await discoverFromSitemap();
+  } catch {}
+  try {
+    return await discoverFromPages();
+  } catch {}
   throw new Error("taxonomy sources unavailable");
 }
 
+/**
+ * /api/discover — all taxonomy in one call.
+ * Exposes both singular (genre) and plural (genres) keys.
+ */
 export async function handleDiscover(ctx) {
-  return cached("discover:v2", TTL.taxonomy, async () => {
-    const d = await discoverTaxonomy();
-    return {
-      ...d,
-      topLevel: [],
-      counts: Object.fromEntries(KINDS.map((k) => [k, d[k].length])),
-    };
-  }, ctx);
+  return cached(
+    "discover:v3",
+    TTL.taxonomy,
+    async () => {
+      const d = await discoverTaxonomy();
+      const out = { ...d, topLevel: [] };
+      // Plural aliases for client compatibility
+      for (const [sing, plur] of Object.entries(ALIAS)) {
+        out[plur] = d[sing] || [];
+      }
+      out.counts = Object.fromEntries(KINDS.map((k) => [k, (d[k] || []).length]));
+      return out;
+    },
+    ctx
+  );
 }
 
+/**
+ * /api/genres — list of all genres.
+ * Reads the SINGULAR key returned by discoverTaxonomy().
+ */
 export async function handleGenreList(ctx) {
-  return cached("genres:v2", TTL.taxonomy, async () => (await discoverTaxonomy()).genres, ctx);
+  return cached(
+    "genres:v3",
+    TTL.taxonomy,
+    async () => (await discoverTaxonomy()).genre || [],
+    ctx
+  );
 }
 
-/** /api/genre/<slug> etc. — paginated results */
+/**
+ * /api/genre/<slug>, /api/language/<slug>, etc.
+ * Paginated results from /category/<kind>/<slug>/.
+ */
 export async function handleTaxonomy(kind, slug, ctx, url) {
   const page = Number(url.searchParams.get("page") || 1);
   return cached(
