@@ -1,8 +1,10 @@
 // ==========================================================================
-// Info page parser v10
-// - Year: anchored to metadata labels, excludes footer years (2000/2025/2026/2027)
-// - Backdrop: CSS background-image search
-// - Episodes: data-title attribute first, fallback to generic
+// Info page parser v11
+// poster      : og:image → poster wrapper → first TMDB (width normalized w500)
+// description : text between ">Overview<" and "Read More"/"Genres"
+// year        : anchored to metadata labels, excludes footer years
+// backdrop    : wide TMDB art inside url(...)
+// episodes    : real titles from visible season grid when available
 // ==========================================================================
 
 const clean = (t) =>
@@ -32,26 +34,58 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
   // ---------------- title ----------------
   const titleM = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
 
-  // ---------------- type ----------------
+  // ---------------- type: canonical / og:url ----------------
   const canon =
     html.match(/<link[^>]*rel="canonical"[^>]*href="([^"]+)"/i) ||
     html.match(/<meta[^>]*property="og:url"[^>]*content="([^"]+)"/i);
   let type = fetchedKind;
   if (canon) type = /\/movies?\//i.test(canon[1]) ? "movie" : "series";
 
-  // ---------------- poster (best TMDB width) ----------------
-  let poster = "";
-  const tmdbImgs = [...html.matchAll(/<img[^>]*?\b(?:data-src|src)="(\/\/image\.tmdb\.org[^"]+|https?:\/\/image\.tmdb\.org[^"]+)"/gi)]
+  // ---------------- all TMDB images on page (used by poster + backdrop) ----
+  const tmdbImgs = [...html.matchAll(
+    /<img[^>]*?\b(?:data-src|src)="(\/\/image\.tmdb\.org[^"]+|https?:\/\/image\.tmdb\.org[^"]+)"/gi
+  )]
     .map((m) => fixUrl(m[1]))
     .filter((u) => !u.startsWith("data:"));
-  for (const w of ["w500", "w342", "w780", "w1280", "w185"]) {
-    const hit = tmdbImgs.find((u) => u.includes(`/t/p/${w}/`));
-    if (hit) { poster = hit; break; }
+
+  // ---------------- poster: og:image → poster wrapper → first TMDB --------
+  let poster = "";
+
+  // 1) og:image / twitter:image — canonical poster for THIS page
+  const ogImg =
+    html.match(/<meta[^>]*property="og:image"[^>]*content="([^"]+)"/i) ||
+    html.match(/<meta[^>]*name="twitter:image"[^>]*content="([^"]+)"/i);
+  if (ogImg) {
+    const u = fixUrl(ogImg[1]);
+    if (u && !u.startsWith("data:")) poster = u;
+  }
+
+  // 2) Poster wrapper div (first img inside class="poster")
+  if (!poster) {
+    const wrap = html.match(
+      /<div[^>]*class="[^"]*poster[^"]*"[^>]*>[\s\S]{0,800}?<img[^>]*?\b(?:data-src|src)="([^"]+)"/i
+    );
+    if (wrap && !wrap[1].startsWith("data:")) poster = fixUrl(wrap[1]);
+  }
+
+  // 3) Fallback: first TMDB image by preferred width
+  if (!poster) {
+    for (const w of ["w500", "w342", "w780"]) {
+      const hit = tmdbImgs.find((u) => u.includes(`/t/p/${w}/`));
+      if (hit) { poster = hit; break; }
+    }
+  }
+
+  // Normalize TMDB width to w500 for consistent card quality
+  if (/\/t\/p\/w\d+\//.test(poster)) {
+    poster = poster.replace(/\/t\/p\/w\d+\//, "/t/p/w500/");
   }
 
   // ---------------- backdrop (wide art in CSS background) ----------------
   let backdrop = "";
-  const bgM = html.match(/style="[^"]*background(?:-image)?\s*:\s*url\(['"]?(\/\/image\.tmdb\.org[^'")]+|https?:\/\/image\.tmdb\.org[^'")]+)/i);
+  const bgM = html.match(
+    /style="[^"]*background(?:-image)?\s*:\s*url\(['"]?(\/\/image\.tmdb\.org[^'")]+|https?:\/\/image\.tmdb\.org[^'")]+)/i
+  );
   if (bgM) backdrop = fixUrl(bgM[1]);
   if (!backdrop && poster) {
     for (const img of tmdbImgs) {
@@ -60,7 +94,7 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     }
   }
 
-  // ---------------- description ----------------
+  // ---------------- description: Overview → Read More / Genres ------------
   let description = "";
   const ovIdx = html.search(/>\s*Overview\s*</i);
   if (ovIdx !== -1) {
@@ -71,7 +105,7 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     if (rm !== -1) cut = Math.min(cut, rm);
     if (gn !== -1) cut = Math.min(cut, gn);
     seg = seg.slice(0, Math.min(cut, 8000)).replace(/^>\s*Overview\s*</i, "");
-    let text = stripLeadingFragments(clean(seg));
+    const text = stripLeadingFragments(clean(seg));
     if (text.length > 40 && !isSpamDesc(text)) description = text;
   }
   if (!description) {
@@ -91,7 +125,7 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     }
   }
 
-  // ---------------- year: anchored to metadata labels, excludes footer ----------------
+  // ---------------- year: anchored to metadata labels, excludes footer ----
   let year = "";
   const header = html.slice(0, 15000);
   const labelPatterns = [
@@ -130,7 +164,7 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
         .filter((l) => l.length > 1 && l.length < 20)
     : [];
 
-  // ---------------- seasons ----------------
+  // ---------------- seasons (tabs: a or button) ----------------
   const seasons = [...html.matchAll(
     /<(?:a|button)[^>]*(?:href="javascript:void\(0\)"|data-season)[^>]*>([^<]*Season\s*\d+[^<]*)<\/(?:a|button)>/gi
   )]
@@ -144,7 +178,7 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     })
     .filter(Boolean);
 
-  // ---------------- episodes ----------------
+  // ---------------- episodes (visible season grid, real titles) -----------
   const episodesPreview = [];
   const epRe = /<a[^>]+href="https?:\/\/animesalt\.cx\/episode\/([^"\/?#]+)\/?"([^>]*)>([\s\S]*?)<\/a>/g;
   let em;
@@ -153,7 +187,7 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     const attrs = em[2];
     if (episodesPreview.some((e) => e.slug === slug)) continue;
     const chunk = em[3];
-    
+
     let title = "";
     const dataTitle = attrs.match(/\bdata-(?:title|ep-?title)="([^"]+)"/i);
     if (dataTitle) {
@@ -170,8 +204,16 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
         if (!isNonEpisodeTitle(candidate)) title = candidate;
       }
     }
+    if (!title) {
+      const after = html.slice(em.index + em[0].length, em.index + em[0].length + 250);
+      const aM = after.match(/<(?:div|span|h[34])[^>]*class="[^"]*(?:title|name)[^"]*"[^>]*>([^<]{2,100})</i);
+      if (aM) {
+        const candidate = clean(aM[1]);
+        if (!isNonEpisodeTitle(candidate)) title = candidate;
+      }
+    }
     if (isNonEpisodeTitle(title)) continue;
-    
+
     const sxe = slug.match(/(\d+)x(\d+)$/);
     episodesPreview.push({
       slug,
