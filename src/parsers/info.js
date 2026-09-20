@@ -1,10 +1,8 @@
 // ==========================================================================
-// Info page parser v11
-// poster      : og:image → poster wrapper → first TMDB (width normalized w500)
-// description : text between ">Overview<" and "Read More"/"Genres"
-// year        : anchored to metadata labels, excludes footer years
-// backdrop    : wide TMDB art inside url(...)
-// episodes    : real titles from visible season grid when available
+// Info page parser v12
+// poster      : img whose alt/title CONTAINS the show title
+//               → poster wrapper (skip logo) → og:image (tmdb only) → first tmdb
+//               Logo URLs always rejected. TMDB width normalized to w500.
 // ==========================================================================
 
 const clean = (t) =>
@@ -30,58 +28,89 @@ const isNonEpisodeTitle = (t) =>
 
 const EXCLUDED_YEARS = new Set(["2000", "2025", "2026", "2027"]);
 
+// ---- poster helpers ----
+const isLogo = (u) => /logo|AnimeSaltLong|favicon|icon|banner|brand/i.test(u);
+
+const norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+
+const getAttr = (tag, name) => {
+  const m = tag.match(new RegExp(`\\b${name}="([^"]*)"`, "i"));
+  return m ? m[1] : "";
+};
+
+const imgUrlOf = (tag) => {
+  const d =
+    getAttr(tag, "data-src") ||
+    getAttr(tag, "data-lazy-src") ||
+    getAttr(tag, "data-original") ||
+    getAttr(tag, "src");
+  return d && !d.startsWith("data:") ? fixUrl(d) : "";
+};
+
 export function parseInfoPage(html, id, fetchedKind = "series") {
   // ---------------- title ----------------
   const titleM = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+  const titleText = titleM ? clean(titleM[1]) : id;
+  const tNorm = norm(titleText);
 
-  // ---------------- type: canonical / og:url ----------------
+  // ---------------- type ----------------
   const canon =
     html.match(/<link[^>]*rel="canonical"[^>]*href="([^"]+)"/i) ||
     html.match(/<meta[^>]*property="og:url"[^>]*content="([^"]+)"/i);
   let type = fetchedKind;
   if (canon) type = /\/movies?\//i.test(canon[1]) ? "movie" : "series";
 
-  // ---------------- all TMDB images on page (used by poster + backdrop) ----
-  const tmdbImgs = [...html.matchAll(
-    /<img[^>]*?\b(?:data-src|src)="(\/\/image\.tmdb\.org[^"]+|https?:\/\/image\.tmdb\.org[^"]+)"/gi
-  )]
-    .map((m) => fixUrl(m[1]))
-    .filter((u) => !u.startsWith("data:"));
+  // ---------------- all <img> tags + tmdb list ----------------
+  const imgTags = [...html.matchAll(/<img\b[^>]*>/gi)].map((m) => m[0]);
+  const tmdbImgs = imgTags
+    .map(imgUrlOf)
+    .filter((u) => u && /image\.tmdb\.org/.test(u));
 
-  // ---------------- poster: og:image → poster wrapper → first TMDB --------
+  // ---------------- POSTER: title-aware matching ----------------
   let poster = "";
 
-  // 1) og:image / twitter:image — canonical poster for THIS page
-  const ogImg =
-    html.match(/<meta[^>]*property="og:image"[^>]*content="([^"]+)"/i) ||
-    html.match(/<meta[^>]*name="twitter:image"[^>]*content="([^"]+)"/i);
-  if (ogImg) {
-    const u = fixUrl(ogImg[1]);
-    if (u && !u.startsWith("data:")) poster = u;
-  }
-
-  // 2) Poster wrapper div (first img inside class="poster")
-  if (!poster) {
-    const wrap = html.match(
-      /<div[^>]*class="[^"]*poster[^"]*"[^>]*>[\s\S]{0,800}?<img[^>]*?\b(?:data-src|src)="([^"]+)"/i
-    );
-    if (wrap && !wrap[1].startsWith("data:")) poster = fixUrl(wrap[1]);
-  }
-
-  // 3) Fallback: first TMDB image by preferred width
-  if (!poster) {
-    for (const w of ["w500", "w342", "w780"]) {
-      const hit = tmdbImgs.find((u) => u.includes(`/t/p/${w}/`));
-      if (hit) { poster = hit; break; }
+  // 1) <img> whose alt/title attribute contains the show title
+  if (tNorm) {
+    for (const tag of imgTags) {
+      const alt = norm(getAttr(tag, "alt") || getAttr(tag, "title"));
+      if (!alt || alt.length < 4) continue;
+      if (alt.includes(tNorm) || (tNorm.includes(alt) && alt.length > 6)) {
+        const u = imgUrlOf(tag);
+        if (u && !isLogo(u)) { poster = u; break; }
+      }
     }
   }
 
-  // Normalize TMDB width to w500 for consistent card quality
-  if (/\/t\/p\/w\d+\//.test(poster)) {
-    poster = poster.replace(/\/t\/p\/w\d+\//, "/t/p/w500/");
+  // 2) Poster wrapper: first non-logo image inside class="...poster..."
+  if (!poster) {
+    const wi = html.search(/class="[^"]*\bposter\b[^"]*"/i);
+    if (wi !== -1) {
+      const seg = html.slice(wi, wi + 1500);
+      for (const tag of seg.match(/<img\b[^>]*>/gi) || []) {
+        const u = imgUrlOf(tag);
+        if (u && !isLogo(u)) { poster = u; break; }
+      }
+    }
   }
 
-  // ---------------- backdrop (wide art in CSS background) ----------------
+  // 3) og:image — only if it's a TMDB asset (site default og:image is the logo)
+  if (!poster) {
+    const ogImg =
+      html.match(/<meta[^>]*property="og:image"[^>]*content="([^"]+)"/i) ||
+      html.match(/<meta[^>]*name="twitter:image"[^>]*content="([^"]+)"/i);
+    if (ogImg) {
+      const u = fixUrl(ogImg[1]);
+      if (u && !u.startsWith("data:") && !isLogo(u) && /image\.tmdb\.org/.test(u)) poster = u;
+    }
+  }
+
+  // 4) Last resort: first TMDB image
+  if (!poster && tmdbImgs.length) poster = tmdbImgs[0];
+
+  // Normalize TMDB width to w500
+  if (/\/t\/p\/w\d+\//.test(poster)) poster = poster.replace(/\/t\/p\/w\d+\//, "/t/p/w500/");
+
+  // ---------------- backdrop ----------------
   let backdrop = "";
   const bgM = html.match(
     /style="[^"]*background(?:-image)?\s*:\s*url\(['"]?(\/\/image\.tmdb\.org[^'")]+|https?:\/\/image\.tmdb\.org[^'")]+)/i
@@ -94,7 +123,7 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     }
   }
 
-  // ---------------- description: Overview → Read More / Genres ------------
+  // ---------------- description ----------------
   let description = "";
   const ovIdx = html.search(/>\s*Overview\s*</i);
   if (ovIdx !== -1) {
@@ -125,7 +154,7 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     }
   }
 
-  // ---------------- year: anchored to metadata labels, excludes footer ----
+  // ---------------- year ----------------
   let year = "";
   const header = html.slice(0, 15000);
   const labelPatterns = [
@@ -164,7 +193,7 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
         .filter((l) => l.length > 1 && l.length < 20)
     : [];
 
-  // ---------------- seasons (tabs: a or button) ----------------
+  // ---------------- seasons ----------------
   const seasons = [...html.matchAll(
     /<(?:a|button)[^>]*(?:href="javascript:void\(0\)"|data-season)[^>]*>([^<]*Season\s*\d+[^<]*)<\/(?:a|button)>/gi
   )]
@@ -178,7 +207,7 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     })
     .filter(Boolean);
 
-  // ---------------- episodes (visible season grid, real titles) -----------
+  // ---------------- episodes preview ----------------
   const episodesPreview = [];
   const epRe = /<a[^>]+href="https?:\/\/animesalt\.cx\/episode\/([^"\/?#]+)\/?"([^>]*)>([\s\S]*?)<\/a>/g;
   let em;
@@ -249,7 +278,7 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
 
   return {
     id,
-    title: titleM ? clean(titleM[1]) : id,
+    title: titleText,
     poster,
     backdrop,
     description: description.slice(0, 1500),
