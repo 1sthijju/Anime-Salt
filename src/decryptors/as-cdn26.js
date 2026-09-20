@@ -13,15 +13,12 @@ function parseMasterPlaylist(m3u8Url, m3u8Content) {
   const subtitleTracks = [];
   const qualities = [];
 
-  let currentMedia = null;
-
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
 
     // Parse #EXT-X-MEDIA for audio/subtitle tracks
     if (line.startsWith("#EXT-X-MEDIA:")) {
       const type = line.match(/TYPE=([^,]+)/)?.[1];
-      const groupId = line.match(/GROUP-ID="([^"]+)"/)?.[1];
       const name = line.match(/NAME="([^"]+)"/)?.[1];
       const lang = line.match(/LANGUAGE="([^"]+)"/)?.[1];
       const uri = line.match(/URI="([^"]+)"/)?.[1];
@@ -54,7 +51,6 @@ function parseMasterPlaylist(m3u8Url, m3u8Content) {
       const audio = line.match(/AUDIO="([^"]+)"/)?.[1];
       const subs = line.match(/SUBTITLES="([^"]+)"/)?.[1];
 
-      // Next line should be the stream URL
       if (i + 1 < lines.length && !lines[i + 1].startsWith("#")) {
         const streamUrl = lines[i + 1].trim();
         qualities.push({
@@ -78,11 +74,7 @@ function parseMasterPlaylist(m3u8Url, m3u8Content) {
 async function fetchMasterPlaylist(m3u8Url, referer) {
   try {
     const res = await fetch(m3u8Url, {
-      headers: {
-        ...CHROME_HEADERS,
-        Referer: referer,
-        Accept: "*/*",
-      },
+      headers: { ...CHROME_HEADERS, Referer: referer, Accept: "*/*" },
     });
     if (!res.ok) return null;
     const content = await res.text();
@@ -111,17 +103,18 @@ export async function resolveAsCdn26(embedUrl) {
     // Extract subtitles from playerjsSubtitle variable
     const subtitles = [];
     const subVar = playerHtml.match(/var\s+playerjsSubtitle\s*=\s*["']([^"']*)["']/i);
-    if (subVar) {
+    if (subVar && subVar[1].trim() !== "") {
       const re = /\[([^\]]+)\]\s*(https?:\/\/[^"'\s,;]+)/g;
       let pm;
       while ((pm = re.exec(subVar[1])) !== null) {
         const label = pm[1].trim();
         const url = pm[2].trim();
-        // Only add if it looks like a subtitle file (not an image)
-        if (/\.(vtt|srt|ass|ssa|txt)(\?|$)/i.test(url)) {
+        // NO strict extension check here! Upstream sometimes sends .jpg placeholders.
+        // We accept any URL and let the media proxy safely handle binary files.
+        if (url) {
           subtitles.push({
-            label,
-            url,
+            label: label || "Sub",
+            url: url,
             referer: new URL(url).origin + "/",
           });
         }
@@ -147,19 +140,15 @@ export async function resolveAsCdn26(embedUrl) {
     if (apiRes.ok) {
       try {
         const j = await apiRes.json();
-
         // Extract subtitles from tracks (filter out non-subtitle tracks)
         (j.tracks || []).forEach((t) => {
           if ((t.kind === "captions" || t.kind === "subtitles") && t.file) {
             const fileUrl = String(t.file).replace(/\\\//g, "/");
-            // Only add if it looks like a subtitle file
-            if (/\.(vtt|srt|ass|ssa|txt)(\?|$)/i.test(fileUrl)) {
-              subtitles.push({
-                label: t.label || t.language || "Sub",
-                url: fileUrl,
-                referer: "https://as-cdn26.top/",
-              });
-            }
+            subtitles.push({
+              label: t.label || t.language || "Sub",
+              url: fileUrl,
+              referer: "https://as-cdn26.top/",
+            });
           }
         });
 
