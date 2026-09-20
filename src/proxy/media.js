@@ -3,7 +3,8 @@
 //
 // Proxies media (HLS manifests, segments, VTT, images) with:
 //  - referer/origin spoofing via candidate list (CDN hotlink whitelists)
-//  - HLS manifest rewriting (segments, URI=, #EXT-X-KEY, #EXT-X-MAP)
+//  - HLS manifest rewriting (segments, URI=, #EXT-X-KEY, #EXT-X-MAP,
+//    #EXT-X-MEDIA) — tag prefixes preserved (v4 fix)
 //  - Range passthrough for segments
 //  - force=text/vtt → returns valid VTT even for binary input
 // ==========================================================================
@@ -48,31 +49,37 @@ function detectKind(url, ct) {
 /**
  * Rewrite HLS manifest so every segment and URI="..." reference points back
  * through /proxy/media — keeps the whole chain proxied for referer spoofing.
+ *
+ * v4 FIX: capture groups now INCLUDE the tag prefix (#EXT-X-MEDIA:,
+ * #EXT-X-KEY:, #EXT-X-MAP:) so rebuilt lines keep their tags. Previously the
+ * prefix was dropped, producing invalid lines like `TYPE=AUDIO,...` which
+ * made players ignore all audio renditions (silent playback, no audio menu).
  */
 function rewriteManifest(text, origin, baseUrl, referer, audio) {
   const lines = text.split(/\r?\n/);
   const out = [];
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
 
-    // #EXT-X-MEDIA:...URI="..." → rewrite URI value (audio/subtitle renditions)
-    const mediaM = line.match(/^#EXT-X-MEDIA:(.*?URI=")([^"]+)(".*)$/i);
+    // #EXT-X-MEDIA:...URI="..."  (audio / subtitle renditions)
+    const mediaM = line.match(/^(#EXT-X-MEDIA:.*?URI=")([^"]+)(".*)$/i);
     if (mediaM) {
       const abs = mediaM[2].startsWith("http") ? mediaM[2] : new URL(mediaM[2], baseUrl).href;
       out.push(mediaM[1] + proxyMediaUrl(origin, abs, { referer, audio }) + mediaM[3]);
       continue;
     }
 
-    // #EXT-X-KEY:...URI="..." → proxy the decryption key
-    const keyM = line.match(/^#EXT-X-KEY:(.*?URI=")([^"]+)(".*)$/i);
+    // #EXT-X-KEY:...URI="..."  (encryption key)
+    const keyM = line.match(/^(#EXT-X-KEY:.*?URI=")([^"]+)(".*)$/i);
     if (keyM) {
       const abs = keyM[2].startsWith("http") ? keyM[2] : new URL(keyM[2], baseUrl).href;
       out.push(keyM[1] + proxyMediaUrl(origin, abs, { referer }) + keyM[3]);
       continue;
     }
 
-    // #EXT-X-MAP:URI="..." → proxy initialization segment
-    const mapM = line.match(/^#EXT-X-MAP:(.*?URI=")([^"]+)(".*)$/i);
+    // #EXT-X-MAP:...URI="..."  (initialization segment)
+    const mapM = line.match(/^(#EXT-X-MAP:.*?URI=")([^"]+)(".*)$/i);
     if (mapM) {
       const abs = mapM[2].startsWith("http") ? mapM[2] : new URL(mapM[2], baseUrl).href;
       out.push(mapM[1] + proxyMediaUrl(origin, abs, { referer }) + mapM[3]);
@@ -112,7 +119,7 @@ export async function handleMediaProxy(request) {
 
   const candidates = [
     refererParam,
-    "https://megaplay.buzz/",        // ← fetch.nexabloom.top whitelist
+    "https://megaplay.buzz/",        // fetch.nexabloom.top whitelist
     "https://megaplay.buzz",
     "https://as-cdn26.top/",
     "https://as-cdn27.top/",
@@ -218,7 +225,7 @@ export async function handleMediaProxy(request) {
   if (cr) outHeaders.set("Content-Range", cr);
   outHeaders.set("Accept-Ranges", "bytes");
 
-  // Cache: segments & VTT stable (1h), images (1h), binary (1h)
+  // Cache: segments & VTT & images stable (1h); manifests short (60s)
   const maxAge = kind === "manifest" ? 60 : 3600;
   outHeaders.set("Cache-Control", `public, max-age=${maxAge}`);
 
