@@ -1,5 +1,6 @@
 // ==========================================================================
 // Media proxy — rewrites HLS manifests + proxies VTT with referer
+// Safely handles upstream misconfigurations (e.g. binary images requested as VTT)
 // ==========================================================================
 
 import { CHROME_HEADERS, corsHeaders } from "../config.js";
@@ -90,10 +91,10 @@ export async function handleMediaProxy(request) {
 
   const ct = (res.headers.get("Content-Type") || "").toLowerCase();
 
-  // Force text/vtt for subtitles
+  // Force text/vtt for subtitles (and protect against binary images like .jpg)
   if (forceType === "text/vtt") {
     const text = await res.text();
-    // Detect if it's actually an image (binary)
+    // Detect if it's actually an image (binary magic bytes)
     const isImage = /^\u00FF\u00D8\u00FF|\u0089PNG|GIF8|RIFF/.test(text);
     if (isImage) {
       return new Response("WEBVTT\n\n", {
