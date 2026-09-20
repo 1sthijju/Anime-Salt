@@ -1,9 +1,9 @@
 // ==========================================================================
-// Info page parser v7
-// description : text between ">Overview<" and "Read More"/"Genres"
-// year        : chip after "NN min" → fallbacks (release_date, JSON-LD, time)
-// backdrop    : wide TMDB art inside url(...)
-// episodes    : real titles from the visible season grid
+// Info page parser v8
+// - Strip leading HTML fragments from description
+// - Year search limited to header (exclude footer)
+// - Better episode title extraction
+// - Filter out "Comments" and non-episode links
 // ==========================================================================
 
 const clean = (t) =>
@@ -16,10 +16,16 @@ const clean = (t) =>
     .replace(/\s+/g, " ")
     .trim();
 
+const stripLeadingFragments = (t) =>
+  t.replace(/^(?:\/?p>|<\/?[a-z][^>]*>|[\s\n\r\/<>]+)/i, "").trim();
+
 const fixUrl = (u) => (u && u.startsWith("//") ? "https:" + u : u || "");
 
 const isSpamDesc = (d) =>
   /Download\s*\/\s*Watch Online|480p,\s*720p|Hindi Dubbed|Watch Online \d/i.test(d);
+
+const isNonEpisodeTitle = (t) =>
+  /^(?:Comments?|Reviews?|Share|Related|Recommendations?|Trailer|Watch Now|Download)/i.test(t);
 
 export function parseInfoPage(html, id, fetchedKind = "series") {
   // ---------------- title ----------------
@@ -42,7 +48,7 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     if (hit) { poster = hit; break; }
   }
 
-  // ---------------- backdrop (wide art in url(...)) ----------------
+  // ---------------- backdrop (wide art) ----------------
   let backdrop = "";
   const bdM = html.slice(0, 40000).match(
     /url\(['"]?(\/\/image\.tmdb\.org\/t\/p\/w(?:780|1280|original)\/[^'")]+|https?:\/\/image\.tmdb\.org\/t\/p\/w(?:780|1280|original)\/[^'")]+)/i
@@ -60,13 +66,13 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     if (rm !== -1) cut = Math.min(cut, rm);
     if (gn !== -1) cut = Math.min(cut, gn);
     seg = seg.slice(0, Math.min(cut, 8000)).replace(/^>\s*Overview\s*</i, "");
-    const text = clean(seg);
+    let text = stripLeadingFragments(clean(seg));
     if (text.length > 40 && !isSpamDesc(text)) description = text;
   }
   if (!description) {
     const dm = html.match(/<div[^>]*class="[^"]*(?:desc|synopsis|summary)[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
     if (dm) {
-      const t = clean(dm[1]);
+      const t = stripLeadingFragments(clean(dm[1]));
       if (t.length > 40 && !isSpamDesc(t)) description = t;
     }
   }
@@ -75,30 +81,40 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
       html.match(/<meta[^>]*property="og:description"[^>]*content="([^"]+)"/i) ||
       html.match(/<meta[^>]*name="description"[^>]*content="([^"]+)"/i);
     if (ogDesc) {
-      const t = clean(ogDesc[1]);
+      const t = stripLeadingFragments(clean(ogDesc[1]));
       if (t.length > 40 && !isSpamDesc(t)) description = t;
     }
   }
 
-  // ---------------- year: chip after "NN min" → fallbacks ----------------
-  const head30 = html.slice(0, 30000);
+  // ---------------- year: limit to first 20000 chars (exclude footer) ----------------
+  const headerSection = html.slice(0, 20000);
   let year = "";
-  const y1 = head30.match(/\d+\s*min<\/[\s\S]{0,400}?(19[5-9]\d|20[0-2]\d)/i);
+  
+  // Strategy 1: year near "min" runtime
+  const y1 = headerSection.match(/\d+\s*min[\s\S]{0,600}?(19[5-9]\d|20[0-2]\d)/i);
   if (y1) year = y1[1];
+  
+  // Strategy 2: year after Episodes/Seasons label
   if (!year) {
-    const y2 = head30.match(/(?:Episodes|Seasons)<\/[\s\S]{0,600}?(19[5-9]\d|20[0-2]\d)/i);
+    const y2 = headerSection.match(/(?:Episodes|Seasons)[\s\S]{0,800}?(19[5-9]\d|20[0-2]\d)/i);
     if (y2) year = y2[1];
   }
+  
+  // Strategy 3: standalone year chip after metadata labels
   if (!year) {
-    const y3 = html.match(/video:release_date[^>]*content="(\d{4})/i);
+    const y3 = headerSection.match(/(?:Genres|Languages|Status|Type)[\s\S]{0,1500}>(19[5-9]\d|20[0-2]\d)</i);
     if (y3) year = y3[1];
   }
+  
+  // Strategy 4: JSON-LD datePublished
   if (!year) {
     const y4 = html.match(/"datePublished"\s*:\s*"(\d{4})/i);
     if (y4) year = y4[1];
   }
+  
+  // Strategy 5: <time datetime>
   if (!year) {
-    const y5 = head30.match(/<time[^>]*datetime="(\d{4})/i);
+    const y5 = headerSection.match(/<time[^>]*datetime="(\d{4})/i);
     if (y5) year = y5[1];
   }
 
@@ -119,7 +135,7 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
         .filter((l) => l.length > 1 && l.length < 20)
     : [];
 
-  // ---------------- seasons (tabs: a or button) ----------------
+  // ---------------- seasons ----------------
   const seasons = [...html.matchAll(
     /<(?:a|button)[^>]*(?:href="javascript:void\(0\)"|data-season)[^>]*>([^<]*Season\s*\d+[^<]*)<\/(?:a|button)>/gi
   )]
@@ -133,7 +149,7 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     })
     .filter(Boolean);
 
-  // ---------------- episodes (visible season grid, real titles) ----------------
+  // ---------------- episodes (real titles, filtered) ----------------
   const episodesPreview = [];
   const epRe = /<a[^>]+href="https?:\/\/animesalt\.cx\/episode\/([^"\/?#]+)\/?"[^>]*>([\s\S]*?)<\/a>/g;
   let em;
@@ -141,22 +157,38 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     const slug = em[1];
     if (episodesPreview.some((e) => e.slug === slug)) continue;
     const chunk = em[2];
+    
+    // Extract title from various possible locations
     let title = "";
     const tM =
-      chunk.match(/class="[^"]*(?:title|name|ep-t)[^"]*"[^>]*>([^<]{2,80})</i) ||
-      chunk.match(/\balt="([^"]{2,80})"/i);
-    if (tM) title = clean(tM[1]);
-    if (!title) {
-      const after = html.slice(em.index + em[0].length, em.index + em[0].length + 250);
-      const aM = after.match(/<(?:div|span|h[34])[^>]*class="[^"]*(?:title|name)[^"]*"[^>]*>([^<]{2,80})</i);
-      if (aM) title = clean(aM[1]);
+      chunk.match(/class="[^"]*(?:ep-?title|episode-?title|title|name)[^"]*"[^>]*>([^<]{2,100})</i) ||
+      chunk.match(/<(?:h[34]|div|span)[^>]*class="[^"]*title[^"]*"[^>]*>([^<]{2,100})</i) ||
+      chunk.match(/\balt="([^"]{2,100})"/i);
+    
+    if (tM) {
+      const candidate = clean(tM[1]);
+      if (!isNonEpisodeTitle(candidate)) title = candidate;
     }
+    
+    // Fallback: look for title in HTML after the link
+    if (!title) {
+      const after = html.slice(em.index + em[0].length, em.index + em[0].length + 400);
+      const aM = after.match(/<(?:div|span|h[34])[^>]*class="[^"]*(?:title|name|ep)[^"]*"[^>]*>([^<]{2,100})</i);
+      if (aM) {
+        const candidate = clean(aM[1]);
+        if (!isNonEpisodeTitle(candidate)) title = candidate;
+      }
+    }
+    
+    // Skip if title is "Comments" or similar
+    if (isNonEpisodeTitle(title)) continue;
+    
     const sxe = slug.match(/(\d+)x(\d+)$/);
     episodesPreview.push({
       slug,
       season: sxe ? +sxe[1] : 1,
       num: sxe ? +sxe[2] : 0,
-      title: title && !/^Image\s/i.test(title) ? title : `Episode ${sxe ? sxe[2] : ""}`,
+      title: title || `Episode ${sxe ? sxe[2] : ""}`,
       image: (() => {
         const iM = chunk.match(/<img[^>]*?\b(?:data-src|src)="(?!data:)([^"]+)"/i);
         return iM ? fixUrl(iM[1]) : null;
