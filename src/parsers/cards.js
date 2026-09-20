@@ -1,10 +1,25 @@
 // ==========================================================================
-// Catalog card parsers — series/movie listings
-// Chunk-based: split HTML into per-card chunks FIRST, then extract fields locally
-// Prevents cross-card boundary pairing bugs
+// Catalog card parsers v3 — heading filtering + chunk-based
 // ==========================================================================
 
-const cleanTitle = (t) =>
+// Known section headings to skip when extracting titles
+const HEADING_PATTERNS = [
+  /^Most[- ]Watched/i,
+  /^Latest/i,
+  /^Popular/i,
+  /^Fresh/i,
+  /^Ongoing/i,
+  /^Completed/i,
+  /^Genres/i,
+  /^Languages/i,
+  /^Networks/i,
+  /^Franchises/i,
+];
+
+const isHeading = (title) =>
+  HEADING_PATTERNS.some((pat) => pat.test(title));
+
+const clean = (t) =>
   String(t || "")
     .replace(/<[^>]+>/g, "")
     .replace(/^Image\s+/i, "")
@@ -12,34 +27,43 @@ const cleanTitle = (t) =>
     .replace(/&amp;/g, "&")
     .replace(/&#8217;/g, "'")
     .replace(/&#8211;/g, "-")
+    .replace(/&nbsp;/g, " ")
     .trim();
 
+const fixUrl = (u) => (u && u.startsWith("//") ? "https:" + u : u || "");
+
 const pickImage = (chunk) => {
-  // Prefer lazy-load attributes; reject inline data: placeholders
   const m =
     chunk.match(
       /<img[^>]*?\b(?:data-lazy-src|data-src|data-original|data-cfsrc|data-bg)="([^"]+)"/i
     ) || chunk.match(/<img[^>]*?\bsrc="(?!data:)([^"]+)"/i);
-  return m ? m[1] : "";
+  return m ? fixUrl(m[1]) : "";
 };
 
 const pickTitle = (chunk) => {
-  const m =
-    chunk.match(/<h[1-4][^>]*>([\s\S]*?)<\/h[1-4]>/i) ||
+  // Try h-tag title first, skip headings
+  const h = chunk.match(/<h[1-4][^>]*>([\s\S]*?)<\/h[1-4]>/i);
+  if (h) {
+    const t = clean(h[1]);
+    if (t && !isHeading(t)) return t;
+  }
+  // Fallback to alt/title attributes
+  const alt =
     chunk.match(/\btitle="([^"]{2,120})"/i) ||
     chunk.match(/\balt="([^"]{2,120})"/i);
-  return cleanTitle(m ? m[1] : "");
+  if (alt) {
+    const t = clean(alt[1]).replace(/^Image\s+/i, "");
+    if (t && !isHeading(t)) return t;
+  }
+  return "";
 };
 
 /**
- * Parse catalog cards from HTML.
- * Strategy: split HTML into per-card chunks using class/id patterns,
- * then extract link/image/title inside each chunk independently.
+ * Parse catalog cards using chunk-based splitting.
+ * Skips section headings. Prefers data-src over src (lazy-load).
  */
 export function parseCatalogItems(html) {
   const out = [];
-
-  // Split into chunks: each chunk starts with a card wrapper element
   const chunks = html.split(
     /(?=<(?:article|div|li)\b[^>]*\b(?:class|id)="[^"]*(?:bs|bsx|item|card|post|poster|tt|mlw|thumb)[^"]*")/i
   );
@@ -61,26 +85,6 @@ export function parseCatalogItems(html) {
     });
   }
 
-  // Fallback: plain link scan (pages with no card wrappers)
-  if (!out.length) {
-    const re =
-      /<a[^>]+href="(https?:\/\/animesalt\.cx\/(series|movies)\/([^"\/?#]+)\/?)"[^>]*>([\s\S]*?)<\/a>/gi;
-    let m;
-    while ((m = re.exec(html)) !== null) {
-      const title = cleanTitle(m[4]);
-      if (!title || title.length < 2 || /^(View|Read)\b/i.test(title)) continue;
-      out.push({
-        id: m[3],
-        title,
-        image:
-          pickImage(m[4]) ||
-          pickImage(html.slice(Math.max(0, m.index - 600), m.index)),
-        type: m[2] === "movies" ? "movie" : "series",
-        url: m[1],
-      });
-    }
-  }
-
   // Dedupe by id
   const seen = new Set();
   return out.filter((it) => {
@@ -91,7 +95,8 @@ export function parseCatalogItems(html) {
 }
 
 /**
- * Parse Most-Watched numbered lists from homepage.
+ * Parse Most-Watched from chart-item grid structure.
+ * Real HTML: <div class="chart-item"> with chart-number, chart-poster, chart-title
  */
 export function parseMostWatched(html) {
   const grab = (heading) => {
@@ -100,54 +105,65 @@ export function parseMostWatched(html) {
     const next = html
       .toLowerCase()
       .indexOf("most-watched", idx + heading.length);
-    const block = html.slice(idx, next === -1 ? idx + 80000 : next);
+    const altNext = html.toLowerCase().indexOf("latest", idx + heading.length);
+    const endIdx =
+      next === -1
+        ? altNext === -1
+          ? idx + 80000
+          : altNext
+        : next;
+    const block = html.slice(idx, endIdx);
+
     const items = [];
-    const re =
-      /<a[^>]+href="(https?:\/\/animesalt\.cx\/(series|movies)\/([^"\/?#]+)\/?)"[^>]*>([\s\S]*?)<\/a>/gi;
-    let m,
-      rank = 0;
-    while ((m = re.exec(block)) !== null) {
-      rank++;
-      const title = cleanTitle(m[4]);
-      if (!title || title.length < 2) continue;
-      items.push({
-        rank,
-        id: m[3],
-        title,
-        image: pickImage(m[4]),
-        type: m[2] === "movies" ? "movie" : "series",
-        url: m[1],
-      });
-      if (items.length >= 25) break;
+    const itemChunks = block.split(/(?=<div\s+class="chart-item")/i);
+    for (const chunk of itemChunks) {
+      const numM = chunk.match(/<div\s+class="chart-number">(\d+)<\/div>/i);
+      if (!numM) continue;
+      const rank = parseInt(numM[1], 10);
+
+      const linkM = chunk.match(
+        /<a[^>]+href="(https?:\/\/animesalt\.cx\/(series|movies)\/([^"\/?#]+)\/?)"[^>]*class="chart-poster"/i
+      );
+      if (!linkM) continue;
+      const [, url, kind, slug] = linkM;
+
+      const titleM = chunk.match(/<div\s+class="chart-title">([^<]+)<\/div>/i);
+      const title = titleM ? clean(titleM[1]) : "";
+
+      const imgM = chunk.match(/<img[^>]*?\bdata-src="([^"]+)"/i);
+      const image = imgM ? fixUrl(imgM[1]) : "";
+
+      if (title) {
+        items.push({
+          rank,
+          id: slug,
+          title,
+          image,
+          type: kind === "movies" ? "movie" : "series",
+          url,
+        });
+      }
     }
     return items;
   };
+
   return {
     series: grab("Most-Watched Series"),
     films: grab("Most-Watched Films"),
   };
 }
 
-/**
- * Parse featured/hero items — uses most-watched as primary source.
- */
+/** Featured items — uses most-watched as primary source */
 export function parseFeatured(html) {
   const mw = parseMostWatched(html);
   const pool = [...mw.series.slice(0, 3), ...mw.films.slice(0, 3)];
-  if (pool.length) return pool;
-  return parseCatalogItems(html).slice(0, 6);
+  return pool.length ? pool : parseCatalogItems(html).slice(0, 6);
 }
 
-/**
- * Parse latest updates from homepage.
- */
 export function parseLatest(html) {
   return parseCatalogItems(html).slice(0, 24);
 }
 
-/**
- * Pick a random item from catalog.
- */
 export function parseRandomItem(html) {
   const items = parseCatalogItems(html);
   return items.length ? items[Math.floor(Math.random() * items.length)] : null;
