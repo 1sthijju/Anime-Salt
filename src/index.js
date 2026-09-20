@@ -1,5 +1,5 @@
 // ==========================================================================
-// AnimeSalt Worker — Main Router (v4.5.0-az)
+// AnimeSalt Worker — Main Router (v4.6.0-megaplay)
 // ==========================================================================
 
 import { corsHeaders, UPSTREAM, CHROME_HEADERS } from "./config.js";
@@ -43,7 +43,7 @@ export default {
         return jsonSuccess({
           pong: true,
           timestamp: new Date().toISOString(),
-          worker: "v4.5.0-az",
+          worker: "v4.6.0-megaplay",
         });
       }
 
@@ -103,13 +103,40 @@ export default {
       // ---------- media proxy ----------
       if (path === "/proxy/media") return await handleMediaProxy(request);
 
-      // ---------- audit ----------
+      // ---------- debug: dump any embed page ----------
+      if (path === "/api/debug/embed") {
+        const u = url.searchParams.get("url");
+        if (!u) return jsonError("Missing url", 400);
+        try {
+          const res = await fetch(u, {
+            headers: {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+              Accept: "text/html,application/xhtml+xml,*/*;q=0.8",
+              "Accept-Language": "en-US,en;q=0.9",
+              "Sec-Ch-Ua": '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
+              "Sec-Ch-Ua-Platform": '"Windows"',
+              "Sec-Fetch-Dest": "iframe",
+              "Sec-Fetch-Mode": "navigate",
+              "Sec-Fetch-Site": "cross-site",
+              Referer: "https://animesalt.cx/",
+            },
+            redirect: "follow",
+          });
+          return new Response(await res.text(), {
+            headers: { "Content-Type": "text/html; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+          });
+        } catch (e) {
+          return jsonError(e.message, 500);
+        }
+      }
+
+      // ---------- audit (upstream-only) ----------
       if (path === "/api/debug/audit") return await handleAudit();
 
       // ---------- root ----------
       if (path === "/" || path === "") {
         return new Response(
-          `AnimeSalt Worker v4.5.0-az\n\n` +
+          `AnimeSalt Worker v4.6.0-megaplay\n\n` +
           `Home:      /api/home/hero, /api/home/<section>\n` +
           `Sections:  ${HOME_SECTIONS.join(", ")}\n` +
           `Letters:   /api/letter/<A-Z|#>\n` +
@@ -120,7 +147,7 @@ export default {
           `Episodes:  /api/episodes/<id>?season=<n|all>\n` +
           `Streaming: /api/servers?ep=<slug>, /api/stream?ep=<slug>&server=<n>&lang=<l>\n` +
           `Proxy:     /proxy/media?url=<url>&referer=<r>&force=text/vtt\n` +
-          `Debug:     /api/debug/home, /api/debug/audit, /api/health\n`,
+          `Debug:     /api/debug/home, /api/debug/embed, /api/debug/audit, /api/health\n`,
           {
             headers: {
               "Content-Type": "text/plain; charset=utf-8",
