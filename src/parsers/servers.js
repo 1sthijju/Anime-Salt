@@ -1,5 +1,5 @@
 // ==========================================================================
-// Episode server parser v2 — extracts real embed URLs
+// Episode server parser v2 — extracts real embed URLs + multi-lang detection
 // ==========================================================================
 
 export function parseServers(html, epSlug) {
@@ -12,12 +12,19 @@ export function parseServers(html, epSlug) {
     try {
       const serversArray = JSON.parse(jsVarMatch[1]);
       serversArray.forEach((srv, idx) => {
+        const embedUrl = srv.url || srv.link || srv.src || "";
         servers.push({
           index: idx,
           serverName: srv.name || srv.label || `Server ${idx + 1}`,
-          embedUrl: srv.url || srv.link || srv.src || "",
-          isActive: idx === 0, // first server usually active
-          isMultiLang: srv.multi || srv.isMulti || /multi/i.test(srv.name || ""),
+          embedUrl,
+          isActive: idx === 0,
+          isMultiLang:
+            srv.multi ||
+            srv.isMulti ||
+            /multi/i.test(srv.name || "") ||
+            /multi[-_]?lang/i.test(embedUrl) ||
+            /data=[A-Za-z0-9+/=]{20,}/.test(embedUrl) ||
+            /short\.icu/i.test(embedUrl),
         });
       });
     } catch {}
@@ -26,7 +33,8 @@ export function parseServers(html, epSlug) {
   // Strategy 2: Extract from server buttons + iframes
   if (!servers.length) {
     // Find all server buttons
-    const buttonRe = /<div[^>]*class="server-btn([^"]*)"[^>]*onclick="changeServer\((\d+)\)"[^>]*>([\s\S]*?)<\/div>/gi;
+    const buttonRe =
+      /<div[^>]*class="server-btn([^"]*)"[^>]*onclick="changeServer\((\d+)\)"[^>]*>([\s\S]*?)<\/div>/gi;
     const buttons = [];
     let bm;
     while ((bm = buttonRe.exec(html)) !== null) {
@@ -50,12 +58,18 @@ export function parseServers(html, epSlug) {
 
     // Match buttons to iframes by index
     buttons.forEach((btn, idx) => {
+      const embed = iframes[btn.index] || iframes[idx] || "";
       servers.push({
         index: btn.index,
         serverName: btn.serverName,
-        embedUrl: iframes[btn.index] || iframes[idx] || "",
+        embedUrl: embed,
         isActive: btn.isActive,
-        isMultiLang: btn.isMultiLang,
+        // Detect multi-lang from URL patterns
+        isMultiLang:
+          btn.isMultiLang ||
+          /multi[-_]?lang/i.test(embed) ||
+          /data=[A-Za-z0-9+/=]{20,}/.test(embed) ||
+          /short\.icu/i.test(embed),
       });
     });
   }
@@ -66,12 +80,17 @@ export function parseServers(html, epSlug) {
     let dm;
     let idx = 0;
     while ((dm = dataRe.exec(html)) !== null) {
+      const url = dm[1];
       servers.push({
         index: idx++,
         serverName: dm[2].trim(),
-        embedUrl: dm[1],
+        embedUrl: url,
         isActive: idx === 1,
-        isMultiLang: /multi/i.test(dm[2]),
+        isMultiLang:
+          /multi/i.test(dm[2]) ||
+          /multi[-_]?lang/i.test(url) ||
+          /data=[A-Za-z0-9+/=]{20,}/.test(url) ||
+          /short\.icu/i.test(url),
       });
     }
   }
@@ -83,12 +102,16 @@ export function parseServers(html, epSlug) {
     let idx = 0;
     while ((em = embedRe.exec(html)) !== null) {
       if (em[0].includes("episode") || em[0].includes("series")) continue;
+      const url = em[0].startsWith("http") ? em[0] : "https://" + em[0];
       servers.push({
         index: idx++,
         serverName: `Server ${idx}`,
-        embedUrl: em[0].startsWith("http") ? em[0] : "https://" + em[0],
+        embedUrl: url,
         isActive: idx === 1,
-        isMultiLang: false,
+        isMultiLang:
+          /multi[-_]?lang/i.test(url) ||
+          /data=[A-Za-z0-9+/=]{20,}/.test(url) ||
+          /short\.icu/i.test(url),
       });
       if (servers.length >= 5) break;
     }
