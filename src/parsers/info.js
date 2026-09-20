@@ -1,8 +1,9 @@
 // ==========================================================================
-// Info page parser v12
-// poster      : img whose alt/title CONTAINS the show title
-//               → poster wrapper (skip logo) → og:image (tmdb only) → first tmdb
-//               Logo URLs always rejected. TMDB width normalized to w500.
+// Info page parser v13
+// poster : img whose alt/title CONTAINS the show title → poster wrapper
+//          → og:image (TMDB only) → first TMDB. Logo URLs always rejected.
+//          TMDB width normalized to w500.
+// year   : anchored AFTER runtime "N min" indicator, excludes footer years
 // ==========================================================================
 
 const clean = (t) =>
@@ -93,7 +94,7 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     }
   }
 
-  // 3) og:image — only if it's a TMDB asset (site default og:image is the logo)
+  // 3) og:image — only if it's a TMDB asset
   if (!poster) {
     const ogImg =
       html.match(/<meta[^>]*property="og:image"[^>]*content="([^"]+)"/i) ||
@@ -154,23 +155,41 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     }
   }
 
-  // ---------------- year ----------------
+  // ---------------- YEAR: anchored AFTER runtime "N min" ----------------
   let year = "";
   const header = html.slice(0, 15000);
-  const labelPatterns = [
-    /(?:Episodes?|Seasons?|Runtime|Type|Status)\b[^0-9]{0,300}?(19[5-9]\d|20[0-2]\d)/gi,
-    /(19[5-9]\d|20[0-2]\d)[^0-9]{0,300}?\b(?:Episodes?|Seasons?)/gi,
-  ];
-  for (const pat of labelPatterns) {
-    const m = pat.exec(header);
-    if (m && !EXCLUDED_YEARS.has(m[1])) { year = m[1]; break; }
+  
+  // Strategy 1: year within 500 chars AFTER runtime indicator "N min"
+  const runtimeMatch = header.match(/(\d+)\s*min/i);
+  if (runtimeMatch) {
+    const afterMin = header.slice(runtimeMatch.index, runtimeMatch.index + 500);
+    const yearMatch = afterMin.match(/\b(19[5-9]\d|20[0-2]\d)\b/);
+    if (yearMatch && !EXCLUDED_YEARS.has(yearMatch[1])) {
+      year = yearMatch[1];
+    }
   }
+  
+  // Strategy 2: year near metadata labels (Seasons/Episodes/Type/Status)
+  if (!year) {
+    const labelPatterns = [
+      /(?:Episodes?|Seasons?|Type|Status)\b[^0-9]{0,300}?(19[5-9]\d|20[0-2]\d)/gi,
+      /(19[5-9]\d|20[0-2]\d)[^0-9]{0,300}?\b(?:Episodes?|Seasons?)/gi,
+    ];
+    for (const pat of labelPatterns) {
+      const m = pat.exec(header);
+      if (m && !EXCLUDED_YEARS.has(m[1])) { year = m[1]; break; }
+    }
+  }
+  
+  // Strategy 3: any year in header (last resort, excludes footer years)
   if (!year) {
     const allYears = [...header.matchAll(/\b(19[5-9]\d|20[0-2]\d)\b/g)]
       .map((m) => m[1])
       .filter((y) => !EXCLUDED_YEARS.has(y));
     year = allYears[0] || "";
   }
+  
+  // Strategy 4: JSON-LD datePublished
   if (!year) {
     const ym = html.match(/"datePublished"\s*:\s*"(19[5-9]\d|20[0-2]\d)/i);
     if (ym && !EXCLUDED_YEARS.has(ym[1])) year = ym[1];
