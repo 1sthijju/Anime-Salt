@@ -1,45 +1,96 @@
 // ==========================================================================
-// Episode server parser v3 — button pattern + multi-lang detection
+// Episode server parser v2 — extracts real embed URLs
 // ==========================================================================
 
-/**
- * Parse streaming servers from an episode page.
- * Real HTML: <div class="server-btn [active]" onclick="changeServer(N)">
- */
 export function parseServers(html, epSlug) {
   const servers = [];
 
-  // Primary pattern: server buttons with changeServer(N) onclick
-  const re =
-    /<div\s+class="server-btn([^"]*)"[^>]*onclick="changeServer\((\d+)\)"[^>]*>([\s\S]*?)<\/div>/gi;
-  let m;
-  while ((m = re.exec(html)) !== null) {
-    const [_, classes, idx, content] = m;
-    const isMulti =
-      /multi/i.test(content) || /multi/i.test(classes) || /data=/.test(html);
-    const nameM = content.match(/<div\s+class="server-name">([^<]+)<\/div>/i);
-    servers.push({
-      index: parseInt(idx, 10),
-      serverName: nameM ? nameM[1].trim() : `Server ${idx}`,
-      embedUrl: "", // filled by stream handler via AJAX or page context
-      isActive: /active/i.test(classes),
-      isMultiLang: isMulti,
+  // Strategy 1: Extract from JavaScript variable (most common)
+  // Pattern: var servers = [{url: "...", ...}, ...]
+  const jsVarMatch = html.match(/var\s+servers\s*=\s*(\[[\s\S]*?\]);/i);
+  if (jsVarMatch) {
+    try {
+      const serversArray = JSON.parse(jsVarMatch[1]);
+      serversArray.forEach((srv, idx) => {
+        servers.push({
+          index: idx,
+          serverName: srv.name || srv.label || `Server ${idx + 1}`,
+          embedUrl: srv.url || srv.link || srv.src || "",
+          isActive: idx === 0, // first server usually active
+          isMultiLang: srv.multi || srv.isMulti || /multi/i.test(srv.name || ""),
+        });
+      });
+    } catch {}
+  }
+
+  // Strategy 2: Extract from server buttons + iframes
+  if (!servers.length) {
+    // Find all server buttons
+    const buttonRe = /<div[^>]*class="server-btn([^"]*)"[^>]*onclick="changeServer\((\d+)\)"[^>]*>([\s\S]*?)<\/div>/gi;
+    const buttons = [];
+    let bm;
+    while ((bm = buttonRe.exec(html)) !== null) {
+      const [, classes, idx, content] = bm;
+      const nameM = content.match(/<div\s+class="server-name">([^<]+)<\/div>/i);
+      buttons.push({
+        index: parseInt(idx, 10),
+        serverName: nameM ? nameM[1].trim() : `Server ${idx}`,
+        isActive: /active/i.test(classes),
+        isMultiLang: /multi/i.test(content) || /multi/i.test(classes),
+      });
+    }
+
+    // Find all iframe srcs (these are the actual embed URLs)
+    const iframeRe = /<iframe[^>]*src="([^"]+)"[^>]*>/gi;
+    const iframes = [];
+    let im;
+    while ((im = iframeRe.exec(html)) !== null) {
+      iframes.push(im[1]);
+    }
+
+    // Match buttons to iframes by index
+    buttons.forEach((btn, idx) => {
+      servers.push({
+        index: btn.index,
+        serverName: btn.serverName,
+        embedUrl: iframes[btn.index] || iframes[idx] || "",
+        isActive: btn.isActive,
+        isMultiLang: btn.isMultiLang,
+      });
     });
   }
 
-  // Fallback: list items with data-id
+  // Strategy 3: Extract from data attributes
   if (!servers.length) {
-    const re2 =
-      /<li[^>]*data-id="(\d+)"[^>]*>[\s\S]*?<a[^>]+href="([^"]+)"[^>]*>[\s\S]*?<span[^>]*>([^<]+)<\/span>/gi;
-    let m2;
-    while ((m2 = re2.exec(html)) !== null) {
+    const dataRe = /<a[^>]*data-server[^>]*href="([^"]+)"[^>]*>([^<]+)<\/a>/gi;
+    let dm;
+    let idx = 0;
+    while ((dm = dataRe.exec(html)) !== null) {
       servers.push({
-        index: parseInt(m2[1], 10),
-        serverName: m2[3].trim(),
-        embedUrl: m2[2],
-        isActive: false,
-        isMultiLang: /multi/i.test(m2[3]) || /data=/.test(m2[2]),
+        index: idx++,
+        serverName: dm[2].trim(),
+        embedUrl: dm[1],
+        isActive: idx === 1,
+        isMultiLang: /multi/i.test(dm[2]),
       });
+    }
+  }
+
+  // Strategy 4: Fallback — extract any as-cdn or animesalt embed URLs
+  if (!servers.length) {
+    const embedRe = /(?:as-cdn|animesalt)[^"'\s]*\.(?:top|cx|com)\/[^"'\s<>]+/gi;
+    let em;
+    let idx = 0;
+    while ((em = embedRe.exec(html)) !== null) {
+      if (em[0].includes("episode") || em[0].includes("series")) continue;
+      servers.push({
+        index: idx++,
+        serverName: `Server ${idx}`,
+        embedUrl: em[0].startsWith("http") ? em[0] : "https://" + em[0],
+        isActive: idx === 1,
+        isMultiLang: false,
+      });
+      if (servers.length >= 5) break;
     }
   }
 
