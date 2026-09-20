@@ -64,7 +64,7 @@ export default {
 
       // ----- Taxonomy -----
       if (path === "/api/discover") return await handleDiscover(ctx);
-      if (path === "/api/genres") return jsonSuccess(await handleGenreList(ctx));
+      if (path === "/api/genres") return await handleGenreList(ctx);
       for (const kind of TAXONOMY_KINDS) {
         const m = path.match(new RegExp(`^/api/${kind}/([^/]+)$`));
         if (m) {
