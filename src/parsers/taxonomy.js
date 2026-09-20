@@ -1,10 +1,11 @@
 // ==========================================================================
 // Taxonomy parser — genres, languages, networks, franchises
-// Extracts category links from homepage/category pages
 // ==========================================================================
 
 /**
- * Parse taxonomy (genres, languages, networks, franchises) from HTML.
+ * Parse taxonomy categories from HTML.
+ * Note: homepage may not contain all categories — /api/discover should
+ * fetch from a dedicated category index if available.
  */
 export function parseTaxonomy(html) {
   const parse = (kind) => {
