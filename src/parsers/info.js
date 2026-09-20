@@ -1,9 +1,7 @@
 // ==========================================================================
-// Info page parser v5
-// description : Overview block → desc class → og:description (spam-filtered)
-// year        : JSON-LD → <time> → standalone >YYYY< chip in first 40KB
-// poster      : best TMDB width (w500 > w342 > w780 > any)
-// quickPlay   : labeled links → max slug → movie fallback {slug:id}
+// Info page parser v6
+// description : paragraph/div AFTER "Overview" heading
+// year        : metadata section year, exclude footer
 // ==========================================================================
 
 const clean = (t) =>
@@ -13,6 +11,7 @@ const clean = (t) =>
     .replace(/&amp;/g, "&").replace(/&#8217;/g, "'").replace(/&#8211;/g, "-")
     .replace(/&nbsp;/g, " ").replace(/&quot;/g, '"').replace(/&#39;/g, "'")
     .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/\s+/g, " ")
     .trim();
 
 const fixUrl = (u) => (u && u.startsWith("//") ? "https:" + u : u || "");
@@ -39,37 +38,65 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
     const hit = tmdbImgs.find((u) => u.includes(`/t/p/${w}/`));
     if (hit) { poster = hit; break; }
   }
-  if (!poster) {
-    const wrap = html.match(/<div[^>]*class="[^"]*poster[^"]*"[^>]*>[\s\S]*?<img[^>]*?\b(?:data-src|src)="([^"]+)"/i);
-    if (wrap && !wrap[1].startsWith("data:")) poster = fixUrl(wrap[1]);
-  }
 
-  // ---- description: Overview block first, spam-filtered og last ----
+  // ---- description: find Overview heading, grab NEXT paragraph/div ----
   let description = "";
-  const ov = html.match(
-    /(?:Overview|Synopsis|Summary|Plot)[\s\S]{0,500}?(<(?:p|div)[^>]*>[\s\S]{40,4000}?<\/(?:p|div)>)/i
-  );
-  if (ov) description = clean(ov[1]);
-  if (!description || isSpamDesc(description)) {
-    const dm = html.match(/<div[^>]*class="[^"]*(?:desc|synopsis|summary)[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
-    if (dm) description = clean(dm[1]);
+  
+  // Pattern 1: Look for "Overview" or "Synopsis" heading, then grab next <p> or <div>
+  const overviewM = html.match(/(?:Overview|Synopsis|Summary|Plot)\s*<\/(?:h[2-4]|div|span)>[\s\S]{0,200}?(<(?:p|div)[^>]*>([\s\S]{40,5000}?)<\/(?:p|div)>)/i);
+  if (overviewM) description = clean(overviewM[2]);
+  
+  // Pattern 2: class-based description
+  if (!description || description.length < 30) {
+    const dm = html.match(/<div[^>]*class="[^"]*(?:desc|synopsis|summary|content)[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+    if (dm) {
+      const desc = clean(dm[1]);
+      if (desc.length > 30 && !isSpamDesc(desc)) description = desc;
+    }
   }
-  if (!description || isSpamDesc(description)) {
+  
+  // Pattern 3: og:description (filter spam)
+  if (!description || description.length < 30) {
     const ogDesc =
       html.match(/<meta[^>]*property="og:description"[^>]*content="([^"]+)"/i) ||
       html.match(/<meta[^>]*name="description"[^>]*content="([^"]+)"/i);
-    if (ogDesc && !isSpamDesc(clean(ogDesc[1]))) description = clean(ogDesc[1]);
+    if (ogDesc) {
+      const desc = clean(ogDesc[1]);
+      if (desc.length > 30 && !isSpamDesc(desc)) description = desc;
+    }
   }
-  if (isSpamDesc(description)) description = "";
 
-  // ---- year: JSON-LD → <time> → standalone chip in first 40KB ----
-  const ym =
-    html.match(/"datePublished"\s*:\s*"(\d{4})/i) ||
-    html.match(/<time[^>]*datetime="(\d{4})/i) ||
-    html.slice(0, 40000).match(/>(19[5-9]\d|20[0-2]\d)</);
-  const year = ym ? ym[1] : "";
+  // ---- year: find in metadata section, exclude footer ----
+  let year = "";
+  
+  // Strategy: search first 30KB (before footer), look for year near "Release" or in metadata div
+  const headerSection = html.slice(0, 30000);
+  
+  // Pattern 1: "Release: 2022" or "Year: 2016"
+  const releaseM = headerSection.match(/(?:Release|Year|Aired|Premiered|Released)[^0-9\n]{0,50}(19[5-9]\d|20[0-2]\d)/i);
+  if (releaseM) year = releaseM[1];
+  
+  // Pattern 2: <time datetime="2022">
+  if (!year) {
+    const timeM = headerSection.match(/<time[^>]*datetime="(\d{4})/i);
+    if (timeM) year = timeM[1];
+  }
+  
+  // Pattern 3: JSON-LD datePublished
+  if (!year) {
+    const jsonM = html.match(/"datePublished"\s*:\s*"(\d{4})/i);
+    if (jsonM) year = jsonM[1];
+  }
+  
+  // Pattern 4: standalone year in metadata section (not footer)
+  if (!year) {
+    // Look for year after "Genres" or "Languages" but before footer
+    const metaSection = html.slice(0, 25000);
+    const yearChip = metaSection.match(/(?:Genres|Languages|Status)[\s\S]{0,2000}>(19[5-9]\d|20[0-2]\d)</);
+    if (yearChip) year = yearChip[1];
+  }
 
-  // ---- status: left to handler inference ----
+  // ---- status ----
   let status = "";
   const sm = html.match(/\/category\/status\/([a-z0-9-]+)\/?["']/i);
   if (sm) status = sm[1].replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
@@ -115,7 +142,6 @@ export function parseInfoPage(html, id, fetchedKind = "series") {
       return (+pa[1] - +pb[1]) || (+pa[2] - +pb[2]);
     }).pop();
   }
-  // movie fallback: watch route resolves /movies/<id>/ directly
   if (type === "movie" && !firstSlug) firstSlug = id;
 
   return {
