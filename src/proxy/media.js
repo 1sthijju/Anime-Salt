@@ -2,12 +2,17 @@
 // /proxy/media?url=<target>&referer=<ref>&force=text/vtt&audio=<code>
 //
 // Proxies media (HLS manifests, MP4, segments, VTT, images) with:
-//  - referer/origin spoofing via candidate list (CDN hotlink whitelists)
+//  - referer spoofing via candidate list; PAGE-LEVEL referer tried first
+//    (sssrr.org / hydrax-family CDNs gate on the player-page URL)
+//  - Origin header sent ONLY for origin-level referers (browsers omit Origin
+//    on plain media loads; some CDNs 403 when it's present)
 //  - HLS manifest rewriting (segments, URI=, #EXT-X-KEY, #EXT-X-MAP,
 //    #EXT-X-MEDIA) — tag prefixes preserved (v4 fix)
-//  - Audio language selection via ?audio=<code> → flips DEFAULT flag (v5)
-//  - Range passthrough for MP4 segments
-//  - force=text/vtt → returns valid VTT even for binary input
+//  - Audio selection via ?audio=<code> → flips DEFAULT flag (v5 fix)
+//  - Range passthrough for MP4/segments
+//  - force=text/vtt → valid VTT even when upstream serves a binary placeholder
+//  - HTML challenge/block pages are rejected with 502 instead of being
+//    streamed to the player as "video"
 // ==========================================================================
 
 import { jsonError } from "../util/response.js";
@@ -42,8 +47,8 @@ function normAudio(v) {
 }
 
 /**
- * Build the public URL clients will use to fetch media through the proxy.
- * Preserves referer / force / audio so the chain stays proxied.
+ * Public URL clients use to fetch media through this proxy.
+ * Preserves referer / force / audio so the whole chain stays proxied.
  */
 export function proxyMediaUrl(origin, targetUrl, opts = {}) {
   const u = new URL("/proxy/media", origin);
@@ -54,9 +59,7 @@ export function proxyMediaUrl(origin, targetUrl, opts = {}) {
   return u.toString();
 }
 
-/**
- * Detect content type from URL extension / headers.
- */
+/** Detect content kind from URL extension / content-type. */
 function detectKind(url, ct) {
   const lower = (ct || "").toLowerCase();
   if (/mpegurl|manifest/i.test(lower) || /\.m3u8(\?|$)/i.test(url)) return "manifest";
@@ -67,14 +70,11 @@ function detectKind(url, ct) {
 }
 
 /**
- * Rewrite HLS manifest:
- *  - Proxy every segment, URI=, #EXT-X-KEY, #EXT-X-MAP, #EXT-X-MEDIA
- *  - When ?audio=<code> is present, flip the matching AUDIO rendition to
- *    DEFAULT=YES (all others DEFAULT=NO) so ANY engine auto-selects it.
- *
- * v4 FIX: capture groups INCLUDE the tag prefix so rebuilt lines keep
- * #EXT-X-MEDIA: / #EXT-X-KEY: / #EXT-X-MAP: intact.
- * v5 ADD: audio DEFAULT-flip for reload-based switching.
+ * Rewrite an HLS manifest:
+ *  - proxy every segment / URI= / #EXT-X-KEY / #EXT-X-MAP / #EXT-X-MEDIA
+ *  - when ?audio=<code> is present, flip DEFAULT=YES on the matching AUDIO
+ *    rendition (all others DEFAULT=NO) so any engine auto-selects it
+ * Tag prefixes are preserved (v4 fix).
  */
 function rewriteManifest(text, origin, baseUrl, referer, audio) {
   const want = audio ? normAudio(audio) : null;
@@ -84,7 +84,7 @@ function rewriteManifest(text, origin, baseUrl, referer, audio) {
   for (let i = 0; i < lines.length; i++) {
     let line = lines[i];
 
-    // --- AUDIO: flip DEFAULT flag when ?audio= is present ---
+    // --- AUDIO DEFAULT flip when ?audio= present ---
     if (want && /^#EXT-X-MEDIA:/i.test(line) && /TYPE=AUDIO/i.test(line)) {
       const langM = line.match(/LANGUAGE="([^"]+)"/i);
       const nameM = line.match(/NAME="([^"]+)"/i);
@@ -109,7 +109,7 @@ function rewriteManifest(text, origin, baseUrl, referer, audio) {
       continue;
     }
 
-    // --- #EXT-X-MAP:URI="..." (initialization segment) ---
+    // --- #EXT-X-MAP:URI="..." (init segment) ---
     const mapM = line.match(/^(#EXT-X-MAP:.*?URI=")([^"]+)(".*)$/i);
     if (mapM) {
       const abs = mapM[2].startsWith("http") ? mapM[2] : new URL(mapM[2], baseUrl).href;
@@ -117,7 +117,7 @@ function rewriteManifest(text, origin, baseUrl, referer, audio) {
       continue;
     }
 
-    // --- Bare URL line (segment or child manifest) ---
+    // --- bare URL line (segment / child manifest) ---
     if (!line.startsWith("#") && line.trim()) {
       const abs = line.trim().startsWith("http") ? line.trim() : new URL(line.trim(), baseUrl).href;
       out.push(proxyMediaUrl(origin, abs, { referer, audio }));
@@ -129,10 +129,7 @@ function rewriteManifest(text, origin, baseUrl, referer, audio) {
   return out.join("\n");
 }
 
-/**
- * Main handler: fetches upstream with referer/origin spoofing,
- * rewrites manifests, streams binary with Range passthrough.
- */
+/** Main handler. */
 export async function handleMediaProxy(request) {
   const url = new URL(request.url);
   const targetUrl = url.searchParams.get("url");
@@ -142,14 +139,13 @@ export async function handleMediaProxy(request) {
 
   if (!targetUrl) return jsonError("Missing url", 400);
 
-  // --- Referer candidates in priority order ---
-  const targetOrigin = (() => {
-    try { return new URL(targetUrl).origin; } catch { return ""; }
-  })();
+  // --- referer candidates: PAGE-LEVEL first, then its origin, then known hosts ---
+  const targetOrigin = (() => { try { return new URL(targetUrl).origin; } catch { return ""; } })();
+  const refererOrigin = (() => { try { return new URL(refererParam).origin + "/"; } catch { return null; } })();
 
   const candidates = [
-    refererParam,
-    // megaplay / as-cdn hosts
+    refererParam,                      // e.g. https://player.abyssplayer.com/<slug>
+    refererOrigin,                     // https://player.abyssplayer.com/
     "https://megaplay.buzz/",
     "https://megaplay.buzz",
     "https://as-cdn26.top/",
@@ -158,18 +154,13 @@ export async function handleMediaProxy(request) {
     "https://as-cdn29.top/",
     "https://as-cdn30.top/",
     "https://animesalt.cx/",
-    // abyss / hydrax hosts (v6)
     "https://abyssplayer.com/",
-    "https://player.abyssplayer.com/",
     "https://playhydrax.com/",
-    "https://abyss.to/",
-    // sssrr.org (Abyss CDN)
-    "https://sssrr.org/",
     targetOrigin ? targetOrigin + "/" : null,
-    "",                              // last-resort: no referer
-  ].filter((v, i, a) => v !== null && a.indexOf(v) === i);
+    "",                                // last resort: no referer
+  ].filter((v, i, a) => v !== null && v !== undefined && a.indexOf(v) === i);
 
-  // --- Upstream headers template ---
+  // --- base headers: NO Origin by default (browsers omit it on media loads) ---
   const baseHeaders = {
     "User-Agent": UPSTREAM_UA,
     Accept: "*/*",
@@ -179,10 +170,8 @@ export async function handleMediaProxy(request) {
     "Sec-Fetch-Site": "cross-site",
   };
 
-  // --- Range passthrough ---
   const clientRange = request.headers.get("Range");
 
-  // --- Try each candidate until 2xx ---
   let upstreamRes = null;
   let usedReferer = "";
   let lastStatus = 0;
@@ -191,26 +180,18 @@ export async function handleMediaProxy(request) {
     const h = { ...baseHeaders };
     if (cand) {
       h.Referer = cand;
-      try { h.Origin = new URL(cand).origin; } catch {}
+      // Origin only for origin-level referers (pathname === "/")
+      const isOriginLevel = (() => { try { return new URL(cand).pathname === "/"; } catch { return false; } })();
+      if (isOriginLevel) { try { h.Origin = new URL(cand).origin; } catch {} }
     }
     if (clientRange) h.Range = clientRange;
 
     try {
-      const r = await fetch(targetUrl, {
-        method: request.method,
-        headers: h,
-        redirect: "follow",
-      });
+      const r = await fetch(targetUrl, { method: request.method, headers: h, redirect: "follow" });
       lastStatus = r.status;
-      if (r.status >= 200 && r.status < 300) {
-        upstreamRes = r;
-        usedReferer = cand;
-        break;
-      }
+      if (r.status >= 200 && r.status < 300) { upstreamRes = r; usedReferer = cand; break; }
       try { if (r.body) await r.body.cancel(); } catch {}
-    } catch {
-      // network error → next candidate
-    }
+    } catch {}
   }
 
   if (!upstreamRes) {
@@ -220,11 +201,19 @@ export async function handleMediaProxy(request) {
     });
   }
 
-  // --- Content kind ---
   const upstreamCt = upstreamRes.headers.get("Content-Type") || "";
   const kind = detectKind(targetUrl, upstreamCt);
 
-  // --- force=text/vtt branch (binary placeholder → valid empty VTT) ---
+  // --- reject HTML challenge/block pages instead of streaming them as media ---
+  if (kind !== "manifest" && kind !== "vtt" && /text\/html/i.test(upstreamCt)) {
+    try { if (upstreamRes.body) await upstreamRes.body.cancel(); } catch {}
+    return new Response("Upstream returned HTML (challenge/block page)", {
+      status: 502,
+      headers: { "Content-Type": "text/plain;charset=UTF-8", ...CORS_HEADERS },
+    });
+  }
+
+  // --- force=text/vtt: binary placeholder → valid empty VTT ---
   if (force === "text/vtt" && kind !== "vtt") {
     try { if (upstreamRes.body) await upstreamRes.body.cancel(); } catch {}
     return new Response("WEBVTT\n\n", {
@@ -238,7 +227,7 @@ export async function handleMediaProxy(request) {
     });
   }
 
-  // --- HLS manifest: rewrite and return ---
+  // --- HLS manifest: rewrite + return ---
   if (kind === "manifest") {
     const text = await upstreamRes.text();
     const rewritten = rewriteManifest(text, url.origin, targetUrl, usedReferer, audio);
@@ -253,7 +242,7 @@ export async function handleMediaProxy(request) {
     });
   }
 
-  // --- Binary / segment / MP4 / image / VTT: stream with Range passthrough ---
+  // --- binary / MP4 / segment / image / VTT: stream with Range passthrough ---
   const outHeaders = new Headers({ ...CORS_HEADERS });
   const ct = upstreamRes.headers.get("Content-Type");
   if (ct) outHeaders.set("Content-Type", ct);
@@ -262,9 +251,7 @@ export async function handleMediaProxy(request) {
   const cr = upstreamRes.headers.get("Content-Range");
   if (cr) outHeaders.set("Content-Range", cr);
   outHeaders.set("Accept-Ranges", "bytes");
-
-  const maxAge = kind === "manifest" ? 60 : 3600;
-  outHeaders.set("Cache-Control", `public, max-age=${maxAge}`);
+  outHeaders.set("Cache-Control", `public, max-age=${kind === "manifest" ? 60 : 3600}`);
 
   return new Response(upstreamRes.body, {
     status: upstreamRes.status,
