@@ -1,17 +1,22 @@
 // ==========================================================================
 // AbyssPlayer decryptor (abyssplayer.com / player.abyssplayer.com)
-// Hydrax-based host. Decrypt chain (verified via oce extractor config):
+//
+// Hydrax-fork using JWPlayer + signed MP4 streams. Decrypt chain:
 //   1. GET embed page with Origin/Referer = https://playhydrax.com
-//   2. Regex  const data = "<encrypted>"
-//   3. POST https://enc-dec.app/api/dec-abyss  body {"text":"<encrypted>"}
-//   4. JSON → result.sources[].url  (m3u8 / mp4)
+//   2. Regex  const datas = "<base64+binary>"   (NOTE: plural "datas")
+//   3. POST https://enc-dec.app/api/dec-abyss  body {"text":"<raw base64>"}
+//   4. JSON → result.sources[]  (each has url/type/codec/size)
 // Playback referer: https://abyssplayer.com/
+//
+// Abyss serves MP4 (not HLS), so direct_hls = best-quality MP4 URL.
+// The proxy handles MP4 with Range passthrough just fine.
 // ==========================================================================
 
 import { CHROME_HEADERS } from "../config.js";
 
 const HYDRAX_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
 
 const PAGE_HEADERS = {
   "User-Agent": HYDRAX_UA,
@@ -30,17 +35,15 @@ export async function resolveAbyss(embedUrl) {
       headers: PAGE_HEADERS,
       redirect: "follow",
     });
-    if (!pageRes.ok) return { embedUrl, isIframe: true };
+    if (!pageRes.ok) return { embedUrl, isIframe: true, debug: `page ${pageRes.status}` };
     const page = await pageRes.text();
 
-    // 2) encrypted payload:  const data = "...."
-    const m =
-      page.match(/(?:const|var|let)\s+data\s*=\s*"([^"]*)"/) ||
-      page.match(/const\s+data\s*=\s*'([^']*)'/);
-    if (!m || !m[1]) return { embedUrl, isIframe: true };
-    const encrypted = m[1];
+    // 2) encrypted payload:  const datas = "...."   (plural "datas", not "data")
+    const m = page.match(/const\s+datas\s*=\s*"([^"]+)"/);
+    if (!m || !m[1]) return { embedUrl, isIframe: true, debug: "no const datas= in page" };
+    const encoded = m[1];
 
-    // 3) decrypt via public dec-abyss API
+    // 3) decrypt via enc-dec.app (handles the custom binary encoding internally)
     const decRes = await fetch(DECRYPT_API, {
       method: "POST",
       headers: {
@@ -48,33 +51,47 @@ export async function resolveAbyss(embedUrl) {
         Origin: "https://playhydrax.com",
         Referer: "https://playhydrax.com/",
         "Content-Type": "application/json",
-        Accept: "application/json, text/plain, */*",
+        Accept: "application/json",
       },
-      body: JSON.stringify({ text: encrypted }),
+      body: JSON.stringify({ text: encoded }),
     });
-    if (!decRes.ok) return { embedUrl, isIframe: true, debug: `decrypt HTTP ${decRes.status}` };
+    if (!decRes.ok) {
+      return { embedUrl, isIframe: true, debug: `decrypt HTTP ${decRes.status}` };
+    }
 
-    let dec;
-    try { dec = await decRes.json(); }
-    catch { return { embedUrl, isIframe: true, debug: "decrypt non-JSON" }; }
+    const dec = await decRes.json();
+    const sources = dec?.result?.sources || [];
+    if (!sources.length) {
+      return { embedUrl, isIframe: true, debug: "no sources in decrypt response" };
+    }
 
-    // 4) sources → prefer m3u8
-    const sources = dec?.result?.sources || dec?.sources || dec?.result || [];
-    const urls = (Array.isArray(sources) ? sources : [])
-      .map((s) => (typeof s === "string" ? s : s && s.url))
-      .filter((u) => typeof u === "string" && u);
-    if (!urls.length) return { embedUrl, isIframe: true, debug: "no sources in decrypt response" };
+    // 4) pick best quality — prefer 1080p h264 (most compatible), then highest size
+    const h264 = sources.filter((s) => /h264/i.test(s.codec || ""));
+    const best =
+      h264.find((s) => /1080p/i.test(s.type || "")) ||
+      h264.find((s) => /720p/i.test(s.type || "")) ||
+      sources.sort((a, b) => (b.size || 0) - (a.size || 0))[0];
 
-    const hls = urls.find((u) => /\.m3u8(\?|$)/i.test(u)) || urls[0];
+    if (!best || !best.url) {
+      return { embedUrl, isIframe: true, debug: "no playable source" };
+    }
 
     return {
-      direct_hls: hls,
-      qualities: urls.map((u, i) => ({ label: `Source ${i + 1}`, url: u })),
+      // It's MP4, not HLS, but direct_hls is the unified "playable URL" field
+      direct_hls: best.url,
+      qualities: sources
+        .filter((s) => s.url)
+        .map((s) => ({
+          label: `${s.type || "unknown"}${s.codec ? ` ${s.codec}` : ""}`,
+          url: s.url,
+          bandwidth: Math.round((s.size || 0) / 1000), // rough bitrate from file size
+          resolution: s.type || null,
+        })),
       subtitles: [],
       audio_languages: [],
       subtitle_languages: [],
       poster: null,
-      referer: "https://abyssplayer.com/",   // playback referer per extractor config
+      referer: "https://abyssplayer.com/",
       isIframe: false,
     };
   } catch (e) {
