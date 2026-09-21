@@ -4,8 +4,9 @@
 // Pipeline:
 //   1. Server list via existing handleServers() (single source of truth)
 //   2. Pick embed URL (apply ?lang for multi-lang servers)
-//   3. Follow short.icu redirects, dispatch to the right decryptor:
-//      as-cdn26 / megaplay / abyss(hydrax) / generic m3u8 / iframe fallback
+//   3. short.icu → player.abyssplayer.com domain rewrite, then follow
+//      redirects, then dispatch to decryptor: as-cdn26 / megaplay /
+//      abyss(hydrax) / generic m3u8 / iframe fallback
 //   4. Assemble unified response: ONE proxied master m3u8 (all qualities +
 //      all audio renditions). Audio chip URLs carry ?audio=<code> so
 //      proxy/media.js flips DEFAULT=YES on the matching rendition.
@@ -23,23 +24,49 @@ const UA =
   "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
 
 // ---------------------------------------------------------------------------
-// short.icu (and similar) → follow redirect to the real embed host
+// Domain rewrites — short.icu links are actually abyssplayer embeds.
+// Rewrite BEFORE any fetch so the Worker never has to follow the shortener.
 // ---------------------------------------------------------------------------
-async function followShortener(shortUrl) {
-  let finalUrl = shortUrl;
+const DOMAIN_REWRITES = [
+  [/^https?:\/\/short\.icu\//i, "https://player.abyssplayer.com/"],
+  [/^https?:\/\/(?:www\.)?abyss\.to\//i, "https://player.abyssplayer.com/"],
+  [/^https?:\/\/(?:www\.)?playhydrax\.com\//i, "https://player.abyssplayer.com/"],
+];
+function applyRewrites(url) {
+  if (!url) return url;
+  for (const [re, replacement] of DOMAIN_REWRITES) {
+    if (re.test(url)) return url.replace(re, replacement);
+  }
+  return url;
+}
+
+// ---------------------------------------------------------------------------
+// Follow any remaining redirects + dispatch to the right decryptor.
+// ---------------------------------------------------------------------------
+async function followAndResolve(embedUrl) {
+  const rewritten = applyRewrites(embedUrl);
+  if (!rewritten) return { embedUrl, isIframe: true };
+
+  // After rewrite, try the URL directly with each decryptor
+  if (/as-cdn/i.test(rewritten)) return resolveAsCdn26(rewritten);
+  if (/megaplay/i.test(rewritten)) return resolveMegaplay(rewritten);
+  if (/abyssplayer|abyss\.to|playhydrax/i.test(rewritten)) return resolveAbyss(rewritten);
+
+  // Still unknown — follow redirects, then dispatch again
+  let finalUrl = rewritten;
   try {
-    const res = await fetch(shortUrl, {
+    const res = await fetch(rewritten, {
       redirect: "follow",
-      headers: { "User-Agent": UA },
+      headers: { "User-Agent": UA, Accept: "text/html,application/xhtml+xml" },
     });
-    finalUrl = res.url || shortUrl;
+    finalUrl = applyRewrites(res.url || rewritten);
   } catch {}
 
-  if (/as-cdn/i.test(finalUrl))              return resolveAsCdn26(finalUrl);
-  if (/megaplay/i.test(finalUrl))            return resolveMegaplay(finalUrl);
+  if (/as-cdn/i.test(finalUrl)) return resolveAsCdn26(finalUrl);
+  if (/megaplay/i.test(finalUrl)) return resolveMegaplay(finalUrl);
   if (/abyssplayer|abyss\.to|playhydrax/i.test(finalUrl)) return resolveAbyss(finalUrl);
 
-  // generic: look for an iframe or a plain m3u8 inside the landing page
+  // Final fallback: look for iframe or plain m3u8 on the landing page
   try {
     const res = await fetch(finalUrl, {
       headers: { "User-Agent": UA, Accept: "text/html,application/xhtml+xml" },
@@ -49,7 +76,7 @@ async function followShortener(shortUrl) {
 
     const iframeM = html.match(/<iframe[^>]*src=["']([^"']+)["']/i);
     if (iframeM) {
-      const inner = iframeM[1].replace(/\\\//g, "/").replace(/^\/\//, "https://");
+      const inner = applyRewrites(iframeM[1].replace(/\\\//g, "/").replace(/^\/\//, "https://"));
       if (/as-cdn/i.test(inner))              return resolveAsCdn26(inner);
       if (/megaplay/i.test(inner))            return resolveMegaplay(inner);
       if (/abyssplayer|abyss\.to|playhydrax/i.test(inner)) return resolveAbyss(inner);
@@ -61,48 +88,26 @@ async function followShortener(shortUrl) {
     if (m3u8M) {
       return {
         direct_hls: m3u8M[1],
-        qualities: [],
-        subtitles: [],
-        audio_languages: [],
-        subtitle_languages: [],
+        qualities: [], subtitles: [], audio_languages: [], subtitle_languages: [],
         isIframe: false,
       };
     }
   } catch {}
 
-  return { embedUrl: shortUrl, isIframe: true };
+  return { embedUrl: rewritten, isIframe: true, debug: `no extractor matched ${finalUrl}` };
 }
 
 // ---------------------------------------------------------------------------
-// decryptor dispatch by embed host
+// top-level dispatcher
 // ---------------------------------------------------------------------------
 async function resolveEmbed(embedUrl) {
   if (!embedUrl) return { isIframe: true };
-  if (/as-cdn/i.test(embedUrl))              return resolveAsCdn26(embedUrl);
-  if (/megaplay/i.test(embedUrl))            return resolveMegaplay(embedUrl);
-  if (/abyssplayer|abyss\.to|playhydrax/i.test(embedUrl)) return resolveAbyss(embedUrl);
-  if (/short\.icu|multi-lang-plyr/i.test(embedUrl)) return followShortener(embedUrl);
-
-  // unknown host: try plain m3u8 extraction, else iframe fallback
-  try {
-    const res = await fetch(embedUrl, {
-      headers: { "User-Agent": UA },
-      redirect: "follow",
-    });
-    const html = await res.text();
-    const m3u8M = html.match(/(https?:\/\/[^"'\s<>]+\.m3u8[^"'\s<>]*)/i);
-    if (m3u8M) {
-      return {
-        direct_hls: m3u8M[1],
-        qualities: [],
-        subtitles: [],
-        audio_languages: [],
-        subtitle_languages: [],
-        isIframe: false,
-      };
-    }
-  } catch {}
-  return { embedUrl, isIframe: true };
+  const rewritten = applyRewrites(embedUrl);
+  if (/as-cdn/i.test(rewritten))              return resolveAsCdn26(rewritten);
+  if (/megaplay/i.test(rewritten))            return resolveMegaplay(rewritten);
+  if (/abyssplayer|abyss\.to|playhydrax/i.test(rewritten)) return resolveAbyss(rewritten);
+  if (/short\.icu|multi-lang-plyr/i.test(rewritten)) return followAndResolve(rewritten);
+  return followAndResolve(embedUrl);
 }
 
 // ---------------------------------------------------------------------------
@@ -128,15 +133,15 @@ export async function handleStream(ctx, url) {
   const server = servers[serverIdx];
   if (!server) return jsonError(`Server ${serverIdx} not found (have ${servers.length})`, 404);
 
-  // 2) pick embed URL (multi-lang aware)
-  let embedUrl = server.embedUrl;
+  // 2) pick embed URL (multi-lang aware) + apply domain rewrites
+  let embedUrl = applyRewrites(server.embedUrl);
   let selectedLanguage = lang;
   if (server.isMultiLang && Array.isArray(server.languages) && server.languages.length) {
     const pick = lang
       ? server.languages.find((l) => String(l.language).toLowerCase() === String(lang).toLowerCase())
       : server.languages[0];
     if (pick && pick.link) {
-      embedUrl = pick.link;
+      embedUrl = applyRewrites(pick.link);
       selectedLanguage = pick.language;
     }
   }
