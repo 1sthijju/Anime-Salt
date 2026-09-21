@@ -1,12 +1,12 @@
 // ==========================================================================
 // /proxy/media?url=<target>&referer=<ref>&force=text/vtt&audio=<code>
 //
-// Proxies media (HLS manifests, segments, VTT, images) with:
+// Proxies media (HLS manifests, MP4, segments, VTT, images) with:
 //  - referer/origin spoofing via candidate list (CDN hotlink whitelists)
 //  - HLS manifest rewriting (segments, URI=, #EXT-X-KEY, #EXT-X-MAP,
 //    #EXT-X-MEDIA) — tag prefixes preserved (v4 fix)
 //  - Audio language selection via ?audio=<code> → flips DEFAULT flag (v5)
-//  - Range passthrough for segments
+//  - Range passthrough for MP4 segments
 //  - force=text/vtt → returns valid VTT even for binary input
 // ==========================================================================
 
@@ -158,11 +158,13 @@ export async function handleMediaProxy(request) {
     "https://as-cdn29.top/",
     "https://as-cdn30.top/",
     "https://animesalt.cx/",
-    // abyss / hydrax hosts (v6 ADD)
+    // abyss / hydrax hosts (v6)
     "https://abyssplayer.com/",
     "https://player.abyssplayer.com/",
     "https://playhydrax.com/",
     "https://abyss.to/",
+    // sssrr.org (Abyss CDN)
+    "https://sssrr.org/",
     targetOrigin ? targetOrigin + "/" : null,
     "",                              // last-resort: no referer
   ].filter((v, i, a) => v !== null && a.indexOf(v) === i);
@@ -251,7 +253,7 @@ export async function handleMediaProxy(request) {
     });
   }
 
-  // --- Binary / segment / image / VTT: stream with Range passthrough ---
+  // --- Binary / segment / MP4 / image / VTT: stream with Range passthrough ---
   const outHeaders = new Headers({ ...CORS_HEADERS });
   const ct = upstreamRes.headers.get("Content-Type");
   if (ct) outHeaders.set("Content-Type", ct);
