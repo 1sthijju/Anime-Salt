@@ -12,7 +12,7 @@
 // ==========================================================================
 
 import { jsonSuccess, jsonError } from "../util/response.js";
-import { fetchUpstream, fetchText } from "../util/fetcher.js";
+import { fetchUpstream } from "../util/fetcher.js";
 import { UPSTREAM } from "../config.js";
 import { resolveAsCdn26 } from "../decryptors/as-cdn26.js";
 import { resolveMegaplay } from "../decryptors/megaplay.js";
@@ -51,9 +51,9 @@ function normLang(label) {
 
 async function pageForSlug(slug) {
   const episodePage = `${UPSTREAM}/episode/${slug}/`;
-  try { return { html: await fetchText(episodePage), referer: episodePage }; } catch {}
+  try { return { html: await fetchUpstream(episodePage), referer: episodePage }; } catch {}
   const moviePage = `${UPSTREAM}/movies/${slug}/`;
-  try { return { html: await fetchText(moviePage), referer: moviePage }; } catch {}
+  try { return { html: await fetchUpstream(moviePage), referer: moviePage }; } catch {}
   throw new Error(`No page found for slug "${slug}"`);
 }
 
@@ -181,7 +181,7 @@ export async function handleStream(url, ctx, req) {
     // master URL — every client fetches the same cached manifest
     const proxiedMaster = proxiedUrl(hls, hlsReferer, null);
 
-    // per-audio chip URLs carry ?audio= so media.js rewrites DEFAULT on the
+    // per-audio chip URLs carry ?audio= so media.js rewrites DEFAULT=YES on the
     // matching #EXT-X-MEDIA line when hls.js loads it
     const audioLangs = (resolved.audio_languages || []).map(a => ({
       language: a.language || normLang(a.name || a.label),
