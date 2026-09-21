@@ -1,199 +1,224 @@
 // ==========================================================================
-// /api/stream?ep=<slug>&server=<n>&lang=<l>&audio=<a>
-// Decodes embed URLs to direct HLS streams via decryptors
+// /api/stream?ep=<slug>&server=<n>&lang=<language>&audio=<code>
+//
+// Pipeline:
+//   1. resolve episode page (series or movie) from slug
+//   2. collect embed servers from the page
+//   3. pick server by ?server index, apply ?lang if multi-lang
+//   4. dispatch to the correct decryptor: as-cdn / megaplay / abyss / generic
+//   5. assemble a unified response — ONE proxied master m3u8 with all
+//      qualities + all audio tracks baked in. Audio chip URLs carry ?audio=
+//      so media.js can rewrite DEFAULT=YES on the matching rendition.
 // ==========================================================================
 
 import { jsonSuccess, jsonError } from "../util/response.js";
-import { handleServers } from "./servers.js";
+import { fetchUpstream, fetchText } from "../util/fetcher.js";
+import { UPSTREAM } from "../config.js";
 import { resolveAsCdn26 } from "../decryptors/as-cdn26.js";
-import { resolveAbyss } from "../decryptors/abyss.js";
 import { resolveMegaplay } from "../decryptors/megaplay.js";
-import { proxyMediaUrl } from "../proxy/media.js";
-import { fetchUpstream } from "../util/fetcher.js";
+import { resolveAbyss } from "../decryptors/abyss.js";
 
-/**
- * Follow a shortener URL (short.icu etc.) to find the real embed.
- */
-async function followShortener(shortUrl) {
-  let finalUrl = shortUrl;
+const PROXY_BASE = "https://anime-salt.abdullahdaniyal.workers.dev/proxy/media";
+
+// ---- helpers -----------------------------------------------------------
+
+function proxiedUrl(url, referer, audio) {
+  const qs = new URLSearchParams();
+  qs.set("url", url);
+  if (referer) qs.set("referer", referer);
+  if (audio) qs.set("audio", audio);
+  return `${PROXY_BASE}?${qs.toString()}`;
+}
+
+function proxiedSub(url, referer) {
+  const qs = new URLSearchParams();
+  qs.set("url", url);
+  if (referer) qs.set("referer", referer);
+  qs.set("force", "text/vtt");     // always safe for subtitles
+  return `${PROXY_BASE}?${qs.toString()}`;
+}
+
+function normLang(label) {
+  const m = { english:"en", japanese:"ja", hindi:"hi", spanish:"es", french:"fr",
+              german:"de", italian:"it", portuguese:"pt", russian:"ru", korean:"ko",
+              chinese:"zh", arabic:"ar", indonesian:"id", urdu:"ur", bengali:"bn",
+              tamil:"ta", telugu:"te" };
+  const k = String(label || "").toLowerCase();
+  return m[k] || (k.replace(/[^a-z]/g, "").slice(0, 2)) || "en";
+}
+
+// ---- episode / movie page lookup ---------------------------------------
+
+async function pageForSlug(slug) {
+  const episodePage = `${UPSTREAM}/episode/${slug}/`;
+  try { return { html: await fetchText(episodePage), referer: episodePage }; } catch {}
+  const moviePage = `${UPSTREAM}/movies/${slug}/`;
+  try { return { html: await fetchText(moviePage), referer: moviePage }; } catch {}
+  throw new Error(`No page found for slug "${slug}"`);
+}
+
+// Extract embed iframes / server blocks from the title page.
+function extractServers(html) {
+  const out = [];
+
+  // iframes
+  const ifrRe = /<iframe[^>]+src=["']([^"']+)["'][^>]*>/gi;
+  let m;
+  while ((m = ifrRe.exec(html))) {
+    const raw = m[1].replace(/\\\//g, "/");
+    const src = raw.startsWith("//") ? "https:" + raw : raw;
+    out.push({ index: out.length, embedUrl: src, serverName: `Server ${out.length + 1}` });
+  }
+
+  // some sites expose embeds via data attributes on server tabs
+  const dataRe = /data-(?:src|embed|url)=["']([^"']+)["']/gi;
+  while ((m = dataRe.exec(html))) {
+    const src = m[1].replace(/\\\//g, "/");
+    if (out.some(s => s.embedUrl === src)) continue;
+    out.push({ index: out.length, embedUrl: src, serverName: `Server ${out.length + 1}` });
+  }
+
+  // multi-lang servers (e.g. Server 2 with Hindi/English tabs)
+  const langBlockRe = /<div[^>]+class=["'][^"']*(?:server|lang|dub)[^"']*["'][^>]*>([\s\S]*?)<\/div>/gi;
+  while ((m = langBlockRe.exec(html))) {
+    const block = m[1];
+    const langRe = /data-lang=["']([^"']+)["'][^>]*data-(?:src|embed)=["']([^"']+)["']/gi;
+    const langs = [];
+    let lm;
+    while ((lm = langRe.exec(block))) {
+      langs.push({ language: lm[1], link: lm[2].replace(/\\\//g, "/") });
+    }
+    if (langs.length > 1) {
+      out.push({
+        index: out.length,
+        embedUrl: langs[0].link,
+        serverName: `Server ${out.length + 1}`,
+        isMultiLang: true,
+        languages: langs,
+      });
+    }
+  }
+
+  return out;
+}
+
+// ---- decryptor dispatch ------------------------------------------------
+
+async function resolveEmbed(embedUrl) {
+  if (!embedUrl) return { isIframe: true };
+  if (/as-cdn/i.test(embedUrl))   return resolveAsCdn26(embedUrl);
+  if (/megaplay/i.test(embedUrl)) return resolveMegaplay(embedUrl);
+  if (/abyssplayer|abyss\.to|playhydrax/i.test(embedUrl)) return resolveAbyss(embedUrl);
+
+  // generic: try to extract m3u8 directly, else iframe fallback
   try {
-    const res = await fetch(shortUrl, {
-      redirect: "follow",
+    const res = await fetch(embedUrl, {
       headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
-    });
-    finalUrl = res.url;
-  } catch {}
-
-  if (/as-cdn/i.test(finalUrl)) return resolveAsCdn26(finalUrl);
-  if (/megaplay/i.test(finalUrl)) return resolveMegaplay(finalUrl);
-
-  try {
-    const res = await fetch(finalUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        Accept: "text/html,application/xhtml+xml",
-      },
+      redirect: "follow",
     });
     const html = await res.text();
-
-    const iframeM = html.match(/<iframe[^>]*src="([^"]+)"[^>]*>/i);
-    if (iframeM) {
-      const innerUrl = iframeM[1].replace(/\\\//g, "/").replace(/^\/\//, "https://");
-      if (/as-cdn/i.test(innerUrl)) return resolveAsCdn26(innerUrl);
-      if (/megaplay/i.test(innerUrl)) return resolveMegaplay(innerUrl);
-      const innerResolved = await resolveAbyss(innerUrl);
-      if (innerResolved.direct_hls) return innerResolved;
-    }
-
     const m3u8M = html.match(/(https?:\/\/[^"'\s<>]+\.m3u8[^"'\s<>]*)/i);
-    if (m3u8M) {
-      return { direct_hls: m3u8M[1], qualities: [], subtitles: [], isIframe: false };
-    }
-
-    const jsM = html.match(/(?:file|source|src)\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']/i);
-    if (jsM) {
-      return { direct_hls: jsM[1].replace(/\\\//g, "/"), qualities: [], subtitles: [], isIframe: false };
-    }
+    if (m3u8M) return { direct_hls: m3u8M[1], isIframe: false, qualities: [], subtitles: [], audio_languages: [] };
   } catch {}
-
-  return { embedUrl: shortUrl, isIframe: true };
+  return { embedUrl, isIframe: true };
 }
 
-/**
- * Extract subtitles from episode page (working version from earlier)
- */
-async function extractSubtitlesFromPage(epSlug) {
-  try {
-    const html = await fetchUpstream(`/episode/${epSlug}/`);
-    const subtitles = [];
+// ---- handler -----------------------------------------------------------
 
-    // Pattern 1: playerjsSubtitle variable
-    const pjsMatch = html.match(/var\s+playerjsSubtitle\s*=\s*["']([^"']*)["']/i);
-    if (pjsMatch && pjsMatch[1].trim() !== "") {
-      const re = /\[([^\]]+)\]\s*(https?:\/\/[^"'\s,;]+)/g;
-      let pm;
-      while ((pm = re.exec(pjsMatch[1])) !== null) {
-        const label = pm[1].trim();
-        const url = pm[2].trim();
-        if (url) {
-          subtitles.push({
-            label: label || "Sub",
-            url: url,
-            referer: new URL(url).origin + "/",
-          });
-        }
-      }
+export async function handleStream(url, ctx, req) {
+  const ep     = url.searchParams.get("ep");
+  const server = Number(url.searchParams.get("server") ?? "0");
+  const lang   = url.searchParams.get("lang") || null;
+  const audio  = url.searchParams.get("audio") || null;
+
+  if (!ep) return jsonError("Missing ?ep=", 400);
+
+  try {
+    // 1) page + servers
+    const { html, referer } = await pageForSlug(ep);
+    const servers = extractServers(html);
+    if (!servers.length) return jsonError("No servers found on page", 404);
+
+    const srv = servers.find(s => s.index === server) || servers[0];
+
+    // 2) pick the right embed (apply multi-lang)
+    let embedUrl = srv.embedUrl;
+    let selectedLanguage = null;
+    if (srv.isMultiLang && lang) {
+      const pick = (srv.languages || []).find(l =>
+        (l.language || "").toLowerCase() === lang.toLowerCase());
+      if (pick) { embedUrl = pick.link; selectedLanguage = pick.language; }
     }
 
-    return subtitles;
+    // 3) decrypt
+    let resolved;
+    try { resolved = await resolveEmbed(embedUrl); }
+    catch (e) { resolved = { embedUrl, isIframe: true, debug: e.message }; }
+
+    if (resolved.isIframe) {
+      return jsonSuccess({
+        host: srv.serverName,
+        serverIndex: srv.index,
+        selectedLanguage,
+        isIframe: true,
+        embedUrl: resolved.embedUrl || embedUrl,
+        debug: resolved.debug || null,
+      });
+    }
+
+    // 4) build unified HLS response
+    const hls       = resolved.direct_hls || (resolved.qualities?.[0]?.url) || null;
+    const hlsReferer = resolved.referer || referer;
+
+    if (!hls) {
+      return jsonSuccess({
+        host: srv.serverName, serverIndex: srv.index,
+        selectedLanguage, isIframe: true, embedUrl,
+        debug: "decryptor returned no playable URL",
+      });
+    }
+
+    // master URL — every client fetches the same cached manifest
+    const proxiedMaster = proxiedUrl(hls, hlsReferer, null);
+
+    // per-audio chip URLs carry ?audio= so media.js rewrites DEFAULT on the
+    // matching #EXT-X-MEDIA line when hls.js loads it
+    const audioLangs = (resolved.audio_languages || []).map(a => ({
+      language: a.language || normLang(a.name || a.label),
+      name: a.name || a.label || a.language,
+      url: proxiedUrl(hls, hlsReferer, a.language),   // ← audio= baked in
+      isDefault: !!a.isDefault,
+      isAutoSelect: a.isAutoSelect !== false,
+    }));
+
+    const subtitles = (resolved.subtitles || []).map(s => ({
+      label: s.label || s.language || "Subtitles",
+      url: proxiedSub(s.url, hlsReferer),
+    }));
+
+    return jsonSuccess({
+      host: srv.serverName,
+      serverIndex: srv.index,
+      selectedLanguage,
+      selected_audio: audio || null,
+      isIframe: false,
+      proxied_url: proxiedMaster,
+      direct_hls: hls,
+      referer: hlsReferer,
+      poster: resolved.poster || null,
+      qualities: (resolved.qualities || []).map(q => ({
+        label: q.label,
+        bandwidth: q.bandwidth,
+        resolution: q.resolution,
+        url: q.url,
+      })),
+      audio_languages: audioLangs,
+      subtitles,
+      subtitle_languages: resolved.subtitle_languages || [],
+      intro: resolved.intro || null,
+      outro: resolved.outro || null,
+    });
   } catch (e) {
-    console.error("Failed to extract subtitles from page:", e.message);
-    return [];
+    return jsonError(e.message, 500, e.stack);
   }
-}
-
-/**
- * Main stream handler
- */
-export async function handleStream(ctx, url) {
-  const ep = url.searchParams.get("ep");
-  const serverIdx = Number(url.searchParams.get("server") || 0);
-  const lang = url.searchParams.get("lang");
-  const audio = url.searchParams.get("audio");
-
-  if (!ep) return jsonError("Missing ep", 400);
-
-  // 1. Fetch servers list
-  const srvRes = await handleServers(ctx, url);
-  let servers;
-  try {
-    const parsed = await srvRes.clone().json();
-    servers = Array.isArray(parsed) ? parsed : (parsed && parsed.data) || [];
-  } catch {
-    servers = [];
-  }
-
-  if (!servers.length) return jsonError("No servers available", 500);
-  const server = servers[serverIdx];
-  if (!server) return jsonError(`Server ${serverIdx} not found (have ${servers.length})`, 404);
-
-  // 2. Pick embed URL (multi-lang with language, or default embed)
-  let embedUrl = server.embedUrl;
-  let selectedLanguage = lang || null;
-
-  if (server.isMultiLang && server.languages && server.languages.length) {
-    const pick = lang
-      ? server.languages.find((l) => String(l.language).toLowerCase() === lang.toLowerCase())
-      : server.languages.find((l) => /eng/i.test(l.language)) || server.languages[0];
-    if (pick) {
-      embedUrl = pick.link;
-      selectedLanguage = pick.language;
-    }
-  }
-
-  if (!embedUrl) {
-    return jsonSuccess(
-      { host: server.serverName, serverIndex: serverIdx, error: "No embed URL" },
-      { "Cache-Control": "no-store" }
-    );
-  }
-
-  // 3. Resolve embed to direct stream
-  let resolved;
-  try {
-    if (/as-cdn26|as-cdn/i.test(embedUrl)) {
-      resolved = await resolveAsCdn26(embedUrl);
-    } else if (/megaplay\.buzz/i.test(embedUrl)) {
-      resolved = await resolveMegaplay(embedUrl);
-    } else if (/short\.icu|multi-lang-plyr/i.test(embedUrl)) {
-      resolved = await followShortener(embedUrl);
-    } else {
-      resolved = await resolveAbyss(embedUrl);
-    }
-  } catch (e) {
-    return jsonSuccess(
-      { host: server.serverName, serverIndex: serverIdx, isIframe: true, embedUrl, error: `Resolve failed: ${e.message}` },
-      { "Cache-Control": "no-store" }
-    );
-  }
-
-  const result = {
-    host: server.serverName,
-    serverIndex: serverIdx,
-    selectedLanguage,
-    selected_audio: audio || null,
-  };
-
-  if (resolved.isIframe) {
-    return jsonSuccess({ ...result, isIframe: true, embedUrl: resolved.embedUrl }, { "Cache-Control": "no-store" });
-  }
-
-  const hlsUrl = resolved.direct_hls;
-  if (!hlsUrl) {
-    return jsonSuccess({ ...result, isIframe: true, embedUrl, error: "No playable URL" }, { "Cache-Control": "no-store" });
-  }
-
-  const referer = resolved.referer || new URL(hlsUrl).origin + "/";
-  result.proxied_url = proxyMediaUrl(url.origin, hlsUrl, { referer, audio });
-  result.direct_hls = hlsUrl;
-  result.referer = referer;
-  result.qualities = resolved.qualities || [];
-  result.poster = resolved.poster || null;
-  result.isIframe = false;
-  result.intro = resolved.intro || null;
-  result.outro = resolved.outro || null;
-  
-  // Map subtitles from decryptor
-  result.subtitles = (resolved.subtitles || []).map((s) => ({
-    label: s.label || "Sub",
-    url: proxyMediaUrl(url.origin, s.url, {
-      referer: s.referer || referer,
-      force: "text/vtt",
-    }),
-  }));
-  
-  result.audio_languages = resolved.audio_languages || [];
-  result.subtitle_languages = resolved.subtitle_languages || [];
-
-  return jsonSuccess(result, { "Cache-Control": "no-store" });
 }
