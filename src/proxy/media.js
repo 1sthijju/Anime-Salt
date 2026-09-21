@@ -14,7 +14,7 @@ import { jsonError } from "../util/response.js";
 
 const UPSTREAM_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-  "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+  "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -149,7 +149,8 @@ export async function handleMediaProxy(request) {
 
   const candidates = [
     refererParam,
-    "https://megaplay.buzz/",        // fetch.nexabloom.top whitelist
+    // megaplay / as-cdn hosts
+    "https://megaplay.buzz/",
     "https://megaplay.buzz",
     "https://as-cdn26.top/",
     "https://as-cdn27.top/",
@@ -157,6 +158,11 @@ export async function handleMediaProxy(request) {
     "https://as-cdn29.top/",
     "https://as-cdn30.top/",
     "https://animesalt.cx/",
+    // abyss / hydrax hosts (v6 ADD)
+    "https://abyssplayer.com/",
+    "https://player.abyssplayer.com/",
+    "https://playhydrax.com/",
+    "https://abyss.to/",
     targetOrigin ? targetOrigin + "/" : null,
     "",                              // last-resort: no referer
   ].filter((v, i, a) => v !== null && a.indexOf(v) === i);
