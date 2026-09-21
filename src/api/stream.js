@@ -6,10 +6,9 @@
 //   2. Pick embed URL (apply ?lang for multi-lang servers)
 //   3. short.icu → player.abyssplayer.com domain rewrite, then follow
 //      redirects, then dispatch to decryptor: as-cdn26 / megaplay /
-//      abyss(hydrax) / generic m3u8 / iframe fallback
-//   4. Assemble unified response: ONE proxied master m3u8 (all qualities +
-//      all audio renditions). Audio chip URLs carry ?audio=<code> so
-//      proxy/media.js flips DEFAULT=YES on the matching rendition.
+//      abyss(hydrax+JWPlayer) / generic m3u8 / iframe fallback
+//   4. Assemble unified response: proxied URL (HLS master or MP4).
+//      Audio chip URLs carry ?audio=<code> for HLS DEFAULT-flip.
 // ==========================================================================
 
 import { jsonSuccess, jsonError } from "../util/response.js";
@@ -47,12 +46,12 @@ async function followAndResolve(embedUrl) {
   const rewritten = applyRewrites(embedUrl);
   if (!rewritten) return { embedUrl, isIframe: true };
 
-  // After rewrite, try the URL directly with each decryptor
+  // Direct dispatch by host
   if (/as-cdn/i.test(rewritten)) return resolveAsCdn26(rewritten);
   if (/megaplay/i.test(rewritten)) return resolveMegaplay(rewritten);
   if (/abyssplayer|abyss\.to|playhydrax/i.test(rewritten)) return resolveAbyss(rewritten);
 
-  // Still unknown — follow redirects, then dispatch again
+  // Follow redirects, then dispatch again
   let finalUrl = rewritten;
   try {
     const res = await fetch(rewritten, {
@@ -77,8 +76,8 @@ async function followAndResolve(embedUrl) {
     const iframeM = html.match(/<iframe[^>]*src=["']([^"']+)["']/i);
     if (iframeM) {
       const inner = applyRewrites(iframeM[1].replace(/\\\//g, "/").replace(/^\/\//, "https://"));
-      if (/as-cdn/i.test(inner))              return resolveAsCdn26(inner);
-      if (/megaplay/i.test(inner))            return resolveMegaplay(inner);
+      if (/as-cdn/i.test(inner)) return resolveAsCdn26(inner);
+      if (/megaplay/i.test(inner)) return resolveMegaplay(inner);
       if (/abyssplayer|abyss\.to|playhydrax/i.test(inner)) return resolveAbyss(inner);
       const innerResolved = await resolveAbyss(inner);
       if (innerResolved && innerResolved.direct_hls) return innerResolved;
@@ -103,8 +102,8 @@ async function followAndResolve(embedUrl) {
 async function resolveEmbed(embedUrl) {
   if (!embedUrl) return { isIframe: true };
   const rewritten = applyRewrites(embedUrl);
-  if (/as-cdn/i.test(rewritten))              return resolveAsCdn26(rewritten);
-  if (/megaplay/i.test(rewritten))            return resolveMegaplay(rewritten);
+  if (/as-cdn/i.test(rewritten)) return resolveAsCdn26(rewritten);
+  if (/megaplay/i.test(rewritten)) return resolveMegaplay(rewritten);
   if (/abyssplayer|abyss\.to|playhydrax/i.test(rewritten)) return resolveAbyss(rewritten);
   if (/short\.icu|multi-lang-plyr/i.test(rewritten)) return followAndResolve(rewritten);
   return followAndResolve(embedUrl);
@@ -180,14 +179,14 @@ export async function handleStream(ctx, url) {
     );
   }
 
-  // 4) unified HLS response
-  const hls        = resolved.direct_hls;
-  const hlsReferer = resolved.referer || new URL(hls).origin + "/";
+  // 4) unified response — direct_hls is either HLS master or MP4 (both proxied)
+  const media       = resolved.direct_hls;
+  const mediaReferer = resolved.referer || (() => { try { return new URL(media).origin + "/"; } catch { return ""; } })();
 
   const audioLangs = (resolved.audio_languages || []).map((a) => ({
     language: a.language || "und",
     name: a.name || a.label || a.language || "Audio",
-    url: proxyMediaUrl(url.origin, hls, { referer: hlsReferer, audio: a.language }),
+    url: proxyMediaUrl(url.origin, media, { referer: mediaReferer, audio: a.language }),
     isDefault: !!a.isDefault,
     isAutoSelect: a.isAutoSelect !== false,
   }));
@@ -195,7 +194,7 @@ export async function handleStream(ctx, url) {
   const subtitles = (resolved.subtitles || []).map((s) => ({
     label: s.label || s.language || "Subtitles",
     url: proxyMediaUrl(url.origin, s.url, {
-      referer: s.referer || hlsReferer,
+      referer: s.referer || mediaReferer,
       force: "text/vtt",
     }),
   }));
@@ -204,9 +203,9 @@ export async function handleStream(ctx, url) {
     {
       ...base,
       isIframe: false,
-      proxied_url: proxyMediaUrl(url.origin, hls, { referer: hlsReferer }),
-      direct_hls: hls,
-      referer: hlsReferer,
+      proxied_url: proxyMediaUrl(url.origin, media, { referer: mediaReferer }),
+      direct_hls: media,
+      referer: mediaReferer,
       poster: resolved.poster || null,
       qualities: (resolved.qualities || []).map((q) => ({
         label: q.label,
