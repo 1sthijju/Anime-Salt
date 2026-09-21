@@ -3,13 +3,13 @@
 //
 // Hydrax-fork using JWPlayer + signed MP4 streams. Decrypt chain:
 //   1. GET embed page with Origin/Referer = https://playhydrax.com
-//   2. Regex  const datas = "<base64+binary>"   (NOTE: plural "datas")
+//   2. Regex  const datas = "<base64+binary>"   (plural "datas")
 //   3. POST https://enc-dec.app/api/dec-abyss  body {"text":"<raw base64>"}
-//   4. JSON → result.sources[]  (each has url / type / codec / size)
+//   4. JSON → result.sources[]  (each: url / type / codec / size / status)
 //
-// Playback referer = the FULL embed page URL (https://player.abyssplayer.com/<slug>)
-// because the sssrr.org CDN gates on page-level referer, not origin.
-// Abyss serves MP4 (not HLS), so direct_hls = best-quality MP4 URL.
+// FIX: playback referer is the FULL player page URL
+// (https://player.abyssplayer.com/<slug>) — sssrr.org hotlink protection
+// validates the page-level referer, not just the origin.
 // ==========================================================================
 
 const HYDRAX_UA =
@@ -28,14 +28,16 @@ const DECRYPT_API = "https://enc-dec.app/api/dec-abyss";
 
 export async function resolveAbyss(embedUrl) {
   try {
-    // 1) embed page (follows any redirects)
+    // 1) embed page (short.icu → player.abyssplayer.com rewrite happens upstream)
     const pageRes = await fetch(embedUrl, {
       headers: PAGE_HEADERS,
       redirect: "follow",
     });
     if (!pageRes.ok) return { embedUrl, isIframe: true, debug: `page ${pageRes.status}` };
     const page = await pageRes.text();
-    const pageUrl = pageRes.url || embedUrl;   // final player-page URL after redirects
+
+    // FINAL url after redirects = the player page = required playback referer
+    const pageUrl = pageRes.url || embedUrl;
 
     // 2) encrypted payload:  const datas = "...."
     const m = page.match(/const\s+datas\s*=\s*"([^"]+)"/);
@@ -57,34 +59,32 @@ export async function resolveAbyss(embedUrl) {
     if (!decRes.ok) return { embedUrl, isIframe: true, debug: `decrypt HTTP ${decRes.status}` };
 
     const dec = await decRes.json();
-    const sources = (dec && dec.result && dec.result.sources) || [];
+    const sources = (dec && dec.result && dec.result.sources) || (dec && dec.sources) || [];
     if (!sources.length) return { embedUrl, isIframe: true, debug: "no sources in decrypt response" };
 
-    // 4) pick best quality: 1080p h264 → 720p h264 → any h264 → largest size
-    const h264 = sources.filter((s) => /h264/i.test(s.codec || ""));
+    // 4) pick best quality — 1080p h264 → 720p h264 → largest file
+    const usable = sources.filter((s) => s && s.url && s.status !== false);
+    if (!usable.length) return { embedUrl, isIframe: true, debug: "no usable sources" };
+    const h264 = usable.filter((s) => /h264/i.test(s.codec || ""));
     const best =
       h264.find((s) => /1080p/i.test(s.type || "")) ||
       h264.find((s) => /720p/i.test(s.type || "")) ||
-      h264[0] ||
-      sources.slice().sort((a, b) => (b.size || 0) - (a.size || 0))[0];
-
-    if (!best || !best.url) return { embedUrl, isIframe: true, debug: "no playable source" };
+      usable.slice().sort((a, b) => (b.size || 0) - (a.size || 0))[0];
 
     return {
+      // MP4, not HLS — but direct_hls is the unified "playable URL" field
       direct_hls: best.url,
-      qualities: sources
-        .filter((s) => s.url)
-        .map((s) => ({
-          label: `${s.type || "unknown"}${s.codec ? " " + s.codec : ""}`,
-          url: s.url,
-          bandwidth: Math.round((s.size || 0) / 1000),
-          resolution: s.type || null,
-        })),
+      qualities: usable.map((s) => ({
+        label: `${s.type || "unknown"}${s.codec ? " " + s.codec : ""}`,
+        url: s.url,
+        bandwidth: Math.round((s.size || 0) / 1000),
+        resolution: s.type || null,
+      })),
       subtitles: [],
       audio_languages: [],
       subtitle_languages: [],
       poster: null,
-      referer: pageUrl,        // ← FULL player-page URL (sssrr.org referer gate)
+      referer: pageUrl, // ← FULL player page URL (fixes sssrr.org 403)
       isIframe: false,
     };
   } catch (e) {
